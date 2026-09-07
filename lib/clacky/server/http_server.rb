@@ -4428,8 +4428,9 @@ module Clacky
 
       # GET /api/file/apps?path=/path/to/file.pptx
       # Lists installed applications that declare support for the file's
-      # extension (macOS only), so the Web UI can offer "open with" choices
-      # for formats it cannot preview inline. Always [] on other OSes.
+      # extension, so the Web UI can offer "open with" choices for formats it
+      # cannot preview inline. macOS uses MacAppDetector, WSL uses
+      # WindowsAppDetector; other OSes answer with an empty list.
       def api_file_apps(req, res)
         raw_path = URI.decode_www_form(req.query_string.to_s).to_h["path"].to_s
         return json_response(res, 400, { error: "path is required" }) if raw_path.empty?
@@ -4437,34 +4438,57 @@ module Clacky
         path = Utils::EnvironmentDetector.resolve_local_path(raw_path)
         ext = File.extname(path).downcase.sub(/\A\./, "")
 
-        apps = ext.empty? ? [] : Utils::MacAppDetector.apps_for_ext(ext)
+        apps = if ext.empty?
+          []
+        elsif Utils::EnvironmentDetector.os_type == :wsl
+          Utils::WindowsAppDetector.apps_for_ext(ext)
+        else
+          Utils::MacAppDetector.apps_for_ext(ext)
+        end
         json_response(res, 200, { ok: true, apps: apps })
       rescue => e
         json_response(res, 500, { ok: false, error: e.message })
       end
 
       # GET /api/file/default-app?path=...
-      # Returns the application macOS would use to open the file.
+      # Returns the application the OS would use to open the file.
       def api_file_default_app(req, res)
         raw_path = URI.decode_www_form(req.query_string.to_s).to_h["path"].to_s
         return json_response(res, 400, { error: "path is required" }) if raw_path.empty?
 
         path = Utils::EnvironmentDetector.resolve_local_path(raw_path)
-        app = File.extname(path).empty? ? nil : Utils::MacAppDetector.default_app_for(path)
+        app = if File.extname(path).empty?
+          nil
+        elsif Utils::EnvironmentDetector.os_type == :wsl
+          Utils::WindowsAppDetector.default_app_for(path)
+        else
+          Utils::MacAppDetector.default_app_for(path)
+        end
         json_response(res, 200, { ok: true, app: app })
       rescue => e
         json_response(res, 500, { ok: false, error: e.message })
       end
 
-      # GET /api/app-icon?path=/Applications/Keynote.app
-      # Serves an application's bundle icon as a 64px PNG (converted from
-      # .icns via sips, cached under ~/Library/Caches/openclacky/app-icons).
+      # GET /api/app-icon?path=/Applications/Keynote.app  (macOS)
+      # GET /api/app-icon?path=C:\...\app.exe              (WSL)
+      # Serves an application's icon as a PNG. macOS converts the bundle .icns
+      # via sips; WSL extracts the .exe associated icon via PowerShell. Both are
+      # cached on disk.
       def api_app_icon(req, res)
         raw_path = URI.decode_www_form(req.query_string.to_s).to_h["path"].to_s
         return json_response(res, 400, { error: "path is required" }) if raw_path.empty?
 
-        png = Utils::MacAppDetector.icon_png(Utils::EnvironmentDetector.resolve_local_path(raw_path))
-        return json_response(res, 404, { error: "icon not found" }) unless png
+        png = if Utils::EnvironmentDetector.os_type == :wsl
+          Utils::WindowsAppDetector.icon_png(raw_path)
+        else
+          Utils::MacAppDetector.icon_png(Utils::EnvironmentDetector.resolve_local_path(raw_path))
+        end
+        unless png
+          # Never let a failed lookup stick in the browser cache — it would keep
+          # serving a 404 even after the detector is fixed/updated.
+          res["Cache-Control"] = "no-store"
+          return json_response(res, 404, { error: "icon not found" })
+        end
 
         res.status = 200
         res["Content-Type"] = "image/png"
@@ -4479,8 +4503,8 @@ module Clacky
       # Unified file action endpoint — open locally or download.
       # Body: { path: String, action: "open" | "open_with" | "download" | "save" }
       #   open:      opens the file with the OS default handler (local deployments).
-      #   open_with: opens the file with the app named in body.app (macOS only;
-      #              the app must be one returned by /api/file/apps).
+      #   open_with: opens the file with the app named in body.app (the app must
+      #              be one returned by /api/file/apps).
       #   download:  returns the file as a download (remote deployments).
       #   save:      writes content back to the file. Body must include { content: String }.
       def api_file_action(req, res)
@@ -4507,7 +4531,11 @@ module Clacky
           return json_response(res, 501, { error: "unsupported OS" }) if result.nil?
           json_response(res, 200, { ok: true })
         when "open_with"
-          result = Utils::MacAppDetector.open_with(linux_path, body["app"].to_s)
+          result = if Utils::EnvironmentDetector.os_type == :wsl
+            Utils::WindowsAppDetector.open_with(linux_path, body["app"].to_s)
+          else
+            Utils::MacAppDetector.open_with(linux_path, body["app"].to_s)
+          end
           return json_response(res, 400, { error: "unknown application" }) if result.nil?
           return json_response(res, 500, { error: "failed to open with application" }) unless result
           json_response(res, 200, { ok: true })
