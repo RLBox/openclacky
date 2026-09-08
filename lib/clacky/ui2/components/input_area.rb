@@ -188,10 +188,23 @@ module Clacky
               @command_suggestions.select_next
               return { action: nil }
             when :enter
-              # Accept selected command and submit immediately
+              # Accept selected command; submit immediately — unless the
+              # command takes arguments (argument_hint), in which case only
+              # complete the name so the user can type the arguments first
+              # (same behavior as Tab).
               if @command_suggestions.has_suggestions?
                 selected = @command_suggestions.selected_command_text
                 if selected
+                  hint = @command_suggestions.selected_argument_hint
+                  if hint && !hint.empty?
+                    completed = "#{selected} "
+                    @lines = [completed]
+                    @line_index = 0
+                    @cursor_position = completed.length
+                    @command_suggestions.hide
+                    set_tips("Usage: #{selected} #{hint}", type: :info)
+                    return { action: nil }
+                  end
                   # Replace current input with selected command
                   @lines = [selected]
                   @line_index = 0
