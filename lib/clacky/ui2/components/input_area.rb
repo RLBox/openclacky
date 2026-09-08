@@ -62,6 +62,7 @@ module Clacky
             working_dir: nil,
             mode: nil,
             model: nil,
+            reasoning_effort: nil,  # nil = provider default; appended to model name when set
             tasks: 0,
             cost: 0.0,
             cost_source: nil,  # nil / :api / :price / :default — :default means pricing unknown, show N/A
@@ -145,15 +146,18 @@ module Clacky
         # @param working_dir [String] Working directory
         # @param mode [String] Permission mode
         # @param model [String] AI model name
+        # @param reasoning_effort [String, nil] Thinking level; nil (explicit) appends nothing,
+        #   :_unset (default) leaves the previous value untouched
         # @param tasks [Integer] Number of completed tasks
         # @param cost [Float] Total cost
         # @param cost_source [Symbol, nil] :api / :price / :default — :default renders as N/A
         # @param status [String] Workspace status ('idle' or 'working')
-        def update_sessionbar(session_id: nil, working_dir: nil, mode: nil, model: nil, tasks: nil, cost: nil, cost_source: nil, status: nil)
+        def update_sessionbar(session_id: nil, working_dir: nil, mode: nil, model: nil, reasoning_effort: :_unset, tasks: nil, cost: nil, cost_source: nil, status: nil)
           @sessionbar_info[:session_id] = session_id if session_id
           @sessionbar_info[:working_dir] = working_dir if working_dir
           @sessionbar_info[:mode] = mode if mode
           @sessionbar_info[:model] = model if model
+          @sessionbar_info[:reasoning_effort] = reasoning_effort unless reasoning_effort == :_unset
           @sessionbar_info[:tasks] = tasks if tasks
           @sessionbar_info[:cost] = cost if cost
           @sessionbar_info[:cost_source] = cost_source if cost_source
@@ -1186,6 +1190,9 @@ module Clacky
           if @sessionbar_info[:model]
             parts << theme.format_text(@sessionbar_info[:model], :statusbar_secondary)
           end
+
+          # Thinking level (nil renders as off = provider default)
+          parts << theme.format_text((@sessionbar_info[:reasoning_effort] || 'off').to_s, :statusbar_secondary)
 
           # Tasks count
           parts << theme.format_text("#{@sessionbar_info[:tasks]} tasks", :statusbar_secondary)

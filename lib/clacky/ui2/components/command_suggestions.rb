@@ -16,6 +16,7 @@ module Clacky
           { command: "/clear", description: "Clear chat history and restart session" },
           { command: "/config", description: "Open configuration (models, API keys, settings)" },
           { command: "/model", description: "Quickly switch the current model" },
+          { command: "/think", description: "Set the thinking (reasoning) effort level" },
           { command: "/goal", description: "Set a standing goal for autonomous multi-turn work" },
           { command: "/undo", description: "Undo the last task and restore previous state" },
           { command: "/help", description: "Show help information" },

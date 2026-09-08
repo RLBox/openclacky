@@ -345,6 +345,29 @@ module Clacky
         ui_controller.show_success("Switched to model: #{config.model_name}")
       end
 
+      # Handle the `/think` slash command — pick the reasoning effort level
+      # for the current session. "off" normalizes to nil (provider default),
+      # matching the Web UI's reasoning_effort switcher semantics.
+      private def handle_think_command(ui_controller, agent, session_manager = nil)
+        choice = ui_controller.show_reasoning_effort_menu(agent.reasoning_effort)
+        return if choice.nil?
+
+        agent.reasoning_effort = choice
+
+        # The override lives in the session file (not config.yml), so persist
+        # it now — otherwise it would be lost if the user quits before the
+        # next task.
+        session_manager&.save(agent.to_session_data(updated_at: Time.now))
+
+        # Reflect the change in the session bar (appended after the model name)
+        ui_controller.config[:reasoning_effort] = agent.reasoning_effort
+        ui_controller.update_sessionbar
+
+        current = agent.reasoning_effort
+        message = current ? "Thinking level set to #{current}" : "Thinking level: off (provider default)"
+        ui_controller.show_success(message)
+      end
+
       private def handle_time_machine_command(ui_controller, agent, session_manager)
         # Get task history from agent
         history = agent.get_task_history(limit: 10)
@@ -874,6 +897,7 @@ module Clacky
             working_dir: working_dir,
             mode: agent_config.permission_mode.to_s,
             model: agent_config.model_name,
+            reasoning_effort: agent.reasoning_effort,
             theme: theme_name
           )
         end
@@ -996,6 +1020,9 @@ module Clacky
             next
           when "/model"
             handle_model_command(ui_controller, agent_config, agent, session_manager)
+            next
+          when "/think"
+            handle_think_command(ui_controller, agent, session_manager)
             next
           when "/undo"
             handle_time_machine_command(ui_controller, agent, session_manager)

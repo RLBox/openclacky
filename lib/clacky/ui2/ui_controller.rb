@@ -31,6 +31,7 @@ module Clacky
           working_dir: config[:working_dir],
           mode: config[:mode],
           model: config[:model],
+          reasoning_effort: config[:reasoning_effort],
           theme: config[:theme]
         }
 
@@ -81,6 +82,7 @@ module Clacky
           working_dir: @config[:working_dir],
           mode: @config[:mode],
           model: @config[:model],
+          reasoning_effort: @config[:reasoning_effort],
           tasks: @tasks_count,
           cost: @total_cost
         )
@@ -124,6 +126,7 @@ module Clacky
           working_dir: @config[:working_dir],
           mode: @config[:mode],
           model: @config[:model],
+          reasoning_effort: @config[:reasoning_effort],
           tasks: @tasks_count,
           cost: @total_cost,
           cost_source: cost_source,
@@ -1271,6 +1274,7 @@ module Clacky
           "",
           theme.format_text("Commands:", :info),
           "  #{theme.format_text("/model", :success)}       - Quickly switch the current model",
+          "  #{theme.format_text("/think", :success)}       - Set the thinking (reasoning) effort level",
           "  #{theme.format_text("/config", :success)}      - Configure models, API keys, settings",
           "  #{theme.format_text("/goal", :success)}        - Set a standing goal for autonomous work",
           "    #{theme.format_text("/goal <text>", :dim)}       Set a goal and start working toward it",
@@ -1803,6 +1807,7 @@ module Clacky
             working_dir: @config[:working_dir],
             mode: @config[:mode],
             model: @config[:model],
+            reasoning_effort: @config[:reasoning_effort],
             tasks: @tasks_count,
             cost: @total_cost
           )
@@ -2119,6 +2124,37 @@ module Clacky
         )
 
         result # Return selected task_id or nil
+      end
+
+      # Show a reasoning-effort picker for the `/think` command.
+      # @param current_effort [String, nil] the agent's current effort level
+      # @return [String, nil] the chosen level ("off"/"low"/.../"max") or nil if cancelled
+      public def show_reasoning_effort_menu(current_effort)
+        modal = Components::ModalComponent.new
+
+        descriptions = {
+          "off"    => "Provider default (no effort override)",
+          "low"    => "Light reasoning - fastest",
+          "medium" => "Balanced reasoning",
+          "high"   => "Deep reasoning",
+          "xhigh"  => "Extra deep reasoning",
+          "max"    => "Maximum reasoning - slowest"
+        }
+
+        active_index = nil
+        choices = descriptions.keys.each_with_index.map do |level, idx|
+          is_current = current_effort.nil? ? level == "off" : level == current_effort
+          active_index = idx if is_current
+          marker = is_current ? "● " : "  "
+          { name: "#{marker}#{level} - #{descriptions[level]}", value: level }
+        end
+
+        modal.show(
+          title: "Thinking Level - Set Reasoning Effort",
+          choices: choices,
+          initial_index: active_index,
+          on_close: -> { @layout.rerender_all }
+        )
       end
 
       # Show form for editing a model
