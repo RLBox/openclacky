@@ -1876,14 +1876,15 @@ module Clacky
             }
           end
 
-          # Add action buttons
-          choices << { name: "─" * 50, disabled: true }
-          choices << { name: "[+] Add New Model", value: { action: :add } }
+          # Add action buttons (sticky: always visible below the scrollable
+          # model list, so a long model list can't push them off screen)
+          choices << { name: "─" * 50, disabled: true, sticky: true }
+          choices << { name: "[+] Add New Model", value: { action: :add }, sticky: true }
           if current_config.models.length > 0
-            choices << { name: "[*] Edit Current Model", value: { action: :edit } }
-            choices << { name: "[-] Delete Model", value: { action: :delete } } if current_config.models.length > 1
+            choices << { name: "[*] Edit Current Model", value: { action: :edit }, sticky: true }
+            choices << { name: "[-] Delete Model", value: { action: :delete }, sticky: true } if current_config.models.length > 1
           end
-          choices << { name: "[X] Close", value: { action: :close } }
+          choices << { name: "[X] Close", value: { action: :close }, sticky: true }
 
           # Show menu
           result = modal.show(
