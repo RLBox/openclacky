@@ -20,6 +20,7 @@ require_relative "session_registry"
 require_relative "project_manager"
 require_relative "git_panel"
 require_relative "dir_picker"
+require_relative "preview"
 require_relative "web_ui_controller"
 require_relative "model_prices"
 require_relative "scheduler"
@@ -168,6 +169,7 @@ module Clacky
     #   GET  /**                     → static files served from lib/clacky/web/ directory
     class HttpServer
       include DirPicker
+      include Preview
 
       WEB_ROOT = File.expand_path("../web", __dir__)
       # How long shutdown waits for each agent thread to unwind before falling
@@ -496,6 +498,10 @@ module Clacky
             self.send(:serve_agent_avatar, req, res)
           elsif req.path.start_with?("/ext_ui/")
             self.send(:serve_ext_ui, req, res)
+          elsif req.path.start_with?("/preview/p/")
+            self.send(:serve_preview_proxy, req, res)
+          elsif req.path == "/preview" || req.path.start_with?("/preview/")
+            self.send(:serve_preview, req, res)
           else
             file_handler.service(req, res)
             res["Cache-Control"] = "no-store"
