@@ -29,7 +29,7 @@ module Clacky
         "name" => "OpenClacky",
         "base_url" => "https://api.openclacky.com",
         "api" => "bedrock",
-        "default_model" => "abs-claude-sonnet-5",
+        "default_model" => "or-gemini-3-8-flash",
         "models" => [
           "abs-gpt-6-astra",
           "abs-gpt-5.6-sol",
@@ -139,7 +139,7 @@ module Clacky
         # Default OCR sidecar — used when the primary model is text-only.
         # Candidates are derived from the provider's vision-capable models;
         # this just picks the cheap+fast default to surface in "auto" mode.
-        "default_ocr_model" => "dsk-deepseek-v4-flash-vision-exp",
+        "default_ocr_model" => "or-gemini-3-8-flash",
         # Provider-level default: the Claude family served here is vision-capable.
         "capabilities" => { "vision" => true }.freeze,
         # Model-level overrides: DeepSeek models routed through this provider
