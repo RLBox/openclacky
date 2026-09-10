@@ -7,7 +7,7 @@ RSpec.describe Clacky::UI2::Components::InputArea, "sessionbar reasoning effort"
   let(:input_area) { described_class.new }
 
   def bar_content
-    input_area.send(:build_sessionbar_content)
+    input_area.send(:strip_ansi_codes, input_area.send(:build_sessionbar_content))
   end
 
   before do
