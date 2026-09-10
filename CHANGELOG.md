@@ -4,6 +4,57 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
+## [1.5.14] - 2026-09-10
+
+### Added
+- Add a click-driven live preview panel for workspace files and localhost dev servers
+- Open local files in the preview panel via file:// URLs and bare absolute paths
+- Add GPT-5.6 Sol/Terra/Luna and GPT-6 Astra models with Global CRIS pricing
+- Add the deepseek-flash model
+- Add an editable Chinese metadata form and field-level frontmatter update API for skills
+- Add a /think reasoning-effort switcher to the TUI
+- Render CSV/TSV files as read-only tables in the workspace
+- Add Parallel Free as the primary built-in web-search provider
+- Select text in a message and quote it into the composer (#526 - @kylezhang)
+- Syntax-highlight code in the file viewer
+- Send large STT audio as base64 JSON (#525 - @tomash)
+- Add a Files panel open-with menu, tree toggle, split preview, and in-menu download
+- Detect Windows apps for open-with in WSL
+- Skip registering the browser tool when it is disabled
+- Auto-snapshot the page after browser actions
+- Truncate long working directories in the session info bar
+- Highlight width-drag handles on hover
+
+### Improved
+- Switch the default model to Gemini 3.8 Flash
+- Use single-pane navigation on mobile (C-5779) (#539)
+- Polish the chat navigator layout and hover interactions (#527)
+- Improve message navigation in long conversations (#523)
+- Refine the billing tooltip UX (C-5778) (#537)
+- Let the git panel fill the aside height and free up diff width (#531)
+
+### Fixed
+- Restore the aside width after closing file previews (#545)
+- Replace undefined danger tokens with the error color variable (#542 - @sundevilyang)
+- Add hover and disabled feedback to danger and secondary buttons (#541, #540 - @sundevilyang)
+- Correct DeepSeek v4-pro and flash pricing
+- Collapse extension actions into a menu on narrow screens (C-5781) (#538)
+- Don't submit argumented commands on Enter
+- Scroll overflow menus and pin config action buttons
+- Sniff binary content before text preview (C-5690) (#535)
+- Require a slash prefix for channel help commands (C-5641) (#533)
+- Normalize the homepage URL scheme on read (C-5666) (#534)
+- Decode non-ASCII paths in git panel output (C-5777) (#530)
+- Refresh the file tree on working-dir switch and task completion
+- Harden extension developer guidance and manifest validation (#524)
+- Fix zip file encoding errors
+- Resolve file://~/ tilde paths from chat links
+- Align the open-button icon
+
+### More
+- Move the preview tab to the end of the left-nav order
+- Extract provider id constants to replace magic strings
+
 ## [1.5.13] - 2026-09-03
 
 ### Added
