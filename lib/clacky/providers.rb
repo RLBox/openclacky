@@ -32,6 +32,9 @@ module Clacky
         "default_model" => "abs-claude-sonnet-5",
         "models" => [
           "abs-gpt-6-astra",
+          "abs-gpt-5.6-sol",
+          "abs-gpt-5.6-terra",
+          "abs-gpt-5.6-luna",
           "abs-claude-fable-5-1",
           "abs-claude-fable-5",
           "abs-claude-opus-5",
@@ -170,6 +173,8 @@ module Clacky
           "abs-claude-sonnet-5"   => "abs-claude-haiku-4-5",
           "abs-claude-sonnet-4-6" => "abs-claude-haiku-4-5",
           "abs-claude-sonnet-4-5" => "abs-claude-haiku-4-5",
+          "abs-gpt-5.6-sol"       => "abs-gpt-5.6-luna",
+          "abs-gpt-5.6-terra"     => "abs-gpt-5.6-luna",
           "dsk-deepseek-v4-pro"   => "dsk-deepseek-v4-flash",
           "or-gemini-3-1-pro"     => "or-gemini-3-6-flash"
         },
@@ -427,6 +432,7 @@ module Clacky
         "api" => "openai-completions",
         "default_model" => "gpt-5.5",
         "models" => [
+          "gpt-6-astra",
           "gpt-5.6-sol",
           "gpt-5.6-terra",
           "gpt-5.6-luna",

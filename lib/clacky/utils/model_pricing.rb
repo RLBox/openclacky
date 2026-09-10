@@ -470,74 +470,80 @@ module Clacky
         }
       },
 
-      # GPT-5.6 flat-rate models (no breakpoint, single rate regardless of
-      # context; *-pro variants are priced identically to the base tier).
-      # Source: OpenAI list price ($/MTok) via OpenRouter model pages, incl.
-      # the OpenAI-direct provider row (verified 2026-08-18). Cache write is
-      # not published separately; it follows the GPT-5.5 convention (= input).
+      # GPT-5.6 via Bedrock's OpenAI-compatible endpoint (Global CRIS).
+      # Tiered at 272K input tokens (OpenAI's breakpoint) — same caveat as
+      # GPT-6 Astra below. USD per 1M tokens, source: llm_proxy bedrock_openai
+      # pricing. *-pro variants are priced identically to the base tier.
       "gpt-5.6-sol" => {
         input: {
-          default: 2.50,
-          over_200k: 2.50
+          default: 4.00,
+          over_200k: 8.00
         },
         output: {
-          default: 15.00,
-          over_200k: 15.00
+          default: 20.00,
+          over_200k: 30.00
         },
         cache: {
-          write: 2.50,
-          read: 0.25
+          write_default: 5.00,
+          write_over_200k: 10.00,
+          read_default: 0.40,
+          read_over_200k: 0.80
         }
       },
 
       "gpt-5.6-terra" => {
         input: {
           default: 2.00,
-          over_200k: 2.00
+          over_200k: 4.00
         },
         output: {
           default: 12.00,
-          over_200k: 12.00
+          over_200k: 18.00
         },
         cache: {
-          write: 2.00,
-          read: 0.20
+          write_default: 2.50,
+          write_over_200k: 5.00,
+          read_default: 0.20,
+          read_over_200k: 0.40
         }
       },
 
       "gpt-5.6-luna" => {
         input: {
           default: 0.20,
-          over_200k: 0.20
+          over_200k: 0.40
         },
         output: {
           default: 1.20,
-          over_200k: 1.20
+          over_200k: 1.80
         },
         cache: {
-          write: 0.20,
-          read: 0.02
+          write_default: 0.25,
+          write_over_200k: 0.50,
+          read_default: 0.02,
+          read_over_200k: 0.04
         }
       },
 
-      # GPT-6 Astra via Bedrock's OpenAI-compatible endpoint. Tiered at 272K
-      # input tokens (OpenAI's breakpoint, not the global 200K) — the 200K–272K
-      # band is slightly over-estimated, same caveat as GPT-5.5/5.4 below.
-      # USD per 1M tokens, source: llm_proxy bedrock_openai pricing.
+      # GPT-6 Astra via Bedrock's OpenAI-compatible endpoint (Global CRIS).
+      # Tiered at 272K input tokens (OpenAI's breakpoint, not the global 200K)
+      # — the 200K–272K band is slightly over-estimated, same caveat as
+      # GPT-5.5/5.4 below. USD per 1M tokens, source: llm_proxy bedrock_openai
+      # pricing.
       "gpt-6-astra" => {
         input: {
-          default: 11.00,
-          over_200k: 22.00
+          default: 10.00,
+          over_200k: 20.00
         },
         output: {
-          default: 55.00,
-          over_200k: 82.50
+          default: 50.00,
+          over_200k: 75.00
         },
         cache: {
-          write_default: 13.75,
-          write_over_200k: 27.50,
-          read_default: 1.10,
-          read_over_200k: 2.20
+          write_default: 12.50,
+          write_over_200k: 25.00,
+          read_default: 1.00,
+          read_over_200k: 2.00
         }
       },
 
@@ -1105,13 +1111,13 @@ module Clacky
         # anchored rules above would otherwise miss it) and the "-pro"
         # suffix (pro is priced identically to the base tier). Batch ids
         # (":batch") stay unmatched - they bill at half price.
-        when /^(?:abs-|us\.openai\.|openai\/)?gpt-?6[.-]?astra$/i
+        when /^(?:abs-|us\.openai\.|global\.openai\.|openai\/)?gpt-?6[.-]?astra$/i
           "gpt-6-astra"
-        when %r{^(openai/)?gpt-?5[\.-]?6[\.-]?sol(-pro)?$}i
+        when %r{^(?:abs-|global\.openai\.|openai/)?gpt-?5[\.-]?6[\.-]?sol(-pro)?$}i
           "gpt-5.6-sol"
-        when %r{^(openai/)?gpt-?5[\.-]?6[\.-]?terra(-pro)?$}i
+        when %r{^(?:abs-|global\.openai\.|openai/)?gpt-?5[\.-]?6[\.-]?terra(-pro)?$}i
           "gpt-5.6-terra"
-        when %r{^(openai/)?gpt-?5[\.-]?6[\.-]?luna(-pro)?$}i
+        when %r{^(?:abs-|global\.openai\.|openai/)?gpt-?5[\.-]?6[\.-]?luna(-pro)?$}i
           "gpt-5.6-luna"
         when /^gpt-?5\.?5$/i, /^gpt-?5[\.-]?5$/i
           "gpt-5.5"        

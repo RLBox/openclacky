@@ -521,38 +521,38 @@ RSpec.describe Clacky::ModelPricing do
     end
     
     context "with GPT-5.6 models (Sol / Terra / Luna)" do
-      it "bills gpt-5.6-luna at flat economy rates" do
+      it "bills gpt-5.6-luna at tiered rates (long tier above 200K)" do
         usage = { prompt_tokens: 1_000_000, completion_tokens: 1_000_000 }
 
-        # Input:  1M * $0.20 = $0.20
-        # Output: 1M * $1.20 = $1.20
-        # Total: $1.40
+        # Input:  1M * $0.40 = $0.40
+        # Output: 1M * $1.80 = $1.80
+        # Total: $2.20
         result = described_class.calculate_cost(model: "gpt-5.6-luna", usage: usage)
-        expect(result[:cost]).to be_within(0.0001).of(1.40)
+        expect(result[:cost]).to be_within(0.0001).of(2.20)
         expect(result[:source]).to eq(:price)
       end
 
-      it "bills gpt-5.6-terra at flat rates" do
+      it "bills gpt-5.6-terra at tiered rates (long tier above 200K)" do
         usage = { prompt_tokens: 1_000_000, completion_tokens: 1_000_000 }
 
-        # $2.00 + $12.00 = $14.00
+        # $4.00 + $18.00 = $22.00
         result = described_class.calculate_cost(model: "gpt-5.6-terra", usage: usage)
-        expect(result[:cost]).to be_within(0.0001).of(14.00)
+        expect(result[:cost]).to be_within(0.0001).of(22.00)
         expect(result[:source]).to eq(:price)
       end
 
-      it "bills gpt-5.6-sol at flat rates with cache read" do
+      it "bills gpt-5.6-sol at tiered rates with cache read" do
         usage = {
           prompt_tokens: 1_000_000,
           completion_tokens: 0,
           cache_read_input_tokens: 200_000
         }
 
-        # Regular input: (1_000_000 - 200_000)/1M * $2.50 = $2.00
-        # Cache read:     200_000 / 1M * $0.25            = $0.05
-        # Total: $2.05
+        # Regular input: (1_000_000 - 200_000)/1M * $8.00 = $6.40
+        # Cache read:     200_000 / 1M * $0.80            = $0.16
+        # Total: $6.56
         result = described_class.calculate_cost(model: "gpt-5.6-sol", usage: usage)
-        expect(result[:cost]).to be_within(0.0001).of(2.05)
+        expect(result[:cost]).to be_within(0.0001).of(6.56)
         expect(result[:source]).to eq(:price)
       end
 
@@ -561,7 +561,8 @@ RSpec.describe Clacky::ModelPricing do
           model: "openai/gpt-5.6-luna",
           usage: { prompt_tokens: 1_000_000, completion_tokens: 0 }
         )
-        expect(result[:cost]).to be_within(0.0001).of(0.20)
+        # 1M > 200K -> long tier input $0.40
+        expect(result[:cost]).to be_within(0.0001).of(0.40)
         expect(result[:source]).to eq(:price)
       end
 
@@ -573,14 +574,17 @@ RSpec.describe Clacky::ModelPricing do
         expect(pro[:source]).to eq(:price)
       end
 
-      it "keeps flat rates above 200K (no tier bump)" do
+      it "bumps to the long tier above 200K input tokens" do
         small = described_class.calculate_cost(
-          model: "gpt-5.6-terra", usage: { prompt_tokens: 10_000, completion_tokens: 0 }
+          model: "gpt-5.6-terra", usage: { prompt_tokens: 100_000, completion_tokens: 0 }
         )[:cost]
         large = described_class.calculate_cost(
           model: "gpt-5.6-terra", usage: { prompt_tokens: 250_000, completion_tokens: 0 }
         )[:cost]
-        expect(small / 10_000).to be_within(0.0000001).of(large / 250_000)
+
+        # Short tier: 100K * $2.00 = $0.20; long tier: 250K * $4.00 = $1.00
+        expect(small).to be_within(0.0001).of(0.20)
+        expect(large).to be_within(0.0001).of(1.00)
       end
 
       it "returns nil for :batch ids (half-price billing not modeled)" do
