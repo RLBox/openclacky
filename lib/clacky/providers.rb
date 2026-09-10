@@ -45,6 +45,7 @@ module Clacky
           "abs-claude-sonnet-4-6",
           "abs-claude-sonnet-4-5",
           "abs-claude-haiku-4-5",
+          "dsk-deepseek-flash",
           "dsk-deepseek-v4-pro",
           "dsk-deepseek-v4-flash",
           "dsk-deepseek-v4-flash-vision-exp",
@@ -147,6 +148,7 @@ module Clacky
         # to disk refs. Gemini 3.1 Pro keeps the provider-default vision=true
         # (it accepts image/audio/video input natively via OpenRouter).
         "model_capabilities" => {
+          "dsk-deepseek-flash"               => { "vision" => true }.freeze,
           "dsk-deepseek-v4-pro"              => { "vision" => false }.freeze,
           "dsk-deepseek-v4-flash"            => { "vision" => false }.freeze,
           "dsk-deepseek-v4-flash-vision-exp" => { "vision" => true }.freeze
@@ -278,14 +280,17 @@ module Clacky
         # deprecated on 2026-07-24; they map to deepseek-v4-flash's non-thinking
         # and thinking modes respectively. Prefer deepseek-v4-flash / deepseek-v4-pro.
         "models" => [
+          "deepseek-flash",
           "deepseek-v4-pro",
           "deepseek-v4-flash",
           "deepseek-v4-flash-vision-exp",
         ],
         # DeepSeek V4 API is text-only across all models, except the
-        # flash-vision-exp variant which accepts image input.
+        # flash-vision-exp variant which accepts image input. V4.1 Flash
+        # (deepseek-flash) is natively multimodal.
         "capabilities" => { "vision" => false }.freeze,
         "model_capabilities" => {
+          "deepseek-flash"               => { "vision" => true }.freeze,
           "deepseek-v4-flash-vision-exp" => { "vision" => true }.freeze
         }.freeze,
         "website_url" => "https://platform.deepseek.com/api_keys"

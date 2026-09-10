@@ -17,6 +17,7 @@ module Clacky
       # "primary" id where the gateway can dispatch an alias two ways.
       ALIAS_TO_REAL = {
         # deepseek (dsk-)
+        "dsk-deepseek-flash"               => "deepseek-flash",
         "dsk-deepseek-v4-pro"              => "deepseek-v4-pro",
         "dsk-deepseek-v4-flash"            => "deepseek-v4-flash",
         "dsk-deepseek-v4-flash-vision-exp" => "deepseek-v4-flash-vision-exp",

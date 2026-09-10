@@ -179,10 +179,26 @@ module Clacky
       # Peak/off-peak billing (off-peak = half of peak; peak = 01:00-04:00 &
       # 06:00-10:00 UTC). Weekends (Sat/Sun, Beijing time) are billed entirely
       # at off-peak rates regardless of hour.
-      # Effective 2026-09-10 12:00 Beijing time the flash-series pricing was
-      # revised and v4-pro upgraded to V4.1 Flash (same revised rates).
+      # v4-pro keeps its own rates until 2026-09-14, when it is routed to
+      # V4.1 Flash and billed at the flash rates (see flash_peak/flash_off_peak).
       # Each entry carries peak/off_peak tiers; calculate_cost resolves the
       # active tier from the request time.
+      # V4.1 Flash — new canonical model id. Native multimodal; the retired
+      # v4-flash / v4-flash-vision-exp ids are routed here for compatibility.
+      "deepseek-flash" => {
+        deepseek: true,
+        peak: {
+          input:  { default: 0.30,   over_200k: 0.30 },
+          output: { default: 1.20,   over_200k: 1.20 },
+          cache:  { write: 0.30,     read: 0.006 }
+        },
+        off_peak: {
+          input:  { default: 0.15,   over_200k: 0.15 },
+          output: { default: 0.60,   over_200k: 0.60 },
+          cache:  { write: 0.15,     read: 0.003 }
+        }
+      },
+
       "deepseek-v4-flash" => {
         deepseek: true,
         peak: {
@@ -216,14 +232,26 @@ module Clacky
       "deepseek-v4-pro" => {
         deepseek: true,
         peak: {
-          input:  { default: 0.30,   over_200k: 0.30 },   # $0.30/MTok  cache miss (peak)
-          output: { default: 1.20,   over_200k: 1.20 },   # $1.20/MTok
-          cache:  { write: 0.30,     read: 0.006 }        # $0.006/MTok cache hit
+          input:  { default: 1.32,   over_200k: 1.32 },   # $1.32/MTok  cache miss (peak)
+          output: { default: 3.96,   over_200k: 3.96 },   # $3.96/MTok
+          cache:  { write: 1.32,     read: 0.044 }        # $0.044/MTok cache hit
         },
         off_peak: {
-          input:  { default: 0.15,   over_200k: 0.15 },   # $0.15/MTok  (half of peak)
-          output: { default: 0.60,   over_200k: 0.60 },   # $0.60/MTok
-          cache:  { write: 0.15,     read: 0.003 }        # $0.003/MTok cache hit
+          input:  { default: 0.66,   over_200k: 0.66 },   # $0.66/MTok  (half of peak)
+          output: { default: 1.98,   over_200k: 1.98 },   # $1.98/MTok
+          cache:  { write: 0.66,     read: 0.022 }        # $0.022/MTok cache hit
+        },
+        # Routed to V4.1 Flash from 2026-09-14 12:00 Beijing time and billed
+        # at the flash rates.
+        flash_peak: {
+          input:  { default: 0.30,   over_200k: 0.30 },
+          output: { default: 1.20,   over_200k: 1.20 },
+          cache:  { write: 0.30,     read: 0.006 }
+        },
+        flash_off_peak: {
+          input:  { default: 0.15,   over_200k: 0.15 },
+          output: { default: 0.60,   over_200k: 0.60 },
+          cache:  { write: 0.15,     read: 0.003 }
         }
       },
 
@@ -867,6 +895,10 @@ module Clacky
     # Costs for prompts between 200K–272K will be slightly over-estimated.
     TIERED_PRICING_THRESHOLD = 200_000
 
+    # v4-pro is routed to V4.1 Flash and billed at the flash rates from
+    # 2026-09-14 12:00 Beijing time (= 04:00 UTC).
+    DEEPSEEK_V4_PRO_FLASH_START = Time.utc(2026, 9, 14, 4, 0, 0)
+
     class << self
       # Calculate cost for the given model and usage
       #
@@ -1009,6 +1041,9 @@ module Clacky
           "deepseek-v4-flash-vision-exp"
         when /deepseek-v4-flash/i, /deepseek.*v4.*flash/i
           "deepseek-v4-flash"
+        # V4.1 Flash — new canonical id; native multimodal.
+        when /deepseek-flash/i
+          "deepseek-flash"
         # Legacy aliases: deepseek-chat and deepseek-reasoner are being
         # deprecated on 2026-07-24 and map to deepseek-v4-flash's
         # non-thinking / thinking modes respectively. Bill at flash rates.
@@ -1177,6 +1212,12 @@ module Clacky
       # Resolve a DeepSeek pricing entry (which holds peak/off_peak tiers) to
       # the single tier that applies at the given time.
       def resolve_deepseek_tier(pricing, now)
+        # v4-pro migrates to V4.1 Flash on 2026-09-14; its entry carries
+        # flash_peak/flash_off_peak.
+        if pricing.key?(:flash_peak) && now >= DEEPSEEK_V4_PRO_FLASH_START
+          return deepseek_weekend?(now) || !deepseek_peak_hour?(now) ? pricing[:flash_off_peak] : pricing[:flash_peak]
+        end
+
         if deepseek_weekend?(now) || !deepseek_peak_hour?(now)
           pricing[:off_peak]
         else
