@@ -134,6 +134,36 @@ module Clacky
           return
         end
 
+        serve_preview_file(req, res, abs)
+      end
+
+      # GET /preview/f/<absolute-path> — serve a local file outside the
+      # workspace, addressed by its absolute path (the panel maps file:// URLs
+      # here). Restricted to the user's home directory so it cannot read
+      # system files elsewhere.
+      private def serve_preview_local(req, res)
+        unless req.request_method == "GET" || req.request_method == "HEAD"
+          preview_method_not_allowed(res)
+          return
+        end
+
+        abs = preview_decode_path(req.path.delete_prefix("/preview/f"))
+        return preview_not_found(res) if abs.empty? || !abs.start_with?("/")
+
+        abs  = File.expand_path(abs)
+        home = File.expand_path(Dir.home)
+        unless abs == home || abs.start_with?(home + File::SEPARATOR)
+          preview_not_found(res)
+          return
+        end
+
+        serve_preview_file(req, res, abs)
+      end
+
+      # Shared tail for the file-serving routes: resolve a directory to its
+      # index.html, then stream the file with the MIME whitelist and the
+      # injected navigation reporter.
+      private def serve_preview_file(req, res, abs)
         abs = File.join(abs, "index.html") if File.directory?(abs)
         unless File.file?(abs)
           preview_not_found(res)

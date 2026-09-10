@@ -419,4 +419,78 @@ RSpec.describe Clacky::Server::HttpServer, "preview route" do
       expect(serve_proxy(server, "GET", "/preview/p/1/").status).to eq(502)
     end
   end
+
+  describe "local file route /preview/f/<absolute-path>" do
+    let(:outside_dir) { Dir.mktmpdir("clacky_preview_outside") }
+
+    after { FileUtils.rm_rf(outside_dir) }
+
+    before { allow(Dir).to receive(:home).and_return(tmpdir) }
+
+    def serve_local(server, method, path)
+      r = res
+      server.send(:serve_preview_local, req(method, path), r)
+      r
+    end
+
+    it "serves an HTML file inside the home directory" do
+      File.write(File.join(tmpdir, "report.html"), "<h1>report</h1>")
+
+      r = serve_local(server, "GET", "/preview/f#{File.join(tmpdir, "report.html")}")
+
+      expect(r.status).to eq(200)
+      expect(r.headers["Content-Type"]).to eq("text/html; charset=utf-8")
+      expect(r.body).to include("<h1>report</h1>")
+    end
+
+    it "serves a percent-encoded non-ASCII absolute path" do
+      File.write(File.join(tmpdir, "简历.html"), "cv")
+
+      r = serve_local(server, "GET", "/preview/f#{tmpdir}/%E7%AE%80%E5%8E%86.html")
+
+      expect(r.status).to eq(200)
+      expect(r.body).to include("cv")
+    end
+
+    it "resolves a directory to its index.html" do
+      FileUtils.mkdir_p(File.join(tmpdir, "site"))
+      File.write(File.join(tmpdir, "site", "index.html"), "<p>site</p>")
+
+      r = serve_local(server, "GET", "/preview/f#{File.join(tmpdir, "site")}")
+
+      expect(r.status).to eq(200)
+      expect(r.body).to include("<p>site</p>")
+    end
+
+    it "404s on a path outside the home directory" do
+      outside = File.join(outside_dir, "secret.html")
+      File.write(outside, "secret")
+
+      r = serve_local(server, "GET", "/preview/f#{outside}")
+
+      expect(r.status).to eq(404)
+    end
+
+    it "404s when the path is not absolute" do
+      r = serve_local(server, "GET", "/preview/frelative/path.html")
+
+      expect(r.status).to eq(404)
+    end
+
+    it "404s for a missing file" do
+      r = serve_local(server, "GET", "/preview/f#{File.join(tmpdir, "nope.html")}")
+
+      expect(r.status).to eq(404)
+    end
+
+    it "returns the file size and no body for HEAD" do
+      File.write(File.join(tmpdir, "page.html"), "12345")
+
+      r = serve_local(server, "HEAD", "/preview/f#{File.join(tmpdir, "page.html")}")
+
+      expect(r.status).to eq(200)
+      expect(r.headers["Content-Length"]).to eq("5")
+      expect(r.body).to eq("")
+    end
+  end
 end

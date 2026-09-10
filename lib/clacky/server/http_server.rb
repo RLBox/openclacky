@@ -500,6 +500,8 @@ module Clacky
             self.send(:serve_ext_ui, req, res)
           elsif req.path.start_with?("/preview/p/")
             self.send(:serve_preview_proxy, req, res)
+          elsif req.path.start_with?("/preview/f/")
+            self.send(:serve_preview_local, req, res)
           elsif req.path == "/preview" || req.path.start_with?("/preview/")
             self.send(:serve_preview, req, res)
           else
