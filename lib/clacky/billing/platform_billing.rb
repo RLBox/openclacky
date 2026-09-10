@@ -20,6 +20,8 @@ module Clacky
         "dsk-deepseek-v4-pro"              => "deepseek-v4-pro",
         "dsk-deepseek-v4-flash"            => "deepseek-v4-flash",
         "dsk-deepseek-v4-flash-vision-exp" => "deepseek-v4-flash-vision-exp",
+        # gpt via bedrock (abs-, OpenAI-compatible endpoint)
+        "abs-gpt-6-astra" => "us.openai.gpt-6-astra",
         # claude via bedrock (abs-)
         "abs-claude-fable-5-1"  => "global.anthropic.claude-fable-5-1",
         "abs-claude-fable-5"    => "global.anthropic.claude-fable-5",

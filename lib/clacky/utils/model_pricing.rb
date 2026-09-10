@@ -534,6 +534,27 @@ module Clacky
         }
       },
 
+      # GPT-6 Astra via Bedrock's OpenAI-compatible endpoint. Tiered at 272K
+      # input tokens (OpenAI's breakpoint, not the global 200K) — the 200K–272K
+      # band is slightly over-estimated, same caveat as GPT-5.5/5.4 below.
+      # USD per 1M tokens, source: llm_proxy bedrock_openai pricing.
+      "gpt-6-astra" => {
+        input: {
+          default: 11.00,
+          over_200k: 22.00
+        },
+        output: {
+          default: 55.00,
+          over_200k: 82.50
+        },
+        cache: {
+          write_default: 13.75,
+          write_over_200k: 27.50,
+          read_default: 1.10,
+          read_over_200k: 2.20
+        }
+      },
+
       # OpenAI GPT-5.5 / GPT-5.4 - breakpoint at 272K input tokens      # Source: https://openai.com/api/pricing/ (USD / 1M tokens)
       # Note: OpenAI's actual tiered-pricing threshold is 272K, not the
       # global 200K below.  Prompts between 200K–272K will slightly
@@ -1102,6 +1123,8 @@ module Clacky
         # anchored rules above would otherwise miss it) and the "-pro"
         # suffix (pro is priced identically to the base tier). Batch ids
         # (":batch") stay unmatched - they bill at half price.
+        when /^(?:abs-|us\.openai\.|openai\/)?gpt-?6[.-]?astra$/i
+          "gpt-6-astra"
         when %r{^(openai/)?gpt-?5[\.-]?6[\.-]?sol(-pro)?$}i
           "gpt-5.6-sol"
         when %r{^(openai/)?gpt-?5[\.-]?6[\.-]?terra(-pro)?$}i

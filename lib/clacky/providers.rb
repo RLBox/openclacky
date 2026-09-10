@@ -31,6 +31,7 @@ module Clacky
         "api" => "bedrock",
         "default_model" => "abs-claude-sonnet-5",
         "models" => [
+          "abs-gpt-6-astra",
           "abs-claude-fable-5-1",
           "abs-claude-fable-5",
           "abs-claude-opus-5",
@@ -146,6 +147,12 @@ module Clacky
           "dsk-deepseek-v4-pro"              => { "vision" => false }.freeze,
           "dsk-deepseek-v4-flash"            => { "vision" => false }.freeze,
           "dsk-deepseek-v4-flash-vision-exp" => { "vision" => true }.freeze
+        }.freeze,
+        # Bedrock GPT models (abs-gpt-*) are served through the OpenAI
+        # Responses API — their Chat Completions endpoint rejects function
+        # tools for reasoning models (GPT-6 Astra).
+        "model_api_overrides" => {
+          /\Aabs-gpt-/ => "openai-responses"
         }.freeze,
         # Per-primary lite pairing: keys are "strong" primary models, values
         # are the lite sidekick to auto-inject when that primary is the
