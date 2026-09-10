@@ -176,28 +176,24 @@ module Clacky
       #   - "cache miss input" = regular prompt_tokens rate
       #   - "cache hit input"  = cache_read rate (DeepSeek has no separate cache-write charge)
       #   - No tiered pricing (single rate regardless of context length)
-      # Effective 2026-08-16 16:00 UTC DeepSeek switched to peak/off-peak billing
-      # (off-peak = half of peak; peak = 01:00-04:00 & 06:00-10:00 UTC).
-      # Effective 2026-08-23 00:00 Beijing time, weekends (Sat/Sun, Beijing
-      # time) are billed entirely at off-peak rates regardless of hour.
-      # Each entry carries legacy/peak/off_peak tiers; calculate_cost resolves
-      # the active tier from the request time.
+      # Peak/off-peak billing (off-peak = half of peak; peak = 01:00-04:00 &
+      # 06:00-10:00 UTC). Weekends (Sat/Sun, Beijing time) are billed entirely
+      # at off-peak rates regardless of hour.
+      # Effective 2026-09-10 12:00 Beijing time the flash-series pricing was
+      # revised and v4-pro upgraded to V4.1 Flash (same revised rates).
+      # Each entry carries peak/off_peak tiers; calculate_cost resolves the
+      # active tier from the request time.
       "deepseek-v4-flash" => {
         deepseek: true,
-        legacy: {
-          input:  { default: 0.14,   over_200k: 0.14 },   # $0.14/MTok  (pre-cutover flat)
-          output: { default: 0.28,   over_200k: 0.28 },   # $0.28/MTok
-          cache:  { write: 0.14,     read: 0.0028 }       # $0.0028/MTok cache hit
-        },
         peak: {
-          input:  { default: 0.44,   over_200k: 0.44 },   # $0.44/MTok  cache miss (peak)
-          output: { default: 1.32,   over_200k: 1.32 },   # $1.32/MTok
-          cache:  { write: 0.44,     read: 0.014 }        # $0.014/MTok cache hit
+          input:  { default: 0.30,   over_200k: 0.30 },   # $0.30/MTok  cache miss (peak)
+          output: { default: 1.20,   over_200k: 1.20 },   # $1.20/MTok
+          cache:  { write: 0.30,     read: 0.006 }        # $0.006/MTok cache hit
         },
         off_peak: {
-          input:  { default: 0.22,   over_200k: 0.22 },   # $0.22/MTok  (half of peak)
-          output: { default: 0.66,   over_200k: 0.66 },   # $0.66/MTok
-          cache:  { write: 0.22,     read: 0.007 }        # $0.007/MTok cache hit
+          input:  { default: 0.15,   over_200k: 0.15 },   # $0.15/MTok  (half of peak)
+          output: { default: 0.60,   over_200k: 0.60 },   # $0.60/MTok
+          cache:  { write: 0.15,     read: 0.003 }        # $0.003/MTok cache hit
         }
       },
 
@@ -205,39 +201,29 @@ module Clacky
       # as tokens per DeepSeek's image tokenization rules).
       "deepseek-v4-flash-vision-exp" => {
         deepseek: true,
-        legacy: {
-          input:  { default: 0.14,   over_200k: 0.14 },
-          output: { default: 0.28,   over_200k: 0.28 },
-          cache:  { write: 0.14,     read: 0.0028 }
-        },
         peak: {
-          input:  { default: 0.44,   over_200k: 0.44 },
-          output: { default: 1.32,   over_200k: 1.32 },
-          cache:  { write: 0.44,     read: 0.014 }
+          input:  { default: 0.30,   over_200k: 0.30 },
+          output: { default: 1.20,   over_200k: 1.20 },
+          cache:  { write: 0.30,     read: 0.006 }
         },
         off_peak: {
-          input:  { default: 0.22,   over_200k: 0.22 },
-          output: { default: 0.66,   over_200k: 0.66 },
-          cache:  { write: 0.22,     read: 0.007 }
+          input:  { default: 0.15,   over_200k: 0.15 },
+          output: { default: 0.60,   over_200k: 0.60 },
+          cache:  { write: 0.15,     read: 0.003 }
         }
       },
 
       "deepseek-v4-pro" => {
         deepseek: true,
-        legacy: {
-          input:  { default: 0.435,  over_200k: 0.435 },  # $0.435/MTok  (pre-cutover flat)
-          output: { default: 0.87,   over_200k: 0.87 },   # $0.87/MTok
-          cache:  { write: 0.435,    read: 0.003625 }     # $0.003625/MTok cache hit
-        },
         peak: {
-          input:  { default: 1.32,   over_200k: 1.32 },   # $1.32/MTok  cache miss (peak)
-          output: { default: 3.96,   over_200k: 3.96 },   # $3.96/MTok
-          cache:  { write: 1.32,     read: 0.044 }        # $0.044/MTok cache hit
+          input:  { default: 0.30,   over_200k: 0.30 },   # $0.30/MTok  cache miss (peak)
+          output: { default: 1.20,   over_200k: 1.20 },   # $1.20/MTok
+          cache:  { write: 0.30,     read: 0.006 }        # $0.006/MTok cache hit
         },
         off_peak: {
-          input:  { default: 0.66,   over_200k: 0.66 },   # $0.66/MTok  (half of peak)
-          output: { default: 1.98,   over_200k: 1.98 },   # $1.98/MTok
-          cache:  { write: 0.66,     read: 0.022 }        # $0.022/MTok cache hit
+          input:  { default: 0.15,   over_200k: 0.15 },   # $0.15/MTok  (half of peak)
+          output: { default: 0.60,   over_200k: 0.60 },   # $0.60/MTok
+          cache:  { write: 0.15,     read: 0.003 }        # $0.003/MTok cache hit
         }
       },
 
@@ -875,10 +861,6 @@ module Clacky
     # Costs for prompts between 200K–272K will be slightly over-estimated.
     TIERED_PRICING_THRESHOLD = 200_000
 
-    # DeepSeek switched from flat legacy rates to peak/off-peak billing at
-    # 2026-08-17 00:00 Beijing time (= 2026-08-16 16:00 UTC).
-    DEEPSEEK_PEAK_PRICING_START = Time.utc(2026, 8, 16, 16, 0, 0).freeze
-
     class << self
       # Calculate cost for the given model and usage
       #
@@ -1186,17 +1168,13 @@ module Clacky
         cache_cost
       end
 
-      # Resolve a DeepSeek pricing entry (which holds legacy/peak/off_peak
-      # tiers) to the single tier that applies at the given time.
+      # Resolve a DeepSeek pricing entry (which holds peak/off_peak tiers) to
+      # the single tier that applies at the given time.
       def resolve_deepseek_tier(pricing, now)
-        if now < DEEPSEEK_PEAK_PRICING_START
-          pricing[:legacy]
-        elsif deepseek_weekend?(now)
+        if deepseek_weekend?(now) || !deepseek_peak_hour?(now)
           pricing[:off_peak]
-        elsif deepseek_peak_hour?(now)
-          pricing[:peak]
         else
-          pricing[:off_peak]
+          pricing[:peak]
         end
       end
 

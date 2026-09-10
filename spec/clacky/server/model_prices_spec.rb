@@ -76,13 +76,13 @@ RSpec.describe Clacky::Server::ModelPrices do
       it "uses peak rates during peak hours" do
         result = described_class.build("dsk-deepseek-v4-flash", now: peak_time)
 
-        expect(result[:prices]["dsk-deepseek-v4-flash"]).to eq(in: 0.44, out: 1.32, ratio: (0.44 + 1.32) / base_total)
+        expect(result[:prices]["dsk-deepseek-v4-flash"]).to eq(in: 0.30, out: 1.20, ratio: (0.30 + 1.20) / base_total)
       end
 
       it "uses off-peak rates (half of peak) outside peak hours" do
         result = described_class.build("dsk-deepseek-v4-flash", now: off_peak_time)
 
-        expect(result[:prices]["dsk-deepseek-v4-flash"]).to eq(in: 0.22, out: 0.66, ratio: (0.22 + 0.66) / base_total)
+        expect(result[:prices]["dsk-deepseek-v4-flash"]).to eq(in: 0.15, out: 0.60, ratio: (0.15 + 0.60) / base_total)
       end
     end
   end
