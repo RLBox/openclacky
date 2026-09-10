@@ -5454,11 +5454,22 @@ module Clacky
           return json_response(res, 404, { ok: false, error: "SKILL.md not found" })
         end
 
+        raw = File.read(skill_md)
+        frontmatter_match = raw.match(/\A---\n.*?\n---[ \t]*\n?/m)
+        body = frontmatter_match ? raw[frontmatter_match.end(0)..].sub(/\A\n+/, "") : raw
+
         json_response(res, 200, {
           ok:      true,
           name:    skill.identifier,
-          content: File.read(skill_md),
-          path:    skill_md
+          content: raw,
+          path:    skill_md,
+          fields:  {
+            name:           skill.identifier,
+            name_zh:        skill.name_zh.to_s,
+            description:    skill.description.to_s,
+            description_zh: skill.description_zh.to_s,
+            body:           body
+          }
         })
       end
 
@@ -5471,12 +5482,18 @@ module Clacky
           return json_response(res, 403, { ok: false, error: "System skills cannot be edited" })
         end
 
-        data    = parse_json_body(req)
-        content = data["content"].to_s
+        data     = parse_json_body(req)
         skill_md = File.join(skill.directory.to_s, "SKILL.md")
         unless File.exist?(skill_md)
           return json_response(res, 404, { ok: false, error: "SKILL.md not found" })
         end
+
+        fields  = data["fields"]
+        content = if fields.is_a?(Hash)
+                    Clacky::Skill.update_frontmatter_fields(File.read(skill_md), fields)
+                  else
+                    data["content"].to_s
+                  end
 
         File.write(skill_md, content)
         @skill_loader.load_all

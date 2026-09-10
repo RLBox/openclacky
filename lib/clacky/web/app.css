@@ -10164,6 +10164,35 @@ body {
   border-radius: 4px;
 }
 
+/* ── Skill editor modal (reuses shared .modal-box form styles) ──────────── */
+.skill-editor-box {
+  max-width: 42.5rem;
+  max-height: 86vh;
+  display: flex;
+  flex-direction: column;
+}
+.skill-editor-box .modal-body {
+  overflow-y: auto;
+  flex: 1;
+  min-height: 0;
+}
+.skill-editor-box textarea.modal-input {
+  resize: none;
+  overflow: hidden;
+}
+.skill-editor-body-input {
+  font-family: var(--font-mono, 'SF Mono', 'Fira Code', monospace);
+  min-height: 12rem;
+}
+.skill-editor-status {
+  font-size: 0.8125rem;
+  color: var(--color-text-secondary);
+  margin-right: auto;
+}
+.skill-editor-status-error {
+  color: var(--color-error);
+}
+
 /* ── Markdown split-pane layout ─────────────────────────────────────────── */
 .code-editor-modal--md {
   max-width: 1280px;

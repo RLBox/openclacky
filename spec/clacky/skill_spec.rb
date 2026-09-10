@@ -632,4 +632,75 @@ RSpec.describe Clacky::Skill do
       expect(build_skill("pptx").display_name("zh")).to eq("pptx")
     end
   end
+
+  describe ".update_frontmatter_fields" do
+    it "updates editable fields and preserves unrelated frontmatter lines" do
+      raw = <<~CONTENT
+        ---
+        name: my-skill
+        description: Old description
+        user_invocable: false
+        hooks:
+          - name: on-start
+        ---
+
+        Body content.
+      CONTENT
+
+      result = described_class.update_frontmatter_fields(raw, {
+        "name"           => "my-skill",
+        "name_zh"        => "我的技能",
+        "description"    => "New description",
+        "description_zh" => "新描述",
+        "body"           => "Updated body."
+      })
+
+      expect(result).to include("name: my-skill")
+      expect(result).to include('name_zh: "我的技能"')
+      expect(result).to include("description: New description")
+      expect(result).to include('description_zh: "新描述"')
+      expect(result).to include("user_invocable: false")
+      expect(result).to include("hooks:")
+      expect(result).to include("  - name: on-start")
+      expect(result).to end_with("---\n\nUpdated body.")
+    end
+
+    it "inserts missing editable fields" do
+      raw = <<~CONTENT
+        ---
+        name: my-skill
+        ---
+
+        Body.
+      CONTENT
+
+      result = described_class.update_frontmatter_fields(raw, {
+        "name"           => "my-skill",
+        "name_zh"        => "我的技能",
+        "description"    => "A description",
+        "description_zh" => "",
+        "body"           => "Body."
+      })
+
+      expect(result).to include("name: my-skill")
+      expect(result).to include('name_zh: "我的技能"')
+      expect(result).to include("description: A description")
+      expect(result).to include('description_zh: ""')
+    end
+
+    it "creates frontmatter when none exists" do
+      raw = "Just body content.\nNo frontmatter."
+
+      result = described_class.update_frontmatter_fields(raw, {
+        "name"           => "new-skill",
+        "name_zh"        => "",
+        "description"    => "",
+        "description_zh" => "",
+        "body"           => raw
+      })
+
+      expect(result).to start_with("---\nname: new-skill\n")
+      expect(result).to end_with("---\n\nJust body content.\nNo frontmatter.")
+    end
+  end
 end
