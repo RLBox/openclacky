@@ -1,7 +1,6 @@
 # frozen_string_literal: true
 
-require_relative "../codex_home"
-require_relative "../launcher"
+require_relative "../runtime"
 
 # Safe readiness endpoint for the bundled Codex provider. Authentication and
 # ACP session actions are added by the runtime implementation slice.
@@ -24,23 +23,11 @@ class CodexExt < Clacky::ApiExtension
   end
 
   get "/status" do
-    home_result = Clacky::DefaultExtensions::Codex::CodexHome.new.prepare
-    launcher_result = Clacky::DefaultExtensions::Codex::Launcher.new(
-      codex_home: home_result.managed_home
-    ).resolve
-    json(self.class.status_payload(
-      home_result: home_result,
-      launcher_result: launcher_result
-    ))
-  rescue Clacky::DefaultExtensions::Codex::CodexHome::Error
-    json(
-      available: false,
-      status: "unavailable",
-      authenticated: nil,
-      auth_reused: false,
-      auth_reason: "managed_home_error",
-      error_code: "managed_home_error",
-      message: "OpenClacky could not prepare the managed Codex home."
-    )
+    json(Clacky::DefaultExtensions::Codex::Runtime.status)
+  end
+
+  post "/authenticate" do
+    result = Clacky::DefaultExtensions::Codex::Runtime.authenticate_async
+    json(result, status: result[:started] ? 202 : 200)
   end
 end

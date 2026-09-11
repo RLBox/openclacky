@@ -131,7 +131,7 @@ module Clacky
         end
 
         private def verified_codex_override
-          return [nil, nil] unless @codex_path
+          return [find_executable("codex"), nil] unless @codex_path
 
           verified = verified_executable(@codex_path)
           return [verified, nil] if verified

@@ -30,7 +30,7 @@ module Clacky
         @transport.on_message { |message| handle_message(message) }
       end
 
-      def start(client_info:, capabilities: {})
+      def start(client_info:, capabilities: {}, timeout: INITIALIZE_TIMEOUT)
         return self if initialized?
 
         @transport.start
@@ -41,7 +41,7 @@ module Clacky
             clientCapabilities: capabilities,
             clientInfo: client_info
           },
-          timeout: INITIALIZE_TIMEOUT
+          timeout: timeout
         )
         unless result["protocolVersion"].to_i == PROTOCOL_VERSION
           raise ProtocolError,
@@ -69,6 +69,10 @@ module Clacky
 
       def initialized?
         @lock.synchronize { @started }
+      end
+
+      def alive?
+        initialized? && @transport.alive?
       end
 
       def agent_info

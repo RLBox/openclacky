@@ -464,6 +464,17 @@ RSpec.describe "Codex ACP launcher" do
     expect(result.env["CODEX_PATH"]).to be_nil
   end
 
+  it "automatically pairs the adapter with a verified Codex executable from PATH" do
+    bin_dir = File.join(tmpdir, "bin")
+    explicit = write_executable(File.join(tmpdir, "custom-codex-acp"))
+    codex = write_executable(File.join(bin_dir, "codex"))
+
+    result = build_launcher(explicit_path: explicit, path: bin_dir).resolve
+
+    expect(result.available?).to be(true)
+    expect(result.env["CODEX_PATH"]).to eq(File.expand_path(codex))
+  end
+
   it "actually removes parent credentials and adapter overrides from the child process" do
     fake_agent = File.expand_path("../support/fake_acp_agent.rb", __dir__)
     transport = nil
@@ -565,5 +576,37 @@ RSpec.describe "Codex extension status shell" do
       "secret-argument",
       "/private/home"
     )
+  end
+
+  it "serves cached runtime status and starts authentication with a non-blocking response" do
+    klass = codex_api_class
+    runtime = Clacky::DefaultExtensions::Codex::Runtime
+    allow(runtime).to receive(:status).and_return(
+      available: true, status: "not_connected", authenticated: false
+    )
+    allow(runtime).to receive(:authenticate_async).and_return(
+      ok: true, started: true, status: "authenticating"
+    )
+
+    status_route = klass.routes.find { |route| route.method == :get && route.pattern == "/status" }
+    auth_route = klass.routes.find { |route| route.method == :post && route.pattern == "/authenticate" }
+    expect(status_route).not_to be_nil
+    expect(auth_route).not_to be_nil
+
+    status_handler = klass.new(req: nil, res: nil, route: status_route, params: {}, http_server: nil)
+    expect { status_handler.invoke }.to raise_error(Clacky::ApiExtension::Halt) do |halt|
+      expect(halt.status).to eq(200)
+      expect(JSON.parse(halt.payload)).to include(
+        "status" => "not_connected", "authenticated" => false
+      )
+    end
+
+    auth_handler = klass.new(req: nil, res: nil, route: auth_route, params: {}, http_server: nil)
+    expect { auth_handler.invoke }.to raise_error(Clacky::ApiExtension::Halt) do |halt|
+      expect(halt.status).to eq(202)
+      expect(JSON.parse(halt.payload)).to include(
+        "ok" => true, "started" => true, "status" => "authenticating"
+      )
+    end
   end
 end

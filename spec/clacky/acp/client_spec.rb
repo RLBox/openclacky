@@ -91,11 +91,13 @@ RSpec.describe Clacky::Acp::Client do
       }
     )
     expect(client.initialized?).to be(true)
+    expect(client.alive?).to be(true)
     expect(client.agent_info).to eq("name" => "codex-acp", "version" => "1.11.0")
     expect(client.agent_capabilities.dig("promptCapabilities", "image")).to be(true)
     expect(client.auth_methods.first["id"]).to eq("chat-gpt")
   ensure
     client&.stop
+    expect(client.alive?).to be(false) if client
   end
 
   it "matches concurrent responses by monotonically increasing request id" do
