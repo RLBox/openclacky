@@ -7279,7 +7279,20 @@ module Clacky
         agent = nil
         @registry.with_session(session_id) { |s| agent = s[:agent] }
 
-        if runtime_session?(agent) && agent.current_model_info[:id].to_s != model_id
+        target_model = @agent_config.models.find { |m| m["id"] == model_id }
+        if target_model.nil?
+          return json_response(res, 400, { error: "Model not found in configuration" })
+        end
+
+        source_is_runtime = runtime_session?(agent)
+        target_is_runtime = runtime_model_entry?(target_model)
+        if source_is_runtime != target_is_runtime
+          return json_response(res, 409, {
+            error: "Sessions do not support switching between API and agent runtime providers; start a new session"
+          })
+        end
+
+        if source_is_runtime && agent.current_model_info[:id].to_s != model_id
           return json_response(res, 409, {
             error: "Agent runtime sessions do not support switching provider cards"
           })
@@ -7289,11 +7302,6 @@ module Clacky
         # points at the same @models array as the global @agent_config. So
         # resolving the model by stable id here and in agent.switch_model_by_id
         # will always agree — no more index divergence after add/delete.
-        target_model = @agent_config.models.find { |m| m["id"] == model_id }
-        if target_model.nil?
-          return json_response(res, 400, { error: "Model not found in configuration" })
-        end
-
         # Switch to the model by id (unified interface with CLI)
         # Handles: config.switch_model_by_id + client rebuild + message_compressor rebuild
         success = agent.switch_model_by_id(model_id)
@@ -7415,7 +7423,7 @@ module Clacky
         # Snapshot the models list — @agent_config.models is a shared reference
         # that the user might mutate from the settings panel during the test;
         # a shallow dup is enough since we only read string fields below.
-        models = Array(@agent_config.models).dup
+        models = Array(@agent_config.models).reject { |model| runtime_model_entry?(model) }
         return json_response(res, 200, { ok: true, results: [] }) if models.empty?
 
         # Kick off one thread per model. We deliberately cap per-request wall

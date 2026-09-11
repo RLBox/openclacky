@@ -9,7 +9,11 @@ require_relative "../../support/http_server_spec_helpers"
 RSpec.describe Clacky::Server::HttpServer, "runtime session lifecycle" do
   include HttpServerSpecHelpers
 
-  RuntimeServerSpecProfile = Struct.new(:name)
+  RuntimeServerSpecProfile = Struct.new(:name) do
+    def container_dir
+      nil
+    end
+  end
 
   class RuntimeServerSpecAdapter
     attr_reader :context, :persisted_state, :runs, :cancel_reasons
@@ -493,6 +497,79 @@ RSpec.describe Clacky::Server::HttpServer, "runtime session lifecycle" do
         expect(res.status).to eq(409), method_name.to_s
         expect(parsed_body(res)["error"]).to match(/not support|unavailable/i)
       end
+    end
+  end
+
+  it "rejects switching an API session onto a runtime provider card" do
+    runtime_config.models.unshift(
+      "id" => "api-card",
+      "provider_id" => "custom",
+      "model" => "api-model",
+      "base_url" => "https://example.test",
+      "api_key" => "secret"
+    )
+
+    with_server(
+      agent_config: runtime_config,
+      provider_registry: provider_registry,
+      runtime_registry: runtime_registry
+    ) do |server|
+      session_id = server.send(
+        :build_session,
+        name: "API task",
+        working_dir: Dir.pwd,
+        model_id: "api-card"
+      )
+      agent = server.instance_variable_get(:@registry).get(session_id)[:agent]
+      res = fake_res
+
+      server.send(
+        :api_switch_session_model,
+        session_id,
+        fake_req(method: "PATCH", path: "", body: { model_id: "runtime-card-current" }),
+        res
+      )
+
+      expect(res.status).to eq(409)
+      expect(parsed_body(res)["error"]).to match(/new session|runtime/i)
+      expect(agent.current_model_info[:id]).to eq("api-card")
+    end
+  end
+
+  it "excludes runtime provider cards from API model benchmarks" do
+    runtime_config.models.unshift(
+      "id" => "api-card",
+      "provider_id" => "custom",
+      "model" => "api-model",
+      "base_url" => "https://example.test",
+      "api_key" => "secret"
+    )
+
+    with_server(
+      agent_config: runtime_config,
+      provider_registry: provider_registry,
+      runtime_registry: runtime_registry
+    ) do |server|
+      session_id = server.send(
+        :build_session,
+        name: "API task",
+        working_dir: Dir.pwd,
+        model_id: "api-card"
+      )
+      allow(server).to receive(:benchmark_single_model) do |entry, _timeout|
+        { model_id: entry["id"], model: entry["model"], ok: true }
+      end
+      res = fake_res
+
+      server.send(
+        :api_benchmark_session_models,
+        session_id,
+        fake_req(method: "POST", path: ""),
+        res
+      )
+
+      expect(res.status).to eq(200)
+      expect(parsed_body(res)["results"].map { |row| row["model_id"] }).to eq(["api-card"])
     end
   end
 
