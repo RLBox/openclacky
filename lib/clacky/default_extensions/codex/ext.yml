@@ -1,0 +1,31 @@
+id: codex
+name: Codex
+display_name: Codex
+display_name_zh: Codex
+description: Use Codex through a managed local ACP runtime
+description_zh: 通过隔离的本地 ACP 运行时使用 Codex
+version: "0.1.0"
+origin: self
+author: OpenClacky
+homepage: https://www.openclacky.com
+license: MIT
+contributes:
+  api: api/handler.rb
+  providers:
+    - id: codex
+      name: Codex
+      name_key: provider.name.codex
+      runtime_id: codex
+      auth_mode: runtime
+      credential_fields: []
+      dynamic_models: session
+      display_model: Codex default
+      capabilities:
+        chat: true
+        tools: true
+        vision: true
+      website_url: https://openai.com/codex
+  agent_runtimes:
+    - id: codex
+      adapter: runtime.rb
+      class: Clacky::DefaultExtensions::Codex::Runtime
