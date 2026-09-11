@@ -162,4 +162,26 @@ RSpec.describe Clacky::AgentRuntimeRegistry do
     expect(registry.registered?(:fake)).to be(true)
     expect(registry.build("fake", value: "result")).to eq("result")
   end
+
+  it "shuts down only factories that were resolved during the server run" do
+    factory = Class.new do
+      class << self
+        attr_accessor :shutdown_calls
+
+        def shutdown
+          self.shutdown_calls = shutdown_calls.to_i + 1
+        end
+      end
+
+      def initialize(**_options); end
+    end
+    factory.shutdown_calls = 0
+    registry = described_class.new(
+      extension_units: [], factories: { "fake" => factory }
+    )
+    registry.build("fake")
+
+    expect { registry.shutdown }
+      .to change(factory, :shutdown_calls).from(0).to(1)
+  end
 end

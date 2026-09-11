@@ -433,14 +433,11 @@ module Clacky
 
       # Delete a session from registry (and interrupt its thread).
       def delete(session_id)
-        @mutex.synchronize do
-          session = @sessions.delete(session_id)
-          return false unless session
+        session = @mutex.synchronize { @sessions.delete(session_id) }
+        return false unless session
 
-          session[:idle_timer]&.cancel
-          session[:thread]&.raise(Clacky::AgentInterrupted, "Session deleted")
-          true
-        end
+        release_session(session, reason: :delete, interrupt: true)
+        true
       end
 
       # True if the session exists in registry (runtime).
@@ -460,11 +457,16 @@ module Clacky
       # Remove sessions idle longer than SESSION_TIMEOUT.
       def cleanup_stale!
         cutoff = Time.now - SESSION_TIMEOUT
+        removed = []
         @mutex.synchronize do
           @sessions.delete_if do |_id, session|
-            RECLAIMABLE_STATUSES.include?(session[:status]) && session[:updated_at] < cutoff
+            stale = RECLAIMABLE_STATUSES.include?(session[:status]) &&
+                    session[:updated_at] && session[:updated_at] < cutoff
+            removed << session if stale
+            stale
           end
         end
+        removed.each { |session| release_session(session, reason: :stale) }
       end
 
       def count_by_status(status)
@@ -535,16 +537,52 @@ module Clacky
         agent = session[:agent]
         @session_manager&.save(agent.to_session_data(status: :success)) if agent
 
-        @mutex.synchronize do
+        removed = @mutex.synchronize do
           s = @sessions[id]
-          next unless s
-          s[:idle_timer]&.cancel
-          s[:agent] = nil
-          s[:ui] = nil
-          s[:idle_timer] = nil
-          s[:thread] = nil
+          next nil unless s.equal?(session)
+          next nil unless RECLAIMABLE_STATUSES.include?(s[:status])
+
           @sessions.delete(id)
         end
+        return unless removed
+
+        release_session(removed, reason: :evict)
+      end
+
+      private def release_session(session, reason:, interrupt: false)
+        release_step("idle timer") { session[:idle_timer]&.cancel }
+        agent = session[:agent]
+        thread = session[:thread]
+
+        if interrupt && thread&.alive?
+          if runtime_agent?(agent)
+            release_step("runtime cancel") do
+              agent.cancel(reason: reason) if agent.respond_to?(:cancel)
+              thread.join(2) unless thread == Thread.current
+            end
+          else
+            release_step("agent interrupt") do
+              thread.raise(Clacky::AgentInterrupted, "Session deleted")
+            end
+          end
+        end
+        release_step("runtime close") do
+          agent.close if runtime_agent?(agent) && agent.respond_to?(:close)
+        end
+      end
+
+      private def release_step(label)
+        yield
+      rescue StandardError => e
+        Clacky::Logger.warn(
+          "[SessionRegistry] #{label} failed: #{e.class}: #{e.message}"
+        )
+      end
+
+      private def runtime_agent?(agent)
+        agent.respond_to?(:runtime?) && agent.runtime?
+      rescue StandardError
+        false
       end
 
       # Build a summary hash for API responses (for in-registry sessions).

@@ -115,3 +115,24 @@ RSpec.describe Clacky::Server::WebUIController, "#show_tool_call" do
     expect(ev[:options]).to eq(%w[a b])
   end
 end
+
+RSpec.describe Clacky::Server::WebUIController, "#cancel_pending_confirmations" do
+  it "unblocks every permission waiter with the supplied safe default" do
+    emitted = Queue.new
+    result = Queue.new
+    controller = described_class.new(
+      "test-session", ->(_sid, event) { emitted << event }
+    )
+    waiter = Thread.new do
+      result << controller.request_confirmation("Allow action?", default: true)
+    end
+    expect(emitted.pop).to include(type: "request_confirmation")
+
+    expect(controller.cancel_pending_confirmations(result: false)).to eq(1)
+
+    expect(result.pop).to be(false)
+    expect(waiter.join(1)).not_to be_nil
+  ensure
+    waiter&.kill if waiter&.alive?
+  end
+end

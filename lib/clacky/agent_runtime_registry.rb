@@ -40,6 +40,22 @@ module Clacky
       instantiate(factory, id, kwargs)
     end
 
+    # Shut down process-lifetime resources for factories that were actually
+    # resolved during this server run. Unused extension classes remain lazy.
+    def shutdown
+      factories = @load_mutex.synchronize do
+        @entries.values.map(&:factory).compact.uniq
+      end
+      factories.each do |factory|
+        factory.shutdown if factory.respond_to?(:shutdown)
+      rescue StandardError => e
+        Clacky::Logger.warn(
+          "[AgentRuntimeRegistry] shutdown failed: #{e.class}: #{e.message}"
+        ) if defined?(Clacky::Logger)
+      end
+      nil
+    end
+
     private def register_unit(unit)
       id = unit.id.to_s
       raise DuplicateRuntimeError, "duplicate agent runtime id: #{id}" if @entries.key?(id)

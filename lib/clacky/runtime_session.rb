@@ -8,6 +8,51 @@ module Clacky
   class RuntimeSession
     class UnsupportedCapability < StandardError; end
 
+    # Keeps the host-owned transcript readable when an extension that owns a
+    # persisted runtime session is disabled, missing, or fails to load. It
+    # deliberately preserves only the already-sanitized resume state and
+    # refuses to execute new turns.
+    class UnavailableRuntime
+      def initialize(runtime_id:, persisted_state: nil, message: nil)
+        @runtime_id = runtime_id.to_s
+        @persisted_state = persisted_state.is_a?(Hash) ? persisted_state : {}
+        @message = message || "Agent runtime '#{@runtime_id}' is unavailable"
+      end
+
+      def capabilities
+        {}
+      end
+
+      def run(_input, generation:)
+        raise UnsupportedCapability, @message
+      end
+
+      def dump_state
+        deep_copy(@persisted_state)
+      end
+
+      def close
+        nil
+      end
+
+      private def deep_copy(value)
+        case value
+        when Hash
+          value.each_with_object({}) do |(key, item), copy|
+            copy[deep_copy(key)] = deep_copy(item)
+          end
+        when Array
+          value.map { |item| deep_copy(item) }
+        else
+          begin
+            value.dup
+          rescue TypeError
+            value
+          end
+        end
+      end
+    end
+
     RuntimeInput = Struct.new(
       :content,
       :files,

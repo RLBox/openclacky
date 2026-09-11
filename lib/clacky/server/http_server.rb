@@ -28,6 +28,7 @@ require_relative "../brand_config"
 require_relative "channel"
 require_relative "../banner"
 require_relative "../utils/file_processor"
+require_relative "../runtime_session"
 
 module Clacky
   module Server
@@ -67,7 +68,7 @@ module Clacky
         event
       end
 
-      def show_user_message(content, task_id: nil, created_at: nil, files: [], editable: true, skill_command: nil, skill_command_display: nil, references: [])
+      def show_user_message(content, task_id: nil, created_at: nil, files: [], editable: true, skill_command: nil, skill_command_display: nil, references: [], source: nil, steering: false)
         ev = { type: "history_user_message", session_id: @session_id, content: content }
         ev[:task_id] = task_id if task_id
         ev[:created_at] = created_at if created_at
@@ -5062,6 +5063,7 @@ module Clacky
           json_response(res, 404, { error: "Agent not found" })
           return
         end
+        return unless runtime_capability_available?(agent, :skills, res, "skills")
 
         agent.skill_loader.load_all
         skills = agent.skill_loader.user_invocable_skills(agent.agent_profile)
@@ -5250,6 +5252,9 @@ module Clacky
           json_response(res, 404, { error: "Session not found" })
           return nil
         end
+        return nil unless runtime_capability_available?(
+          agent, :time_machine, res, "Time Machine"
+        )
         agent
       end
 
@@ -7060,6 +7065,16 @@ module Clacky
           return json_response(res, 200, { events: [], has_more: false })
         end
 
+        history_navigation_requested = query["navigation"] == "1" ||
+                                       query.key?("previews") ||
+                                       query.key?("preview") ||
+                                       query["window"] == "1"
+        if history_navigation_requested
+          return unless runtime_capability_available?(
+            agent, :time_machine, res, "history navigation"
+          )
+        end
+
         # Collect events emitted by replay_history via a lightweight collector UI
         if query["navigation"] == "1"
           return json_response(res, 200, agent.history_navigation)
@@ -7264,6 +7279,12 @@ module Clacky
         agent = nil
         @registry.with_session(session_id) { |s| agent = s[:agent] }
 
+        if runtime_session?(agent) && agent.current_model_info[:id].to_s != model_id
+          return json_response(res, 409, {
+            error: "Agent runtime sessions do not support switching provider cards"
+          })
+        end
+
         # With Plan B (shared @models reference), every session's AgentConfig
         # points at the same @models array as the global @agent_config. So
         # resolving the model by stable id here and in agent.switch_model_by_id
@@ -7302,6 +7323,9 @@ module Clacky
         agent = nil
         @registry.with_session(session_id) { |s| agent = s[:agent] }
         return json_response(res, 404, { error: "Session not found" }) unless agent
+        return unless runtime_capability_available?(
+          agent, :reasoning_effort, res, "reasoning-effort changes"
+        )
 
         agent.reasoning_effort = raw
         @session_manager.save(agent.to_session_data(updated_at: Time.now))
@@ -7329,6 +7353,9 @@ module Clacky
         agent = nil
         @registry.with_session(session_id) { |s| agent = s[:agent] }
         return json_response(res, 404, { error: "Session not found" }) unless agent
+        return unless runtime_capability_available?(
+          agent, :sub_model, res, "sub-model overlays"
+        )
 
         if model_name && !model_name.empty?
           info = agent.current_model_info
@@ -7378,6 +7405,12 @@ module Clacky
       #   }
       def api_benchmark_session_models(session_id, _req, res)
         return json_response(res, 404, { error: "Session not found" }) unless @registry.ensure(session_id)
+
+        agent = nil
+        @registry.with_session(session_id) { |session| agent = session[:agent] }
+        return unless runtime_capability_available?(
+          agent, :model_benchmark, res, "model benchmarks"
+        )
 
         # Snapshot the models list — @agent_config.models is a shared reference
         # that the user might mutate from the settings panel during the test;
@@ -7459,15 +7492,19 @@ module Clacky
         return json_response(res, 400, { error: "working_dir is required" }) if new_dir.empty?
         return json_response(res, 404, { error: "Session not found" }) unless @registry.ensure(session_id)
 
+        agent = nil
+        @registry.with_session(session_id) { |s| agent = s[:agent] }
+        return json_response(res, 404, { error: "Session not found" }) unless agent
+        return unless runtime_capability_available?(
+          agent, :working_directory, res, "working-directory changes"
+        )
+
         # Expand ~ to home directory
         expanded_dir = File.expand_path(new_dir)
 
         # Auto-create the directory if it doesn't exist yet.
         FileUtils.mkdir_p(expanded_dir)
 
-        agent = nil
-        @registry.with_session(session_id) { |s| agent = s[:agent] }
-        
         # Change the agent's working directory
         agent.change_working_dir(expanded_dir)
         
@@ -7483,6 +7520,14 @@ module Clacky
       end
 
       def api_fork_session(session_id, req, res)
+        source = @session_manager.load(session_id)
+        runtime = indifferent_value(source, :runtime)
+        unless indifferent_value(runtime, :id).to_s.empty?
+          return json_response(res, 409, {
+            error: "Agent runtime sessions cannot be forked"
+          })
+        end
+
         fork_data = @session_manager.fork(session_id)
         return json_response(res, 404, { error: "Session not found" }) unless fork_data
 
@@ -7807,8 +7852,24 @@ module Clacky
         return unless @registry.exist?(session_id)
 
         session = @registry.get(session_id)
-        
         mode = @agent_config.input_behavior
+
+        # ACP v1 has no standard steering method and each provider session is
+        # single-flight. Queue a replacement on the existing worker, then send
+        # protocol cancellation; the worker drains it only after the original
+        # session/prompt response has crossed the true completion barrier.
+        if session[:status] == :running && runtime_session?(session[:agent])
+          session[:agent].enqueue_input(
+            content,
+            files: files,
+            references_display: references,
+            reference_contexts: build_reference_contexts(references),
+            created_at: Time.now.to_f
+          )
+          interrupt_session(session_id, reason: :replacement) unless mode == "steer"
+          return
+        end
+
         queued = false
         @registry.with_session(session_id) do |s|
           if s[:status] == :running && mode == "steer"
@@ -7925,20 +7986,33 @@ module Clacky
       # self-terminates at the next check_stale! checkpoint, or when the syscall
       # returns; either way it can no longer touch the live session.
       def interrupt_session(session_id, reason: :user)
+        agent = nil
+        thread = nil
+        runtime = false
         @registry.with_session(session_id) do |s|
           s[:idle_timer]&.cancel
+          agent = s[:agent]
           thread = s[:thread]
           next unless thread&.alive?
 
-          Clacky::Logger.info("[interrupt] session=#{session_id} raise")
-          begin
-            thread[:interrupt_reason] = reason
-            thread.raise(Clacky::AgentInterrupted, "Interrupted by user")
-          rescue ThreadError => e
-            Clacky::Logger.warn("[interrupt] raise failed: #{e.message}")
-          end
+          thread[:interrupt_reason] = reason
+          runtime = runtime_session?(agent)
+          thread[:runtime_cancel_requested] = true if runtime
         end
-      end      # Run a task in a session immediately in the background, without waiting
+        return unless thread&.alive?
+
+        if runtime
+          Clacky::Logger.info("[interrupt] session=#{session_id} runtime_cancel")
+          agent.cancel(reason: reason)
+        else
+          Clacky::Logger.info("[interrupt] session=#{session_id} raise")
+          thread.raise(Clacky::AgentInterrupted, "Interrupted by user")
+        end
+      rescue ThreadError => e
+        Clacky::Logger.warn("[interrupt] failed: #{e.message}")
+      end
+
+      # Run a task in a session immediately in the background, without waiting
       # for the client to subscribe. The user bubble is persisted via
       # display_text (Agent#run → history → replay_history), so the frontend
       # only needs to navigate over and load history — no realtime broadcast,
@@ -8007,10 +8081,18 @@ module Clacky
         # covers all of them — serial joins would multiply the shutdown time
         # by the number of concurrent tasks.
         live = []
+        attached = []
         @registry.each_live_agent do |id, agent, thread|
+          attached << [id, agent, thread]
           next unless thread&.alive?
           begin
-            thread.raise(Clacky::AgentInterrupted, "Worker shutting down")
+            if runtime_session?(agent)
+              thread[:interrupt_reason] = :shutdown
+              thread[:runtime_cancel_requested] = true
+              agent.cancel(reason: :shutdown)
+            else
+              thread.raise(Clacky::AgentInterrupted, "Worker shutting down")
+            end
             live << [id, agent, thread]
             Clacky::Logger.info("[shutdown] interrupted session=#{id}")
           rescue => e
@@ -8021,6 +8103,28 @@ module Clacky
         live.each do |id, agent, _thread|
           @session_manager.save(agent.to_session_data(status: :interrupted, updated_at: Time.now))
         end
+        attached.each do |_id, agent, _thread|
+          agent.close if runtime_session?(agent)
+        rescue StandardError => e
+          Clacky::Logger.warn("[shutdown] runtime close failed: #{e.message}")
+        end
+        @runtime_registry.shutdown if @runtime_registry.respond_to?(:shutdown)
+      end
+
+      private def runtime_session?(agent)
+        agent.respond_to?(:runtime?) && agent.runtime?
+      rescue StandardError
+        false
+      end
+
+      private def runtime_capability_available?(agent, capability, res, label)
+        return true unless runtime_session?(agent)
+        return true if agent.capability?(capability)
+
+        json_response(res, 409, {
+          error: "This agent runtime does not support #{label}"
+        })
+        false
       end
 
       # Run an agent task in a background thread, handling status updates,
@@ -8073,15 +8177,23 @@ module Clacky
           owns_epoch = true
           loop do
             pending = nil
+            cancelled_without_replacement = false
             @registry.with_session(session_id) do |s|
               owns_epoch = s[:epoch].to_i == epoch.to_i
               next unless owns_epoch
               pending = agent.take_pending_input
-              unless pending
+              if pending && runtime_session?(agent)
+                Thread.current[:runtime_cancel_requested] = false
+              elsif !pending && Thread.current[:runtime_cancel_requested]
+                cancelled_without_replacement = true
+              elsif !pending
                 awaiting = run_result.is_a?(Hash) && run_result[:awaiting_user_feedback]
                 s[:status] = awaiting ? :awaiting_feedback : :idle
                 s[:error] = nil
               end
+            end
+            if owns_epoch && cancelled_without_replacement
+              raise Clacky::AgentInterrupted, "Runtime turn cancelled"
             end
             break unless owns_epoch && pending
             run_result = agent.run_pending_input(pending)
@@ -8254,22 +8366,35 @@ module Clacky
         #      AND corrupted the on-disk config at next save.
         config.switch_model_by_id(model_id) if model_id
 
-        # Build client from the (possibly overridden) config so api format
-        # detection (Bedrock vs OpenAI vs Anthropic) uses the correct model.
-        client = Clacky::Client.new(
-          config.api_key,
-          base_url: config.base_url,
-          model: config.model_name,
-          anthropic_format: config.anthropic_format?,
-          api_format: config.api_format
-        )
-
         broadcaster = method(:broadcast)
         ui = WebUIController.new(session_id, broadcaster)
-        agent = Clacky::Agent.new(client, config, working_dir: working_dir, ui: ui, profile: profile,
-                                  session_id: session_id, source: source)
+        runtime = resolve_runtime_card(config.current_model)
+        if runtime
+          agent = Clacky::RuntimeSession.new(
+            runtime_id: runtime[:runtime_id],
+            runtime_factory: runtime_factory(runtime[:runtime_id]),
+            config: config,
+            working_dir: working_dir,
+            ui: ui,
+            profile: Clacky::AgentProfile.load(profile),
+            session_id: session_id,
+            source: source
+          )
+        else
+          # Build client from the (possibly overridden) config so api format
+          # detection (Bedrock vs OpenAI vs Anthropic) uses the correct model.
+          client = Clacky::Client.new(
+            config.api_key,
+            base_url: config.base_url,
+            model: config.model_name,
+            anthropic_format: config.anthropic_format?,
+            api_format: config.api_format
+          )
+          agent = Clacky::Agent.new(client, config, working_dir: working_dir, ui: ui, profile: profile,
+                                    session_id: session_id, source: source)
+        end
         agent.rename(name) unless name.nil? || name.empty?
-        idle_timer = build_idle_timer(session_id, agent)
+        idle_timer = agent.respond_to?(:runtime?) && agent.runtime? ? nil : build_idle_timer(session_id, agent)
 
         @registry.with_session(session_id) do |s|
           s[:agent]      = agent
@@ -8290,7 +8415,6 @@ module Clacky
       def build_session_from_data(session_data, permission_mode: :confirm_all)
         original_id = session_data[:session_id]
 
-        client = @client_factory.call
         config = @agent_config.deep_copy
         config.permission_mode = permission_mode
         broadcaster = method(:broadcast)
@@ -8299,8 +8423,29 @@ module Clacky
         # for sessions saved before the agent_profile field was introduced.
         profile = session_data[:agent_profile].to_s
         profile = "general" if profile.empty?
-        agent = Clacky::Agent.from_session(client, config, session_data, ui: ui, profile: profile)
-        idle_timer = build_idle_timer(original_id, agent)
+        runtime_data = indifferent_value(session_data, :runtime)
+        runtime_id = indifferent_value(runtime_data, :id).to_s
+        if runtime_id.empty?
+          client = @client_factory.call
+          agent = Clacky::Agent.from_session(client, config, session_data, ui: ui, profile: profile)
+          idle_timer = build_idle_timer(original_id, agent)
+        else
+          provider_id = indifferent_value(
+            indifferent_value(session_data, :config), :provider_id
+          ).to_s
+          select_restored_runtime_card(config, runtime_id, provider_id)
+          available = runtime_available?(runtime_id, provider_id)
+          factory = available ? restored_runtime_factory(runtime_id) :
+                                unavailable_runtime_factory(runtime_id)
+          agent = Clacky::RuntimeSession.from_session(
+            runtime_factory: factory,
+            config: config,
+            session_data: session_data,
+            ui: ui,
+            profile: Clacky::AgentProfile.load(profile)
+          )
+          idle_timer = nil
+        end
 
         # Register session atomically with a fully-built agent so no concurrent
         # caller ever sees agent=nil for this session. The duplicate-restore guard
@@ -8313,6 +8458,97 @@ module Clacky
         end
 
         original_id
+      end
+
+      private def resolve_runtime_card(card)
+        return nil unless runtime_model_entry?(card)
+
+        provider_id = card["provider_id"].to_s
+        runtime_id = @provider_registry.runtime_id_for(provider_id).to_s
+        if provider_id.empty? || runtime_id.empty?
+          raise Clacky::AgentRuntimeRegistry::UnknownRuntimeError,
+                "unknown runtime provider: #{provider_id}"
+        end
+        if card["runtime_id"].to_s != runtime_id
+          raise Clacky::AgentRuntimeRegistry::UnknownRuntimeError,
+                "configured runtime_id does not match provider_id"
+        end
+        unless @runtime_registry.registered?(runtime_id)
+          raise Clacky::AgentRuntimeRegistry::UnknownRuntimeError,
+                "unknown agent runtime id: #{runtime_id}"
+        end
+
+        { provider_id: provider_id, runtime_id: runtime_id }
+      end
+
+      private def runtime_factory(runtime_id)
+        lambda do |**options|
+          @runtime_registry.build(runtime_id, **options)
+        end
+      end
+
+      private def restored_runtime_factory(runtime_id)
+        lambda do |persisted_state: nil, **options|
+          @runtime_registry.build(
+            runtime_id, persisted_state: persisted_state, **options
+          )
+        rescue ScriptError, StandardError => e
+          Clacky::Logger.warn(
+            "[runtime restore] #{runtime_id} unavailable: #{e.class}"
+          )
+          Clacky::RuntimeSession::UnavailableRuntime.new(
+            runtime_id: runtime_id,
+            persisted_state: persisted_state,
+            message: "Agent runtime '#{runtime_id}' is unavailable; the saved transcript remains readable"
+          )
+        end
+      end
+
+      private def unavailable_runtime_factory(runtime_id)
+        lambda do |persisted_state: nil, **_options|
+          Clacky::RuntimeSession::UnavailableRuntime.new(
+            runtime_id: runtime_id,
+            persisted_state: persisted_state,
+            message: "Agent runtime '#{runtime_id}' is unavailable; the saved transcript remains readable"
+          )
+        end
+      end
+
+      private def runtime_available?(runtime_id, provider_id)
+        return false unless @runtime_registry.registered?(runtime_id)
+
+        mapped = @provider_registry.runtime_id_for(provider_id)
+        !mapped.nil? && mapped.to_s == runtime_id.to_s
+      end
+
+      private def select_restored_runtime_card(config, runtime_id, provider_id)
+        card = config.models.find do |model|
+          runtime_model_entry?(model) &&
+            model["runtime_id"].to_s == runtime_id.to_s &&
+            (provider_id.empty? || model["provider_id"].to_s == provider_id)
+        end
+        unless card
+          descriptor = provider_id.empty? ? nil : @provider_registry[provider_id]
+          display_model = descriptor && descriptor["display_model"]
+          display_model = runtime_id if display_model.to_s.empty?
+          card = {
+            "id" => "restored-runtime:#{runtime_id}:#{provider_id}",
+            Clacky::AgentConfig::RUNTIME_MODEL_MARKER => true,
+            "provider_id" => provider_id,
+            "runtime_id" => runtime_id,
+            "display_model" => display_model
+          }
+          # A removed runtime card must not be inserted into the global shared
+          # model list merely because an old transcript was opened.
+          config.models = config.models.dup << card
+        end
+        config.switch_model_by_id(card["id"])
+      end
+
+      private def indifferent_value(hash, key)
+        return nil unless hash.is_a?(Hash)
+
+        hash[key] || hash[key.to_s]
       end
 
       # Build an IdleCompressionTimer for a session.

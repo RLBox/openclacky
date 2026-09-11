@@ -333,6 +333,67 @@ RSpec.describe Clacky::Server::SessionRegistry do
     end
   end
 
+  describe "runtime release lifecycle" do
+    def expect_mutex_available(registry)
+      mutex = registry.instance_variable_get(:@mutex)
+      acquired = mutex.try_lock
+      mutex.unlock if acquired
+      expect(acquired).to be(true)
+    end
+
+    it "cancels and closes a deleted runtime outside the registry mutex" do
+      registry = described_class.new(agent_config: default_config)
+      thread = double("runtime-thread", alive?: true, join: true)
+      runtime = double("runtime-session", runtime?: true)
+      expect(runtime).to receive(:cancel).with(reason: :delete) do
+        expect_mutex_available(registry)
+        true
+      end
+      expect(runtime).to receive(:close) do
+        expect_mutex_available(registry)
+      end
+      registry.create(session_id: "runtime")
+      registry.with_session("runtime") do |session|
+        session[:agent] = runtime
+        session[:thread] = thread
+      end
+
+      expect(registry.delete("runtime")).to be(true)
+      expect(registry.exist?("runtime")).to be(false)
+    end
+
+    it "persists and closes only runtime entries during mixed idle eviction" do
+      Dir.mktmpdir("clacky_runtime_evict_spec") do |dir|
+        config = Clacky::AgentConfig.new(max_idle_agents: 1)
+        manager = Clacky::SessionManager.new(sessions_dir: dir)
+        registry = described_class.new(
+          session_manager: manager, agent_config: config
+        )
+        data = {
+          session_id: "placeholder",
+          messages: [],
+          created_at: Time.now.iso8601
+        }
+        runtime = double(
+          "runtime-session", runtime?: true, to_session_data: data
+        )
+        legacy = double("legacy-agent", to_session_data: data)
+        expect(runtime).to receive(:close) { expect_mutex_available(registry) }
+
+        [["runtime", runtime], ["legacy", legacy]].each do |id, agent|
+          registry.create(session_id: id)
+          registry.with_session(id) { |session| session[:agent] = agent }
+          registry.update(id, status: :idle)
+        end
+
+        registry.evict_excess_idle!
+
+        expect(registry.exist?("runtime")).to be(false)
+        expect(registry.exist?("legacy")).to be(true)
+      end
+    end
+  end
+
   describe "epoch fencing" do
     let(:registry) { described_class.new(agent_config: default_config) }
 

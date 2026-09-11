@@ -68,6 +68,19 @@ module Clacky
         end
       end
 
+      # Resolve every outstanding confirmation without waiting for its normal
+      # browser timeout. Runtime cancellation uses this to ensure an ACP
+      # permission request cannot keep the cancelled turn alive.
+      def cancel_pending_confirmations(result: false)
+        @mutex.synchronize do
+          @pending_confirmations.each_value do |pending|
+            pending[:result] = result
+            pending[:cond].signal
+          end
+          @pending_confirmations.length
+        end
+      end
+
       # === Output display ===
 
       def show_user_message(content, created_at: nil, files: [], source: :web, skill_command: nil, skill_command_display: nil, steering: false)
@@ -417,6 +430,8 @@ module Clacky
 
           # Timed out — use default
           return default if result.nil?
+
+          return result if result == true || result == false
 
           case result.to_s.downcase
           when "yes", "y" then true
