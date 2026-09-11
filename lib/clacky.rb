@@ -82,6 +82,8 @@ require_relative "clacky/agent_profile"
 require_relative "clacky/providers"
 require_relative "clacky/provider_registry"
 require_relative "clacky/agent_runtime_registry"
+require_relative "clacky/acp/client"
+require_relative "clacky/acp/process_transport"
 require_relative "clacky/session_manager"
 require_relative "clacky/idle_compression_timer"
 
