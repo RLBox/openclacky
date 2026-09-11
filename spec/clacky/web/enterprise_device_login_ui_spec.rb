@@ -46,10 +46,15 @@ RSpec.describe "Enterprise device login WebUI" do
     setup_step = onboard[/function _showSetupStep.*?(?=\n  \/\/ Step 2)/m]
 
     expect(setup_step).to include('$("setup-device-block").style.display')
-    expect(setup_step).to include('$("setup-enterprise-link").style.display')
+    expect(setup_step).to include('$("setup-btn-enterprise-login").style.display')
     expect(setup_step).not_to match(
       /if \(_branded\).*?\$\("setup-device-block"\)\.style\.display\s*=\s*"none"/m
     )
+  end
+
+  it "uses the enterprise button id for every visibility transition" do
+    expect(onboard).not_to include('$("setup-enterprise-link")')
+    expect(onboard.scan('$("setup-btn-enterprise-login")').length).to be >= 4
   end
 
   it "shows the concrete model returned by the enterprise" do
