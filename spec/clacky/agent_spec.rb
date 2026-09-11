@@ -866,6 +866,10 @@ RSpec.describe Clacky::Agent do
         m[:role] == "user" && m[:content]&.include?("[SYSTEM] Your previous response was truncated")
       }
       expect(system_messages.size).to eq(1)
+      # Regression: the truncation hint must be tagged system_injected so UI
+      # replay filters it like other [SYSTEM] scaffolding (compression summary,
+      # timeout hint) instead of rendering it as a visible user message.
+      expect(system_messages.first[:system_injected]).to be true
 
       # Should have retried and gotten a valid response
       expect(client).to have_received(:send_messages_with_tools).twice
@@ -1695,7 +1699,7 @@ RSpec.describe Clacky::Agent do
       Class.new do
         attr_reader :messages
         def initialize; @messages = []; end
-        def show_assistant_message(content, files:)
+        def show_assistant_message(content, files:, interim: false, created_at: nil)
           @messages << { content: content, files: files }
         end
       end.new
@@ -1733,6 +1737,109 @@ RSpec.describe Clacky::Agent do
       msg = ui_collector.messages.first
       expect(msg[:files]).not_to be_empty
       expect(msg[:files].first[:name]).to eq("photo.png")
+    end
+  end
+
+  describe "awaiting_user_feedback in run result" do
+    def build_agent(tmpdir, permission_mode)
+      cfg = Clacky::AgentConfig.new(permission_mode: permission_mode)
+      cfg.add_model(model: "claude-sonnet-4.5", api_key: "test-api-key",
+                    base_url: "https://api.anthropic.com")
+      agent = Clacky::Agent.new(
+        client, cfg,
+        working_dir: tmpdir, ui: nil, profile: "general",
+        session_id: Clacky::SessionManager.generate_id, source: :manual
+      )
+      allow(agent).to receive(:inject_memory_prompt!).and_return(false)
+      agent
+    end
+
+    it "is true after the model calls request_user_feedback" do
+      Dir.mktmpdir do |tmpdir|
+        agent = build_agent(tmpdir, :confirm_all)
+
+        allow(client).to receive(:send_messages_with_tools).and_return(
+          mock_api_response(
+            content: "I need to know something.",
+            tool_calls: [mock_tool_call(
+              name: "request_user_feedback",
+              args: JSON.generate(question: "Which one?")
+            )]
+          )
+        )
+        allow(client).to receive(:format_tool_results).and_return([])
+
+        result = agent.run("do something ambiguous")
+
+        expect(result[:awaiting_user_feedback]).to be true
+      end
+    end
+
+    it "is false for a plain completed turn" do
+      Dir.mktmpdir do |tmpdir|
+        agent = build_agent(tmpdir, :confirm_all)
+
+        allow(client).to receive(:send_messages_with_tools)
+          .and_return(mock_api_response(content: "All done."))
+
+        result = agent.run("do something simple")
+
+        expect(result[:awaiting_user_feedback]).to be false
+      end
+    end
+
+    it "is false when the reply merely ends with a question mark" do
+      Dir.mktmpdir do |tmpdir|
+        agent = build_agent(tmpdir, :confirm_all)
+
+        allow(client).to receive(:send_messages_with_tools)
+          .and_return(mock_api_response(content: "Fixed it. Want me to run the tests?"))
+
+        result = agent.run("fix the bug")
+
+        expect(result[:awaiting_user_feedback]).to be false
+      end
+    end
+
+    it "is false when the reply ends with a full-width question mark" do
+      Dir.mktmpdir do |tmpdir|
+        agent = build_agent(tmpdir, :confirm_all)
+
+        allow(client).to receive(:send_messages_with_tools)
+          .and_return(mock_api_response(content: "\u4FEE\u597D\u4E86\uFF0C\u8FD8\u9700\u8981\u6211\u505A\u4EC0\u4E48\u5417\uFF1F"))
+
+        result = agent.run("fix the bug")
+
+        expect(result[:awaiting_user_feedback]).to be false
+      end
+    end
+
+    it "still skips skill evolution and memory update on a question-mark ending" do
+      Dir.mktmpdir do |tmpdir|
+        agent = build_agent(tmpdir, :confirm_all)
+
+        allow(client).to receive(:send_messages_with_tools)
+          .and_return(mock_api_response(content: "Done. Anything else?"))
+
+        expect(agent).not_to receive(:run_skill_evolution_hooks)
+        expect(agent).not_to receive(:run_memory_update_subagent)
+
+        agent.run("fix the bug")
+      end
+    end
+
+    it "still reaches both hooks on a plain ending" do
+      Dir.mktmpdir do |tmpdir|
+        agent = build_agent(tmpdir, :confirm_all)
+
+        allow(client).to receive(:send_messages_with_tools)
+          .and_return(mock_api_response(content: "All done."))
+
+        expect(agent).to receive(:run_skill_evolution_hooks)
+        expect(agent).to receive(:run_memory_update_subagent)
+
+        agent.run("fix the bug")
+      end
     end
   end
 end

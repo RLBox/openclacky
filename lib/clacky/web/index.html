@@ -19,6 +19,20 @@
   </script>
 </head>
 <body>
+<script>
+  // Detect whether scrollbars float over content (macOS overlay) or occupy
+  // layout width (Windows/classic). The latter keeps the sidebar scrollbar
+  // always visible.
+  (function () {
+    var probe = document.createElement("div");
+    probe.style.cssText = "position:absolute;top:-9999px;left:0;width:100px;height:100px;overflow:scroll;";
+    document.body.appendChild(probe);
+    if (probe.offsetWidth !== probe.clientWidth) {
+      document.documentElement.classList.add("no-overlay-scrollbar");
+    }
+    document.body.removeChild(probe);
+  })();
+</script>
 <div id="offline-banner" style="display:none" data-i18n="offline.banner"></div>
 <div id="app" style="visibility:hidden">
 
@@ -86,14 +100,22 @@
         </div>
         <!-- Filter row -->
         <div class="search-filter-row">
-          <select id="session-search-type" class="search-select">
-            <option value=""        data-i18n="sessions.search.typeAll">All types</option>
-            <option value="manual"  data-i18n="sessions.search.typeManual">Default</option>
-            <option value="cron"    data-i18n="sessions.search.typeCron">Scheduled</option>
-            <option value="channel" data-i18n="sessions.search.typeChannel">Channel</option>
-            <option value="setup"   data-i18n="sessions.search.typeSetup">Setup</option>
-            <option value="coding"  data-i18n="sessions.search.typeCoding">Coding</option>
-          </select>
+          <div class="custom-select-wrapper search-select" id="session-search-type">
+            <div class="custom-select-trigger custom-select-trigger--bare" tabindex="0">
+              <span class="custom-select-value placeholder" data-i18n="sessions.search.typeAll">All types</span>
+              <svg class="custom-select-arrow" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path>
+              </svg>
+            </div>
+            <div class="custom-select-dropdown">
+              <div class="custom-select-option" data-value="" data-i18n="sessions.search.typeAll">All types</div>
+              <div class="custom-select-option" data-value="manual" data-i18n="sessions.search.typeManual">Default</div>
+              <div class="custom-select-option" data-value="cron" data-i18n="sessions.search.typeCron">Scheduled</div>
+              <div class="custom-select-option" data-value="channel" data-i18n="sessions.search.typeChannel">Channel</div>
+              <div class="custom-select-option" data-value="setup" data-i18n="sessions.search.typeSetup">Setup</div>
+              <div class="custom-select-option" data-value="coding" data-i18n="sessions.search.typeCoding">Coding</div>
+            </div>
+          </div>
           <div class="search-date-wrap">
             <button id="session-search-date" class="search-date datepicker-trigger" type="button" data-value="" data-i18n="sessions.search.datePlaceholder"></button>
           </div>
@@ -126,7 +148,7 @@
           <span class="chat-section-title">
             <span data-i18n="sidebar.chat">Sessions</span>
             <!-- Chevron: hidden by default, shown on hover or when collapsed -->
-            <svg class="chat-section-chevron" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg">
+            <svg class="chat-section-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg">
               <path d="M6 9l6 6 6-6"/>
             </svg>
           </span>
@@ -177,7 +199,7 @@
         <div class="sidebar-divider" id="projects-section-header">
           <span class="projects-section-title">
             <span data-i18n="sidebar.projects">Projects</span>
-            <svg class="projects-section-chevron" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <svg class="projects-section-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
               <path d="M6 9l6 6 6-6"/>
             </svg>
           </span>
@@ -212,7 +234,7 @@
                 <polyline points="12 6 12 12 16 14"/>
               </svg>
               <div class="task-info">
-                <span class="task-name" id="tasks-sidebar-label" data-i18n="sidebar.tasks">Task Management</span>
+                <span class="task-name" id="tasks-sidebar-label" data-i18n="sidebar.tasks">Scheduled Tasks</span>
               </div>
             </div>
           </div>
@@ -370,7 +392,7 @@
           <div id="ns-skill-autocomplete" class="skill-autocomplete" style="display:none" role="listbox" aria-label="Skills">
             <div class="skill-ac-header-row">
               <div class="skill-ac-left">
-                <div class="skill-ac-title" data-i18n="sidebar.skills">Skills</div>
+                <div class="skill-ac-title"><span data-i18n="sidebar.skills">Skills</span><span class="skill-ac-count"></span></div>
                 <label class="skill-ac-filter-toggle">
                   <input type="checkbox" id="ns-chk-ac-show-system-skills">
                   <span class="skill-ac-toggle-track"></span>
@@ -398,17 +420,21 @@
             <button id="ns-btn-slash" type="button" class="new-session-composer-btn" title="Insert skill command (/)">
               <span>/</span>
             </button>
-            <textarea id="new-session-input"
-                      class="new-session-textarea"
-                      rows="1"
-                      data-i18n-placeholder="chat.input.placeholder"
-                      placeholder="Message… (Enter to send, Shift+Enter for newline)"></textarea>
+            <div id="new-session-input"
+                 class="new-session-textarea"
+                 contenteditable="true"
+                 role="textbox"
+                 aria-multiline="true"
+                 data-i18n-placeholder="chat.input.placeholder"
+                 data-placeholder="Message… (Enter to send, Shift+Enter for newline)"></div>
             <button id="new-session-send" class="new-session-send" type="button" title="Send message" disabled>
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"></line><polyline points="12 5 19 12 12 19"></polyline></svg>
             </button>
           </div><!-- /.new-session-input-bar -->
             </div><!-- /.ns-input-bar-card -->
           </div><!-- /.ns-composer-frame -->
+          <!-- @ mention menu (Files & Folders / Past Chats) -->
+          <div id="ns-mention-autocomplete" class="mention-autocomplete" style="display:none" role="listbox" aria-label="Mention"></div>
         </div><!-- /.new-session-composer -->
       </div>
     </div>
@@ -500,7 +526,7 @@
         <div id="skill-autocomplete" style="display:none" role="listbox" aria-label="Skills">
           <div class="skill-ac-header-row">
             <div class="skill-ac-left">
-              <div class="skill-ac-title" data-i18n="sidebar.skills">Skills</div>
+              <div class="skill-ac-title"><span data-i18n="sidebar.skills">Skills</span><span class="skill-ac-count"></span></div>
               <label class="skill-ac-filter-toggle">
                 <input type="checkbox" id="chk-ac-show-system-skills">
                 <span class="skill-ac-toggle-track"></span>
@@ -512,6 +538,8 @@
         </div>
         <!-- Image preview strip (hidden when empty) -->
         <div id="image-preview-strip" style="display:none"></div>
+        <!-- @ mention menu (Files & Folders / Past Chats) -->
+        <div id="mention-autocomplete" class="mention-autocomplete" style="display:none" role="listbox" aria-label="Mention"></div>
         <div id="input-bar">
           <!-- Hidden file picker -->
           <input type="file" id="image-file-input" accept="*/*" multiple style="display:none">
@@ -523,9 +551,12 @@
           <button id="btn-slash" title="Insert skill command (/)">
             <span>/</span>
           </button>
-          <textarea id="user-input" rows="1"
-            data-i18n-placeholder="chat.input.placeholder"
-            placeholder="Message… (Enter to send, Shift-Enter for newline)"></textarea>
+          <div id="user-input"
+               contenteditable="true"
+               role="textbox"
+               aria-multiline="true"
+               data-i18n-placeholder="chat.input.placeholder"
+               data-placeholder="Message… (Enter to send, Shift-Enter for newline)"></div>
           <button id="btn-send" title="Send message"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"></line><polyline points="12 5 19 12 12 19"></polyline></svg></button>
           <button id="btn-interrupt" style="display:none" title="Stop"><svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="1.5"/></svg></button>
         </div>
@@ -539,9 +570,17 @@
            sits outside the slot container so re-renders never clobber it. -->
       <div id="session-aside" class="session-aside">
         <div id="session-aside-resize" class="session-aside-resize"></div>
-        <button id="btn-aside-collapse" class="session-aside-collapse" data-i18n-title="aside.collapse" title="Collapse">
-          <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/><path d="m14 9 3 3-3 3"/></svg>
-        </button>
+        <!-- Host-owned actions docked at the right end of the tab bar (the bar
+             itself is rendered by Clacky.ext inside the slot below). -->
+        <div class="aside-tabbar-actions">
+          <button id="btn-aside-fullscreen" class="session-aside-fullscreen" data-i18n-title="aside.fullscreen" title="Fullscreen">
+            <svg class="icon-fs-enter" xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M21 8V5a2 2 0 0 0-2-2h-3"/><path d="M3 16v3a2 2 0 0 0 2 2h3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/></svg>
+            <svg class="icon-fs-exit" xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3v3a2 2 0 0 1-2 2H3"/><path d="M21 8h-3a2 2 0 0 1-2-2V3"/><path d="M3 16h3a2 2 0 0 1 2 2v3"/><path d="M16 21v-3a2 2 0 0 1 2-2h3"/></svg>
+          </button>
+          <button id="btn-aside-collapse" class="session-aside-collapse" data-i18n-title="aside.collapse" title="Collapse">
+            <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/><path d="m14 9 3 3-3 3"/></svg>
+          </button>
+        </div>
         <div id="ext-slot-session-aside" class="session-aside-slot" data-slot="session.aside"></div>
       </div>
 
@@ -675,6 +714,17 @@
             <h2 class="channels-page-title" data-i18n="extensions.title">Extensions</h2>
             <p class="channels-page-subtitle" data-i18n="extensions.subtitle">Browse and manage extensions — add agents, skills, and panels to supercharge your workflow.</p>
           </div>
+          <div class="extensions-header-actions">
+            <button id="btn-import-extension" class="btn-import-extension" type="button" data-i18n-title="extensions.import.tooltip">
+              <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="icon-sm">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                <polyline points="7 10 12 15 17 10"/>
+                <line x1="12" y1="15" x2="12" y2="3"/>
+              </svg>
+              <span data-i18n="extensions.btn.import">Import</span>
+            </button>
+            <input id="extension-import-file" type="file" accept=".zip" style="display:none" />
+          </div>
         </div>
 
         <div class="extensions-toolbar">
@@ -686,15 +736,31 @@
           </div>
           <div class="extensions-toolbar-right">
             <input type="text" id="extensions-search-input" class="extensions-search" placeholder="Search extensions…" />
-            <select id="extensions-sort" class="extensions-sort">
-              <option value="downloads" data-i18n="extensions.sort.downloads">Most downloaded</option>
-              <option value="newest" data-i18n="extensions.sort.newest">Newest</option>
-              <option value="updated" data-i18n="extensions.sort.updated">Recently updated</option>
-            </select>
-            <select id="extensions-installed-filter" class="extensions-sort">
-              <option value="all" data-i18n="extensions.filter.all">All</option>
-              <option value="installed" data-i18n="extensions.filter.installed">Installed</option>
-            </select>
+            <div class="custom-select-wrapper extensions-select" id="extensions-sort">
+              <div class="custom-select-trigger" tabindex="0">
+                <span class="custom-select-value" data-i18n="extensions.sort.downloads">Most downloaded</span>
+                <svg class="custom-select-arrow" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path>
+                </svg>
+              </div>
+              <div class="custom-select-dropdown">
+                <div class="custom-select-option" data-value="downloads" data-i18n="extensions.sort.downloads">Most downloaded</div>
+                <div class="custom-select-option" data-value="newest" data-i18n="extensions.sort.newest">Newest</div>
+                <div class="custom-select-option" data-value="updated" data-i18n="extensions.sort.updated">Recently updated</div>
+              </div>
+            </div>
+            <div class="custom-select-wrapper extensions-select" id="extensions-installed-filter">
+              <div class="custom-select-trigger" tabindex="0">
+                <span class="custom-select-value" data-i18n="extensions.filter.all">All</span>
+                <svg class="custom-select-arrow" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path>
+                </svg>
+              </div>
+              <div class="custom-select-dropdown">
+                <div class="custom-select-option" data-value="all" data-i18n="extensions.filter.all">All</div>
+                <div class="custom-select-option" data-value="installed" data-i18n="extensions.filter.installed">Installed</div>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -730,9 +796,15 @@
               <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="trash-filter-project-icon">
                 <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
               </svg>
-              <select id="trash-filter-project" class="trash-filter-project-select">
-                <option value="" data-i18n="trash.filterAllProjects">所有项目</option>
-              </select>
+              <div class="custom-select-wrapper" id="trash-filter-project">
+                <div class="custom-select-trigger custom-select-trigger--bare" tabindex="0">
+                  <span class="custom-select-value placeholder" data-i18n="trash.filterAllProjects">所有项目</span>
+                  <svg class="custom-select-arrow" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path>
+                  </svg>
+                </div>
+                <div class="custom-select-dropdown"></div>
+              </div>
             </div>
           </div>
           <span class="trash-summary" id="trash-summary"></span>
@@ -877,9 +949,9 @@
         <button class="settings-tab" data-tab="ui" data-i18n="settings.tabs.ui">UI</button>
         <button class="settings-tab" data-tab="general" data-i18n="settings.tabs.general">General</button>
         <button class="settings-tab" data-tab="data" data-i18n="settings.tabs.data">Data</button>
-        <button class="settings-tab" data-tab="about" data-i18n="settings.tabs.about">About</button>
         <!-- Extension tab slot: extensions add custom settings tabs here (button needs data-tab="<id>"). -->
         <span id="ext-slot-settings-tabs" data-slot="settings.tabs"></span>
+        <button class="settings-tab" data-tab="about" data-i18n="settings.tabs.about">About</button>
       </div>
 
       <div id="settings-body">
@@ -899,6 +971,15 @@
                   <input type="text" id="model-search" class="model-search-input"
                          data-i18n-placeholder="settings.models.search.placeholder"
                          placeholder="Search model / provider / remark / base URL" autocomplete="off">
+                </div>
+                <div class="custom-select-wrapper model-provider-filter" id="model-provider-filter">
+                  <div class="custom-select-trigger" tabindex="0">
+                    <span class="custom-select-value placeholder" data-i18n="settings.models.filter.all">All providers</span>
+                    <svg class="custom-select-arrow" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path>
+                    </svg>
+                  </div>
+                  <div class="custom-select-dropdown"></div>
                 </div>
                 <button id="btn-add-model" class="btn-settings-add" data-i18n="settings.models.add">+ Add Model</button>
               </div>
@@ -1083,13 +1164,21 @@
               <span data-i18n="settings.search.title">Web Search</span>
             </div>
             <div class="settings-network">
-              <p class="settings-network-desc" data-i18n="settings.search.desc">By default web_search scrapes DuckDuckGo and Bing, which needs no key but returns lower-quality results. Select a search provider to use an API instead — it falls back to the built-in engines if the provider fails.</p>
+              <p class="settings-network-desc" data-i18n="settings.search.desc">Free built-in search uses Parallel, DuckDuckGo, and Bing with no key required. Select a search provider to use a configured API instead.</p>
               <div class="settings-network-url">
-                <label class="settings-network-url-label" for="settings-search-provider" data-i18n="settings.search.provider">Provider</label>
+                <label class="settings-network-url-label" for="settings-search-provider-trigger" data-i18n="settings.search.provider">Provider</label>
                 <div class="settings-network-url-row">
-                  <select id="settings-search-provider" class="field-select">
-                    <option value="" data-i18n="settings.search.builtin">Built-in (DuckDuckGo / Bing)</option>
-                  </select>
+                  <div class="custom-select-wrapper" id="settings-search-provider-wrapper">
+                    <div class="custom-select-trigger" tabindex="0" id="settings-search-provider-trigger">
+                      <span class="custom-select-value placeholder" id="settings-search-provider-value" data-i18n="settings.search.builtin">Built-in (Parallel / DuckDuckGo / Bing)</span>
+                      <svg class="custom-select-arrow" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path>
+                      </svg>
+                    </div>
+                    <div class="custom-select-dropdown" id="settings-search-provider-dropdown">
+                      <div class="custom-select-option" data-value="" data-i18n="settings.search.builtin">Built-in (Parallel / DuckDuckGo / Bing)</div>
+                    </div>
+                  </div>
                   <button type="button" id="btn-save-search" class="btn-settings-action" data-i18n="settings.search.save">Save</button>
                 </div>
                 <div id="settings-search-status" class="model-test-result"></div>
@@ -1325,9 +1414,7 @@
       <div class="modal-content model-edit-modal-content">
         <div class="modal-header">
           <h3 id="model-modal-title" data-i18n="settings.models.modal.add">Add Model</h3>
-          <button class="modal-close" id="model-modal-close" aria-label="Close">
-            <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-          </button>
+          <button class="modal-close-btn" id="model-modal-close" aria-label="Close">×</button>
         </div>
         <div class="modal-body">
           <input type="hidden" id="model-modal-index" value="-1">
@@ -1342,7 +1429,7 @@
                   <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path>
                 </svg>
               </div>
-              <div class="custom-select-dropdown" id="model-modal-provider-dropdown"></div>
+              <div class="custom-select-dropdown custom-select-dropdown--footer" id="model-modal-provider-dropdown"></div>
             </div>
             <div id="model-modal-promo-hint" class="provider-promo-hint" data-index="modal"></div>
           </label>
@@ -1390,11 +1477,20 @@
 
           <label class="model-field" id="model-modal-apiformat-field">
             <span class="field-label" data-i18n="settings.models.field.apiFormat">API Format</span>
-            <select id="model-modal-api-format" class="field-input field-select">
-              <option value="" data-i18n="settings.models.apiFormat.auto">Auto (detect from provider &amp; model)</option>
-              <option value="anthropic-messages" data-i18n="settings.models.apiFormat.anthropicMessages">Anthropic Messages API</option>
-              <option value="openai-completions" data-i18n="settings.models.apiFormat.openaiCompletions">OpenAI Chat Completions</option>
-            </select>
+            <div class="custom-select-wrapper" id="model-modal-api-format-wrapper">
+              <div class="custom-select-trigger" tabindex="0" id="model-modal-api-format-trigger">
+                <span class="custom-select-value placeholder" id="model-modal-api-format-value" data-i18n="settings.models.apiFormat.auto">Auto (detect from provider &amp; model)</span>
+                <svg class="custom-select-arrow" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path>
+                </svg>
+              </div>
+              <div class="custom-select-dropdown" id="model-modal-api-format-dropdown">
+                <div class="custom-select-option" data-value="" data-i18n="settings.models.apiFormat.auto">Auto (detect from provider &amp; model)</div>
+                <div class="custom-select-option" data-value="anthropic-messages" data-i18n="settings.models.apiFormat.anthropicMessages">Anthropic Messages API</div>
+                <div class="custom-select-option" data-value="openai-completions" data-i18n="settings.models.apiFormat.openaiCompletions">OpenAI Chat Completions</div>
+                <div class="custom-select-option" data-value="openai-responses" data-i18n="settings.models.apiFormat.openaiResponses">OpenAI Responses API</div>
+              </div>
+            </div>
           </label>
 
           <label class="model-field">
@@ -1402,12 +1498,17 @@
             <input type="text" id="model-modal-remark" class="field-input" autocomplete="off" maxlength="80">
           </label>
 
-          <div id="model-modal-test-result" class="model-test-result"></div>
+          <label class="model-field model-field-checkbox" id="model-modal-no-vision-field">
+            <input type="checkbox" id="model-modal-no-vision" class="field-checkbox">
+            <span class="field-label" data-i18n="settings.models.field.noVision">Model cannot recognize images</span>
+          </label>
 
           <label class="model-field model-field-checkbox" id="model-modal-default-field">
             <input type="checkbox" id="model-modal-set-default" class="field-checkbox">
             <span class="field-label" data-i18n="settings.models.field.setDefault">Set as default model</span>
           </label>
+
+          <div id="model-modal-test-result" class="model-test-result"></div>
         </div>
         <div class="modal-footer">
           <button id="model-modal-cancel" class="btn-secondary" data-i18n="settings.models.btn.cancel">Cancel</button>
@@ -1517,9 +1618,9 @@
             </li>
             <li>
               <strong id="setup-device-success-model-label" data-i18n="onboard.device.success.model.label">Trial model:</strong>
-              <span id="setup-device-success-model">or-gemini-3-5-flash</span>
+              <span id="setup-device-success-model">or-gemini-3-8-flash</span>
             </li>
-            <li id="setup-device-success-note" class="setup-device-success-note" data-i18n="onboard.device.success.note">During the trial only Gemini 3.5 Flash is available — top up any amount to unlock all frontier models on this same key.</li>
+            <li id="setup-device-success-note" class="setup-device-success-note" data-i18n="onboard.device.success.note">During the trial only Gemini 3.8 Flash is available — top up any amount to unlock all frontier models on this same key.</li>
           </ul>
           <button id="setup-btn-device-continue" class="setup-submit-btn" data-i18n="onboard.device.success.btn">Start using Clacky →</button>
         </div>
@@ -1669,13 +1770,18 @@
 <script src="/utils.js"></script>
 <script src="/core/ext.js"></script>
 <script src="/core/aside.js"></script>
+<script src="/components/composer.js"></script>
+<script src="/components/mentions.js"></script>
 <script src="/i18n.js"></script>
+<script src="/components/model-picker.js"></script>
 <script src="/auth.js"></script>
 <script src="/theme.js"></script>
 <script src="/components/notify.js"></script>
 <script src="/ws.js"></script>
 <script src="/ws-dispatcher.js"></script>
+<script src="/components/custom-select.js"></script>
 <script src="/sessions.js"></script>
+<script src="/components/quote-select.js"></script>
 <script src="/projects.js"></script>
 <script src="/features/workspace/store.js"></script>
 <script src="/features/workspace/view.js"></script>

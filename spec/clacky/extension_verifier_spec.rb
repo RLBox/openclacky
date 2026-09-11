@@ -43,6 +43,64 @@ RSpec.describe Clacky::ExtensionVerifier do
     expect(issues.find { |i| i.code == "schema.unknown_key" }.level).to eq(:warning)
   end
 
+  it "accepts the `config` top-level key without warning" do
+    manifest = <<~YAML
+      id: config-ok
+      origin: self
+      config:
+        foo: bar
+      contributes: {}
+    YAML
+    make_ext(local, "config-ok", manifest)
+    result = reload_layers
+
+    issues = described_class.verify(result)
+    expect(issues.map(&:code)).not_to include("schema.unknown_key")
+  end
+
+  it "accepts a three-segment numeric version" do
+    manifest = <<~YAML
+      id: valid-version
+      version: 10.2.35
+      origin: self
+      contributes: {}
+    YAML
+    make_ext(local, "valid-version", manifest)
+
+    issues = described_class.verify(reload_layers)
+
+    expect(issues.map(&:code)).not_to include("schema.invalid_version")
+  end
+
+  it "flags a version that is not three numeric segments" do
+    manifest = <<~YAML
+      id: invalid-version
+      version: test.1.0
+      origin: self
+      contributes: {}
+    YAML
+    make_ext(local, "invalid-version", manifest)
+
+    issues = described_class.verify(reload_layers)
+    issue = issues.find { |candidate| candidate.code == "schema.invalid_version" }
+
+    expect(issue).not_to be_nil
+    expect(issue.level).to eq(:error)
+  end
+
+  it "keeps the version field optional during local development" do
+    manifest = <<~YAML
+      id: no-version
+      origin: self
+      contributes: {}
+    YAML
+    make_ext(local, "no-version", manifest)
+
+    issues = described_class.verify(reload_layers)
+
+    expect(issues.map(&:code)).not_to include("schema.invalid_version")
+  end
+
   it "flags unknown contributes type" do
     manifest = <<~YAML
       id: bad-contrib
@@ -96,6 +154,26 @@ RSpec.describe Clacky::ExtensionVerifier do
     issues = described_class.verify(result)
     unknown = issues.select { |i| i.code == "schema.unknown_field" && i.unit == "secret" }
     expect(unknown).to be_empty
+  end
+
+  it "accepts disabled_skills on agents while still warning about misspelled fields" do
+    manifest = <<~YAML
+      id: filtered-agent-pack
+      origin: self
+      contributes:
+        agents:
+          - id: filtered
+            title: Filtered
+            prompt: prompt.md
+            disabled_skills: [triage]
+            disabled_skill: [typo]
+    YAML
+    make_ext(local, "filtered-agent-pack", manifest, "prompt.md" => "hi")
+
+    issues = described_class.verify(reload_layers)
+    unknown = issues.select { |i| i.code == "schema.unknown_field" && i.unit == "filtered" }
+    expect(unknown.size).to eq(1)
+    expect(unknown.first.message).to eq("agent unit has unknown key(s): disabled_skill")
   end
 
   it "flags an agent referencing a non-existent panel" do

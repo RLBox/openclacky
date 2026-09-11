@@ -40,7 +40,7 @@ end
 Replace the enterprise-card assertion with:
 
 ```ruby
-expect(setup_step).to include('$("setup-enterprise-link").style.display')
+expect(setup_step).to include('$("setup-btn-enterprise-login").style.display')
 ```
 
 - [ ] **Step 3: Run the focused spec and confirm the intended failure**
@@ -124,7 +124,7 @@ In `_showSetupStep`, initialize the enterprise elements as follows while preserv
 ```javascript
 $("setup-device-block").style.display = "";
 $("setup-device-card").style.display = _branded ? "none" : "";
-$("setup-enterprise-link").style.display = "";
+$("setup-btn-enterprise-login").style.display = "";
 $("setup-enterprise-form").style.display = "none";
 $("setup-device-pending").style.display = "none";
 $("setup-device-success").style.display = "none";
@@ -141,7 +141,7 @@ if (enterpriseBtn) enterpriseBtn.addEventListener("click", () => {
   $("setup-device-card").style.display = "none";
   $("setup-manual-toggle").style.display = "none";
   $("setup-manual-section").style.display = "none";
-  $("setup-enterprise-link").style.display = "none";
+  $("setup-btn-enterprise-login").style.display = "none";
   $("setup-enterprise-form").style.display = "";
   $("setup-enterprise-source").focus();
 });
@@ -159,13 +159,13 @@ function _restoreDeviceChoices() {
   $("setup-device-card").style.display = _branded ? "none" : "";
   $("setup-manual-toggle").style.display = "";
   $("setup-manual-section").style.display = "none";
-  $("setup-enterprise-link").style.display = "";
+  $("setup-btn-enterprise-login").style.display = "";
 }
 ```
 
 - [ ] **Step 4: Hide all choices during pending and success states**
 
-In `_showDevicePending` and `_showDeviceSuccess`, hide `setup-enterprise-link`, `setup-manual-toggle`, and `setup-manual-section`. Do not change the request payload, polling loop, atomic persistence, or enterprise-specific success copy.
+In `_showDevicePending` and `_showDeviceSuccess`, hide `setup-btn-enterprise-login`, `setup-manual-toggle`, and `setup-manual-section`. Do not change the request payload, polling loop, validated persistence sequence, or enterprise-specific success copy.
 
 - [ ] **Step 5: Run the focused WebUI spec**
 
@@ -175,7 +175,7 @@ Run:
 mise exec ruby@3.4.9 -- bundle exec rspec spec/clacky/web/enterprise_device_login_ui_spec.rb
 ```
 
-Expected: `5 examples, 0 failures`.
+Expected: all examples pass, including the selector regression check.
 
 ### Task 4: Verify the complete enterprise client behavior
 

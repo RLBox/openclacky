@@ -1,6 +1,19 @@
 # frozen_string_literal: true
 
 RSpec.describe Clacky::Providers do
+  describe ".preset?" do
+    it "returns true for a known preset id" do
+      expect(described_class.preset?("minimax")).to be true
+      expect(described_class.preset?("kimi")).to be true
+    end
+
+    it "returns false for an unknown id" do
+      expect(described_class.preset?("nope-provider")).to be false
+      expect(described_class.preset?("")).to be false
+      expect(described_class.preset?(nil)).to be false
+    end
+  end
+
   describe ".capabilities" do
     it "returns {} for an unknown provider" do
       expect(described_class.capabilities("nope-provider")).to eq({})
@@ -70,6 +83,18 @@ RSpec.describe Clacky::Providers do
                                          model_name: "dsk-deepseek-v4-pro")).to be false
         expect(described_class.supports?("openclacky", :vision,
                                          model_name: "dsk-deepseek-v4-flash")).to be false
+        # The flash-vision-exp variant is vision-capable despite its
+        # text-only DeepSeek siblings.
+        expect(described_class.supports?("openclacky", :vision,
+                                         model_name: "dsk-deepseek-v4-flash-vision-exp")).to be true
+      end
+
+      it "returns true for deepseekv4 + flash-vision-exp override" do
+        expect(described_class.supports?("deepseekv4", :vision)).to be false
+        expect(described_class.supports?("deepseekv4", :vision,
+                                         model_name: "deepseek-v4-flash-vision-exp")).to be true
+        expect(described_class.supports?("deepseekv4", :vision,
+                                         model_name: "deepseek-v4-pro")).to be false
       end
 
       it "returns true for openclacky + unknown model (falls back to provider default)" do
@@ -88,12 +113,14 @@ RSpec.describe Clacky::Providers do
                                          model_name: "mimo-v2.5")).to be true
       end
 
-      it "returns false for glm (default text-only), true for glm-5v-turbo" do
+      it "returns false for glm (default text-only), true for vision SKUs" do
         expect(described_class.supports?("glm", :vision)).to be false
         expect(described_class.supports?("glm", :vision,
                                          model_name: "glm-5.1")).to be false
         expect(described_class.supports?("glm", :vision,
                                          model_name: "glm-5v-turbo")).to be true
+        expect(described_class.supports?("glm", :vision,
+                                         model_name: "glm-5.3-flash")).to be true
       end
     end
 

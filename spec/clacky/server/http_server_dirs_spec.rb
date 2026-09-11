@@ -4,6 +4,7 @@ require "spec_helper"
 require "json"
 require "tmpdir"
 require "fileutils"
+require "uri"
 require "clacky/server/http_server"
 require "clacky/agent_config"
 require_relative "../../support/http_server_spec_helpers"
@@ -64,6 +65,261 @@ RSpec.describe Clacky::Server::HttpServer, "directory picker mutation API" do
         expect(body).to have_key("entries")
       end
     end
+
+    it "exposes quick-access `places` as home favorites" do
+      with_server(agent_config: agent_config) do |server|
+        req = fake_req(method: "GET", path: "/api/dirs",
+                       query_string: "path=#{tmproot}")
+        res = fake_res
+        dispatch(server, req, res)
+
+        expect(res.status).to eq(200)
+        places = parsed_body(res)["places"]
+        expect(places).to be_an(Array)
+
+        home = places.find { |p| p["id"] == "home" }
+        expect(home).not_to be_nil
+        expect(home["path"]).to eq(Dir.home)
+        expect(home["kind"]).to eq("favorite")
+
+        # Only favorites are exposed; no root/locations/volumes.
+        expect(places.map { |p| p["id"] }).not_to include("root", "applications")
+        expect(places.map { |p| p["kind"] }.uniq).to eq(["favorite"])
+      end
+    end
+
+    it "normalizes any WSL drive-letter path before browsing" do
+      with_server(agent_config: agent_config) do |server|
+        windows_path = "R:\\Users\\tester\\workspace"
+        allow(Clacky::Utils::EnvironmentDetector).to receive(:win_to_linux_path)
+          .with(windows_path).and_return(tmproot)
+
+        req = fake_req(method: "GET", path: "/api/dirs",
+                       query_string: URI.encode_www_form(path: windows_path))
+        res = fake_res
+        dispatch(server, req, res)
+
+        expect(res.status).to eq(200)
+        body = parsed_body(res)
+        expect(body["path"]).to eq(tmproot)
+        expect(body["exact"]).to be true
+      end
+    end
+
+    it "marks fallback-to-an-ancestor results as inexact" do
+      with_server(agent_config: agent_config) do |server|
+        missing = File.join(tmproot, "missing", "nested")
+        req = fake_req(method: "GET", path: "/api/dirs",
+                       query_string: URI.encode_www_form(path: missing))
+        res = fake_res
+        dispatch(server, req, res)
+
+        expect(res.status).to eq(200)
+        body = parsed_body(res)
+        expect(body["path"]).to eq(tmproot)
+        expect(body["exact"]).to be false
+      end
+    end
+  end
+
+  describe "GET /api/sessions/:id/files" do
+    it "normalizes a drive-letter path in absolute mode" do
+      with_server(agent_config: agent_config) do |server|
+        windows_path = "Q:/workspaces/project"
+        allow(Clacky::Utils::EnvironmentDetector).to receive(:win_to_linux_path)
+          .with(windows_path).and_return(tmproot)
+
+        registry = double("registry")
+        allow(registry).to receive(:ensure).with("session-1").and_return(true)
+        allow(registry).to receive(:get).with("session-1")
+          .and_return({ agent: double("agent", working_dir: tmproot) })
+        server.instance_variable_set(:@registry, registry)
+
+        req = fake_req(method: "GET", path: "/api/sessions/session-1/files",
+                       query_string: URI.encode_www_form(path: windows_path, absolute: true))
+        res = fake_res
+        server.send(:api_session_files, "session-1", req, res)
+
+        expect(res.status).to eq(200)
+        expect(parsed_body(res)["path"]).to eq(tmproot)
+      end
+    end
+
+    it "lists root-level entries with relative paths (no leading slash)" do
+      with_server(agent_config: agent_config) do |server|
+        FileUtils.touch(File.join(tmproot, "demo.txt"))
+        FileUtils.mkdir_p(File.join(tmproot, "sub"))
+
+        registry = double("registry")
+        allow(registry).to receive(:ensure).with("session-1").and_return(true)
+        allow(registry).to receive(:get).with("session-1")
+          .and_return({ agent: double("agent", working_dir: tmproot) })
+        server.instance_variable_set(:@registry, registry)
+
+        req = fake_req(method: "GET", path: "/api/sessions/session-1/files",
+                       query_string: "")
+        res = fake_res
+        server.send(:api_session_files, "session-1", req, res)
+
+        expect(res.status).to eq(200)
+        entries = parsed_body(res)["entries"]
+        file_entry = entries.find { |e| e["name"] == "demo.txt" }
+        dir_entry  = entries.find { |e| e["name"] == "sub" }
+        # A leading slash would make the Web UI treat the path as absolute and
+        # send "/demo.txt" to file-action, which fails with "file not found".
+        expect(file_entry["path"]).to eq("demo.txt")
+        expect(dir_entry["path"]).to eq("sub")
+      end
+    end
+
+      it "keeps subdirectory entries under their relative parent path" do
+        with_server(agent_config: agent_config) do |server|
+          FileUtils.mkdir_p(File.join(tmproot, "sub"))
+          FileUtils.touch(File.join(tmproot, "sub", "nested.txt"))
+        registry = double("registry")
+        allow(registry).to receive(:ensure).with("session-1").and_return(true)
+        allow(registry).to receive(:get).with("session-1")
+          .and_return({ agent: double("agent", working_dir: tmproot) })
+        server.instance_variable_set(:@registry, registry)
+
+        req = fake_req(method: "GET", path: "/api/sessions/session-1/files",
+                       query_string: URI.encode_www_form(path: "sub"))
+        res = fake_res
+        server.send(:api_session_files, "session-1", req, res)
+
+        expect(res.status).to eq(200)
+        entry = parsed_body(res)["entries"].find { |e| e["name"] == "nested.txt" }
+        expect(entry["path"]).to eq("sub/nested.txt")
+      end
+    end
+  end
+
+  # ── WSL quick-access mapping ─────────────────────────────────────────────
+  # Under WSL every favorite (home/desktop/downloads/documents) must target the
+  # Windows user profile (/mnt/<drive>/Users/<name>/...), not the Linux home.
+
+  describe "WSL quick-access mapping" do
+    it "targets the Windows profile for home/desktop/downloads/documents under WSL" do
+      with_server(agent_config: agent_config) do |server|
+        win_home = File.join(tmproot, "win")
+        %w[Desktop Downloads Documents].each { |d| FileUtils.mkdir_p(File.join(win_home, d)) }
+        allow(server).to receive(:wsl_windows_home).and_return(win_home)
+
+        places = server.send(:dir_picker_places)
+
+        expect(places.find { |p| p[:id] == "home" }[:path]).to eq(win_home)
+        expect(places.find { |p| p[:id] == "desktop" }[:path]).to eq(File.join(win_home, "Desktop"))
+        expect(places.find { |p| p[:id] == "downloads" }[:path]).to eq(File.join(win_home, "Downloads"))
+        expect(places.find { |p| p[:id] == "documents" }[:path]).to eq(File.join(win_home, "Documents"))
+      end
+    end
+
+    it "scans mounted drives for the single real profile, skipping system dirs" do
+      with_server(agent_config: agent_config) do |server|
+        allow(server).to receive(:wsl?).and_return(true)
+        allow(ENV).to receive(:[]).and_wrap_original do |original, *args|
+          %w[WINDOWS_USERNAME USERNAME USER].include?(args.first) ? nil : original.call(*args)
+        end
+        allow(Dir).to receive(:exist?).and_wrap_original do |original, *args|
+          %w[/mnt /mnt/c/Users /mnt/d/Users].include?(args.first) ? true : original.call(*args)
+        end
+        allow(Dir).to receive(:children).and_wrap_original do |original, *args|
+          case args.first
+          when "/mnt" then ["c", "d"]
+          when "/mnt/c/Users" then ["Public", "Default", "Default User", "All Users", "leo"]
+          else original.call(*args)
+          end
+        end
+        allow(File).to receive(:directory?).and_wrap_original do |original, *args|
+          args.first == "/mnt/c/Users/leo" ? true : original.call(*args)
+        end
+
+        expect(server.send(:wsl_windows_home)).to eq("/mnt/c/Users/leo")
+      end
+    end
+
+    it "prefers the cmd.exe-queried username over the first profile" do
+      with_server(agent_config: agent_config) do |server|
+        allow(server).to receive(:wsl?).and_return(true)
+        allow(server).to receive(:wsl_windows_username).and_return("maria")
+        allow(ENV).to receive(:[]).and_wrap_original do |original, *args|
+          %w[WINDOWS_USERNAME USERNAME USER].include?(args.first) ? nil : original.call(*args)
+        end
+        allow(Dir).to receive(:exist?).and_wrap_original do |original, *args|
+          %w[/mnt /mnt/c/Users /mnt/c/Users/maria].include?(args.first) ? true : original.call(*args)
+        end
+        allow(Dir).to receive(:children).and_wrap_original do |original, *args|
+          args.first == "/mnt" ? ["c"] : original.call(*args)
+        end
+
+        expect(server.send(:wsl_windows_home)).to eq("/mnt/c/Users/maria")
+      end
+    end
+
+    it "matches the WSL Linux username before guessing the first profile" do
+      with_server(agent_config: agent_config) do |server|
+        allow(server).to receive(:wsl?).and_return(true)
+        allow(server).to receive(:wsl_windows_username).and_return(nil)
+        allow(ENV).to receive(:[]).and_wrap_original do |original, *args|
+          case args.first
+          when "WINDOWS_USERNAME", "USERNAME" then nil
+          when "USER" then "maria"
+          else original.call(*args)
+          end
+        end
+        allow(Dir).to receive(:exist?).and_wrap_original do |original, *args|
+          %w[/mnt /mnt/c/Users /mnt/c/Users/maria].include?(args.first) ? true : original.call(*args)
+        end
+        allow(Dir).to receive(:children).and_wrap_original do |original, *args|
+          args.first == "/mnt" ? ["c"] : original.call(*args)
+        end
+
+        expect(server.send(:wsl_windows_home)).to eq("/mnt/c/Users/maria")
+      end
+    end
+
+    it "falls back to the first real profile when no username matches" do
+      with_server(agent_config: agent_config) do |server|
+        allow(server).to receive(:wsl?).and_return(true)
+        allow(server).to receive(:wsl_windows_username).and_return(nil)
+        allow(ENV).to receive(:[]).and_wrap_original do |original, *args|
+          %w[WINDOWS_USERNAME USERNAME USER].include?(args.first) ? nil : original.call(*args)
+        end
+        allow(Dir).to receive(:exist?).and_wrap_original do |original, *args|
+          %w[/mnt /mnt/c/Users].include?(args.first) ? true : original.call(*args)
+        end
+        allow(Dir).to receive(:children).and_wrap_original do |original, *args|
+          case args.first
+          when "/mnt" then ["c"]
+          when "/mnt/c/Users" then ["Public", "Default", "leo", "maria"]
+          else original.call(*args)
+          end
+        end
+        allow(File).to receive(:directory?).and_wrap_original do |original, *args|
+          %w[/mnt/c/Users/leo /mnt/c/Users/maria].include?(args.first) ? true : original.call(*args)
+        end
+
+        expect(server.send(:wsl_windows_home)).to eq("/mnt/c/Users/leo")
+      end
+    end
+
+    it "exposes mounted drives as `drive` places under WSL, skipping non-drive mounts" do
+      with_server(agent_config: agent_config) do |server|
+        allow(server).to receive(:wsl?).and_return(true)
+        allow(server).to receive(:wsl_windows_home).and_return(nil)
+        allow(Dir).to receive(:exist?).and_wrap_original do |original, *args|
+          %w[/mnt /mnt/c /mnt/d /mnt/e].include?(args.first) ? true : original.call(*args)
+        end
+        allow(Dir).to receive(:children).and_wrap_original do |original, *args|
+          args.first == "/mnt" ? ["c", "d", "e", "wsl", "wslg"] : original.call(*args)
+        end
+
+        drives = server.send(:dir_picker_places).select { |p| p[:kind] == "drive" }
+
+        expect(drives.map { |d| d[:letter] }).to eq(["C", "D", "E"])
+        expect(drives.map { |d| d[:path] }).to eq(["/mnt/c", "/mnt/d", "/mnt/e"])
+      end
+    end
   end
 
   # ── POST /api/dirs/mkdir ──────────────────────────────────────────────────
@@ -81,6 +337,22 @@ RSpec.describe Clacky::Server::HttpServer, "directory picker mutation API" do
         expect(body["ok"]).to be true
         expect(body["name"]).to eq("fresh")
         expect(Dir.exist?(File.join(tmproot, "fresh"))).to be true
+      end
+    end
+
+    it "normalizes a drive-letter parent before creating a directory" do
+      with_server(agent_config: agent_config) do |server|
+        windows_parent = "Z:\\workspace"
+        allow(Clacky::Utils::EnvironmentDetector).to receive(:win_to_linux_path)
+          .with(windows_parent).and_return(tmproot)
+
+        req = fake_req(method: "POST", path: "/api/dirs/mkdir",
+                       body: { parent: windows_parent, name: "from-windows-path" })
+        res = fake_res
+        dispatch(server, req, res)
+
+        expect(res.status).to eq(200)
+        expect(Dir.exist?(File.join(tmproot, "from-windows-path"))).to be true
       end
     end
 

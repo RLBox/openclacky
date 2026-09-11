@@ -47,7 +47,8 @@ RSpec.describe Clacky::CLI, "UI2 slash commands" do
       agent_profile: agent_profile,
       total_tasks: 0,
       total_cost: 0.0,
-      session_id: "current-session-id")
+      session_id: "current-session-id",
+      reasoning_effort: nil)
   end
 
   # Trigger the registered on_input block with a given command string.
@@ -167,6 +168,78 @@ RSpec.describe Clacky::CLI, "UI2 slash commands" do
     it "delegates to handle_model_command" do
       expect(cli).to receive(:handle_model_command).with(ui_controller, agent_config, agent, anything)
       send_input("/model")
+    end
+  end
+
+  # ── /think ───────────────────────────────────────────────────────────────────
+  describe "/think" do
+    it "delegates to handle_think_command" do
+      expect(cli).to receive(:handle_think_command).with(ui_controller, agent, nil)
+      send_input("/think")
+    end
+  end
+
+  describe "#handle_think_command" do
+    let(:session_manager) { instance_double(Clacky::SessionManager) }
+    let(:session_data) { { id: "current-session-id", config: {} } }
+
+    before do
+      allow(agent).to receive(:to_session_data).and_return(session_data)
+      allow(agent).to receive(:reasoning_effort=)
+      allow(agent).to receive(:reasoning_effort)
+      allow(ui_controller).to receive(:config).and_return({})
+      allow(ui_controller).to receive(:show_reasoning_effort_menu).and_return(nil)
+      allow(ui_controller).to receive(:show_success)
+      allow(session_manager).to receive(:save)
+    end
+
+    it "sets and persists the chosen effort level" do
+      allow(ui_controller).to receive(:show_reasoning_effort_menu).and_return("high")
+      expect(agent).to receive(:reasoning_effort=).with("high")
+      expect(session_manager).to receive(:save).with(session_data)
+      cli.send(:handle_think_command, ui_controller, agent, session_manager)
+    end
+
+    it "reflects the new effort in the session bar config" do
+      allow(ui_controller).to receive(:show_reasoning_effort_menu).and_return("high")
+      allow(agent).to receive(:reasoning_effort).and_return("high")
+      expect(ui_controller).to receive(:update_sessionbar).with(no_args)
+      cli.send(:handle_think_command, ui_controller, agent, session_manager)
+      expect(ui_controller.config[:reasoning_effort]).to eq("high")
+    end
+
+    it "clears the session bar effort when off is chosen" do
+      allow(ui_controller).to receive(:show_reasoning_effort_menu).and_return("off")
+      allow(agent).to receive(:reasoning_effort).and_return(nil)
+      cli.send(:handle_think_command, ui_controller, agent, session_manager)
+      expect(ui_controller.config[:reasoning_effort]).to be_nil
+    end
+
+    it "passes the current effort to the menu" do
+      allow(agent).to receive(:reasoning_effort).and_return("medium")
+      expect(ui_controller).to receive(:show_reasoning_effort_menu).with("medium")
+      cli.send(:handle_think_command, ui_controller, agent, session_manager)
+    end
+
+    it "confirms the chosen level via show_success" do
+      allow(ui_controller).to receive(:show_reasoning_effort_menu).and_return("high")
+      allow(agent).to receive(:reasoning_effort).and_return("high")
+      expect(ui_controller).to receive(:show_success).with("Thinking level set to high")
+      cli.send(:handle_think_command, ui_controller, agent, session_manager)
+    end
+
+    it "reports provider default when off is chosen" do
+      allow(ui_controller).to receive(:show_reasoning_effort_menu).and_return("off")
+      allow(agent).to receive(:reasoning_effort).and_return(nil)
+      expect(ui_controller).to receive(:show_success).with("Thinking level: off (provider default)")
+      cli.send(:handle_think_command, ui_controller, agent, session_manager)
+    end
+
+    it "does nothing when the menu is cancelled" do
+      expect(agent).not_to receive(:reasoning_effort=)
+      expect(session_manager).not_to receive(:save)
+      expect(ui_controller).not_to receive(:show_success)
+      cli.send(:handle_think_command, ui_controller, agent, session_manager)
     end
   end
 end

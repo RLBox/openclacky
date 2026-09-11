@@ -7,6 +7,23 @@ module Clacky
     # Pricing per 1M tokens (MTok) in USD
     # All pricing is based on official API documentation
     PRICING_TABLE = {
+      # Claude Fable 5.1 — same input/output as Fable 5, but cache read is
+      # $0.25/MTok (vs $1.00 for Fable 5). Source: Anthropic pricing table.
+      "claude-fable-5-1" => {
+        input: {
+          default: 10.00,              # $10/MTok for prompts ≤ 200K tokens
+          over_200k: 10.00
+        },
+        output: {
+          default: 50.00,             # $50/MTok for prompts ≤ 200K tokens
+          over_200k: 50.00
+        },
+        cache: {
+          write: 12.50,               # $12.50/MTok cache write (5-min tier)
+          read: 0.25                  # $0.25/MTok cache read
+        }
+      },
+
       # Claude 4.5 models - tiered pricing based on prompt length
       "claude-fable-5" => {
         input: {
@@ -159,36 +176,61 @@ module Clacky
       #   - "cache miss input" = regular prompt_tokens rate
       #   - "cache hit input"  = cache_read rate (DeepSeek has no separate cache-write charge)
       #   - No tiered pricing (single rate regardless of context length)
-      # Effective 2026-08-16 16:00 UTC DeepSeek switched to peak/off-peak billing
-      # (off-peak = half of peak; peak = 01:00-04:00 & 06:00-10:00 UTC).
-      # Each entry carries legacy/peak/off_peak tiers; calculate_cost resolves
-      # the active tier from the request time.
-      "deepseek-v4-flash" => {
+      # Peak/off-peak billing (off-peak = half of peak; peak = 01:00-04:00 &
+      # 06:00-10:00 UTC). Weekends (Sat/Sun, Beijing time) are billed entirely
+      # at off-peak rates regardless of hour.
+      # v4-pro keeps its own rates until 2026-09-14, when it is routed to
+      # V4.1 Flash and billed at the flash rates (see flash_peak/flash_off_peak).
+      # Each entry carries peak/off_peak tiers; calculate_cost resolves the
+      # active tier from the request time.
+      # V4.1 Flash — new canonical model id. Native multimodal; the retired
+      # v4-flash / v4-flash-vision-exp ids are routed here for compatibility.
+      "deepseek-flash" => {
         deepseek: true,
-        legacy: {
-          input:  { default: 0.14,   over_200k: 0.14 },   # $0.14/MTok  (pre-cutover flat)
-          output: { default: 0.28,   over_200k: 0.28 },   # $0.28/MTok
-          cache:  { write: 0.14,     read: 0.0028 }       # $0.0028/MTok cache hit
-        },
         peak: {
-          input:  { default: 0.44,   over_200k: 0.44 },   # $0.44/MTok  cache miss (peak)
-          output: { default: 1.32,   over_200k: 1.32 },   # $1.32/MTok
-          cache:  { write: 0.44,     read: 0.014 }        # $0.014/MTok cache hit
+          input:  { default: 0.30,   over_200k: 0.30 },
+          output: { default: 1.20,   over_200k: 1.20 },
+          cache:  { write: 0.30,     read: 0.006 }
         },
         off_peak: {
-          input:  { default: 0.22,   over_200k: 0.22 },   # $0.22/MTok  (half of peak)
-          output: { default: 0.66,   over_200k: 0.66 },   # $0.66/MTok
-          cache:  { write: 0.22,     read: 0.007 }        # $0.007/MTok cache hit
+          input:  { default: 0.15,   over_200k: 0.15 },
+          output: { default: 0.60,   over_200k: 0.60 },
+          cache:  { write: 0.15,     read: 0.003 }
+        }
+      },
+
+      "deepseek-v4-flash" => {
+        deepseek: true,
+        peak: {
+          input:  { default: 0.30,   over_200k: 0.30 },   # $0.30/MTok  cache miss (peak)
+          output: { default: 1.20,   over_200k: 1.20 },   # $1.20/MTok
+          cache:  { write: 0.30,     read: 0.006 }        # $0.006/MTok cache hit
+        },
+        off_peak: {
+          input:  { default: 0.15,   over_200k: 0.15 },   # $0.15/MTok  (half of peak)
+          output: { default: 0.60,   over_200k: 0.60 },   # $0.60/MTok
+          cache:  { write: 0.15,     read: 0.003 }        # $0.003/MTok cache hit
+        }
+      },
+
+      # Vision variant of v4-flash; identical token rates (images are billed
+      # as tokens per DeepSeek's image tokenization rules).
+      "deepseek-v4-flash-vision-exp" => {
+        deepseek: true,
+        peak: {
+          input:  { default: 0.30,   over_200k: 0.30 },
+          output: { default: 1.20,   over_200k: 1.20 },
+          cache:  { write: 0.30,     read: 0.006 }
+        },
+        off_peak: {
+          input:  { default: 0.15,   over_200k: 0.15 },
+          output: { default: 0.60,   over_200k: 0.60 },
+          cache:  { write: 0.15,     read: 0.003 }
         }
       },
 
       "deepseek-v4-pro" => {
         deepseek: true,
-        legacy: {
-          input:  { default: 0.435,  over_200k: 0.435 },  # $0.435/MTok  (pre-cutover flat)
-          output: { default: 0.87,   over_200k: 0.87 },   # $0.87/MTok
-          cache:  { write: 0.435,    read: 0.003625 }     # $0.003625/MTok cache hit
-        },
         peak: {
           input:  { default: 1.32,   over_200k: 1.32 },   # $1.32/MTok  cache miss (peak)
           output: { default: 3.96,   over_200k: 3.96 },   # $3.96/MTok
@@ -198,6 +240,18 @@ module Clacky
           input:  { default: 0.66,   over_200k: 0.66 },   # $0.66/MTok  (half of peak)
           output: { default: 1.98,   over_200k: 1.98 },   # $1.98/MTok
           cache:  { write: 0.66,     read: 0.022 }        # $0.022/MTok cache hit
+        },
+        # Routed to V4.1 Flash from 2026-09-14 12:00 Beijing time and billed
+        # at the flash rates.
+        flash_peak: {
+          input:  { default: 0.30,   over_200k: 0.30 },
+          output: { default: 1.20,   over_200k: 1.20 },
+          cache:  { write: 0.30,     read: 0.006 }
+        },
+        flash_off_peak: {
+          input:  { default: 0.15,   over_200k: 0.15 },
+          output: { default: 0.60,   over_200k: 0.60 },
+          cache:  { write: 0.15,     read: 0.003 }
         }
       },
 
@@ -385,6 +439,46 @@ module Clacky
         }
       },
 
+      # Gemini 3.8 Flash. Flat pricing, 1M context, 64K max output.
+      # Same list price as 3.7/3.6 Flash; intro rate $0.75/$3.75 through
+      # 2026-12-31 before settling at $1.50/$7.50 (list price shown).
+      # Cache write billed at input rate (Vertex doesn't expose a separate
+      # cache-write charge in the OpenAI shim usage response).
+      "gemini-3.8-flash" => {
+        input: {
+          default: 1.50,
+          over_200k: 1.50
+        },
+        output: {
+          default: 7.50,
+          over_200k: 7.50
+        },
+        cache: {
+          write: 1.50,
+          read: 0.15
+        }
+      },
+
+      # Gemini 3.7 Flash. Flat pricing, 1M context, 64K max output.
+      # Same list price as 3.6 Flash; both carry an intro rate of $0.75/$3.75
+      # through 2026-12-31 before settling at $1.50/$7.50 (list price shown).
+      # Cache write billed at input rate (Vertex doesn't expose a separate
+      # cache-write charge in the OpenAI shim usage response).
+      "gemini-3.7-flash" => {
+        input: {
+          default: 1.50,
+          over_200k: 1.50
+        },
+        output: {
+          default: 7.50,
+          over_200k: 7.50
+        },
+        cache: {
+          write: 1.50,
+          read: 0.15
+        }
+      },
+
       # Gemini 3.6 Flash (GA 2026-07-21). Flat pricing, 1M context, 64K max output.
       # Source: https://deepmind.google/models/gemini/flash/
       # Cache write billed at input rate (Vertex doesn't expose a separate
@@ -404,53 +498,80 @@ module Clacky
         }
       },
 
-      # GPT-5.6 flat-rate models (no breakpoint, single rate regardless of
-      # context; *-pro variants are priced identically to the base tier).
-      # Source: OpenAI list price ($/MTok) via OpenRouter model pages, incl.
-      # the OpenAI-direct provider row (verified 2026-08-18). Cache write is
-      # not published separately; it follows the GPT-5.5 convention (= input).
+      # GPT-5.6 via Bedrock's OpenAI-compatible endpoint (Global CRIS).
+      # Tiered at 272K input tokens (OpenAI's breakpoint) — same caveat as
+      # GPT-6 Astra below. USD per 1M tokens, source: llm_proxy bedrock_openai
+      # pricing. *-pro variants are priced identically to the base tier.
       "gpt-5.6-sol" => {
         input: {
-          default: 2.50,
-          over_200k: 2.50
+          default: 4.00,
+          over_200k: 8.00
         },
         output: {
-          default: 15.00,
-          over_200k: 15.00
+          default: 20.00,
+          over_200k: 30.00
         },
         cache: {
-          write: 2.50,
-          read: 0.25
+          write_default: 5.00,
+          write_over_200k: 10.00,
+          read_default: 0.40,
+          read_over_200k: 0.80
         }
       },
 
       "gpt-5.6-terra" => {
         input: {
           default: 2.00,
-          over_200k: 2.00
+          over_200k: 4.00
         },
         output: {
           default: 12.00,
-          over_200k: 12.00
+          over_200k: 18.00
         },
         cache: {
-          write: 2.00,
-          read: 0.20
+          write_default: 2.50,
+          write_over_200k: 5.00,
+          read_default: 0.20,
+          read_over_200k: 0.40
         }
       },
 
       "gpt-5.6-luna" => {
         input: {
           default: 0.20,
-          over_200k: 0.20
+          over_200k: 0.40
         },
         output: {
           default: 1.20,
-          over_200k: 1.20
+          over_200k: 1.80
         },
         cache: {
-          write: 0.20,
-          read: 0.02
+          write_default: 0.25,
+          write_over_200k: 0.50,
+          read_default: 0.02,
+          read_over_200k: 0.04
+        }
+      },
+
+      # GPT-6 Astra via Bedrock's OpenAI-compatible endpoint (Global CRIS).
+      # Tiered at 272K input tokens (OpenAI's breakpoint, not the global 200K)
+      # — the 200K–272K band is slightly over-estimated, same caveat as
+      # GPT-5.5/5.4 below. USD per 1M tokens, source: llm_proxy bedrock_openai
+      # pricing.
+      "gpt-6-astra" => {
+        input: {
+          default: 10.00,
+          over_200k: 20.00
+        },
+        output: {
+          default: 50.00,
+          over_200k: 75.00
+        },
+        cache: {
+          write_default: 12.50,
+          write_over_200k: 25.00,
+          read_default: 1.00,
+          read_over_200k: 2.00
         }
       },
 
@@ -574,6 +695,18 @@ module Clacky
       # GLM-5.3 shares GLM-5.2's base model (all gains are post-training per
       # Z.ai's release notes) and Z.ai's pricing page does not list a separate
       # GLM-5.3 row yet, so it is billed at the GLM-5.2 flat rate.
+      # GLM-5.3-Flash: GLM-5's first natively-multimodal model (image/video/
+      # file input). Listed at the non-promotional Z.ai rates — input $0.15,
+      # output $0.50, cache read $0.03 per 1M tokens; the 50%-off launch promo
+      # ($0.075 / $0.25 / $0.015, ends 2026-09-09) is ignored per the
+      # "displayed ≤ actual" rule. Cache write bills at the input miss rate
+      # (storage is "Limited-time Free").
+      "glm-5.3-flash" => {
+        input:  { default: 0.15, over_200k: 0.15 },
+        output: { default: 0.50, over_200k: 0.50 },
+        cache:  { write: 0.15, read: 0.03 }
+      },
+
       "glm-5.3" => {
         input:  { default: 1.40, over_200k: 1.40 },
         output: { default: 4.40, over_200k: 4.40 },
@@ -681,6 +814,15 @@ module Clacky
       #   - cache.read  = official explicit-cache-hit price.
       #   - When a model has NO published explicit-cache price (e.g. qwen3.6-27b,
       #     qwen-plus-latest), cache.write/read fall back to the input rate.
+      # qwen3.8-max: NOT tiered (single flat tier). Reuses qwen3.7-max's
+      #   international list rates (2.5 / 7.5 / 3.125 / 0.25) — the billing
+      #   page hasn't listed qwen3.8-max yet, so this is a safe upper bound.
+      "qwen3.8-max" => {
+        input:  { default: 2.5, over_200k: 2.5 },
+        output: { default: 7.5, over_200k: 7.5 },
+        cache:  { write: 3.125, read: 0.25 }
+      },
+
       # qwen3.7-max: NOT tiered (single flat tier per Alibaba's definition).
       #   List price: input 2.5, output 7.5, explicit write 3.125, explicit read 0.25.
       "qwen3.7-max" => {
@@ -753,9 +895,9 @@ module Clacky
     # Costs for prompts between 200K–272K will be slightly over-estimated.
     TIERED_PRICING_THRESHOLD = 200_000
 
-    # DeepSeek switched from flat legacy rates to peak/off-peak billing at
-    # 2026-08-17 00:00 Beijing time (= 2026-08-16 16:00 UTC).
-    DEEPSEEK_PEAK_PRICING_START = Time.utc(2026, 8, 16, 16, 0, 0).freeze
+    # v4-pro is routed to V4.1 Flash and billed at the flash rates from
+    # 2026-09-14 12:00 Beijing time (= 04:00 UTC).
+    DEEPSEEK_V4_PRO_FLASH_START = Time.utc(2026, 9, 14, 4, 0, 0)
 
     class << self
       # Calculate cost for the given model and usage
@@ -865,6 +1007,8 @@ module Clacky
         # Support both dot and dash separators (e.g., "4.5", "4-5", "4-6")
         # Also handles Bedrock cross-region prefixes (e.g. "jp.anthropic.claude-sonnet-4-6")
         case model
+        when /claude.*fable.*5[.-]1/i
+          "claude-fable-5-1"
         when /claude.*fable.*5/i
           "claude-fable-5"
         # Claude Sonnet 5 / Opus 5 (2026) — anchored on the literal "sonnet-5"
@@ -890,8 +1034,16 @@ module Clacky
           "claude-3-5-haiku-20241022"
         when /deepseek-v4-pro/i, /deepseek.*v4.*pro/i
           "deepseek-v4-pro"
+        # Vision variant must be matched BEFORE the v4-flash rule below —
+        # "deepseek-v4-flash-vision-exp" would otherwise be substring-matched
+        # to v4-flash and billed at the wrong model's rate.
+        when /deepseek-v4-flash-vision-exp/i, /deepseek.*flash.*vision/i
+          "deepseek-v4-flash-vision-exp"
         when /deepseek-v4-flash/i, /deepseek.*v4.*flash/i
           "deepseek-v4-flash"
+        # V4.1 Flash — new canonical id; native multimodal.
+        when /deepseek-flash/i
+          "deepseek-flash"
         # Legacy aliases: deepseek-chat and deepseek-reasoner are being
         # deprecated on 2026-07-24 and map to deepseek-v4-flash's
         # non-thinking / thinking modes respectively. Bill at flash rates.
@@ -927,6 +1079,8 @@ module Clacky
         # (mainland bigmodel.cn vs intl z.ai) the user configured.
         # Strict anchored match so unrelated strings like "glm-5-x-foo"
         # don't silently borrow a nearby model's rate.
+        when /^glm-5\.3-flash$/i
+          "glm-5.3-flash"
         when /^glm-5\.3$/i
           "glm-5.3"
         when /^glm-5\.2$/i
@@ -950,10 +1104,12 @@ module Clacky
           "minimax-m2.5"
 
         # Qwen (Alibaba DashScope) — strict anchored match per registered
-        # model id in providers.rb. qwen3.7-* is the latest flagship line;
-        # qwen3.6-* are the previous generation; qwen-plus-latest is the
-        # rolling alias for the latest Qwen-Plus release; qwen3-vl-plus is
-        # the multimodal SKU (replaces the retired qwen-vl-plus/max).
+        # model id in providers.rb. qwen3.8-max is the latest flagship;
+        # qwen3.7-* / qwen3.6-* are previous generations; qwen-plus-latest
+        # is the rolling alias for the latest Qwen-Plus release; qwen3-vl-plus
+        # is the multimodal SKU (replaces the retired qwen-vl-plus/max).
+        when /^qwen3\.8-max$/i
+          "qwen3.8-max"
         when /^qwen3\.7-max$/i
           "qwen3.7-max"
         when /^qwen3\.7-plus$/i
@@ -979,6 +1135,10 @@ module Clacky
           "gemini-3-flash"
         when /^or-gemini-3-6-flash$/i, /^gemini-3\.6-flash$/i
           "gemini-3.6-flash"
+        when /^or-gemini-3-7-flash$/i, /^gemini-3\.7-flash$/i
+          "gemini-3.7-flash"
+        when /^or-gemini-3-8-flash$/i, /^gemini-3\.8-flash$/i
+          "gemini-3.8-flash"
 
         # OpenAI GPT-5.x models - match various dashed/dotted/compact forms
         # (e.g. "gpt-5.5", "gpt-5-5", "gpt5.5", "gpt55")
@@ -986,11 +1146,13 @@ module Clacky
         # anchored rules above would otherwise miss it) and the "-pro"
         # suffix (pro is priced identically to the base tier). Batch ids
         # (":batch") stay unmatched - they bill at half price.
-        when %r{^(openai/)?gpt-?5[\.-]?6[\.-]?sol(-pro)?$}i
+        when /^(?:abs-|us\.openai\.|global\.openai\.|openai\/)?gpt-?6[.-]?astra$/i
+          "gpt-6-astra"
+        when %r{^(?:abs-|global\.openai\.|openai/)?gpt-?5[\.-]?6[\.-]?sol(-pro)?$}i
           "gpt-5.6-sol"
-        when %r{^(openai/)?gpt-?5[\.-]?6[\.-]?terra(-pro)?$}i
+        when %r{^(?:abs-|global\.openai\.|openai/)?gpt-?5[\.-]?6[\.-]?terra(-pro)?$}i
           "gpt-5.6-terra"
-        when %r{^(openai/)?gpt-?5[\.-]?6[\.-]?luna(-pro)?$}i
+        when %r{^(?:abs-|global\.openai\.|openai/)?gpt-?5[\.-]?6[\.-]?luna(-pro)?$}i
           "gpt-5.6-luna"
         when /^gpt-?5\.?5$/i, /^gpt-?5[\.-]?5$/i
           "gpt-5.5"        
@@ -1047,15 +1209,19 @@ module Clacky
         cache_cost
       end
 
-      # Resolve a DeepSeek pricing entry (which holds legacy/peak/off_peak
-      # tiers) to the single tier that applies at the given time.
+      # Resolve a DeepSeek pricing entry (which holds peak/off_peak tiers) to
+      # the single tier that applies at the given time.
       def resolve_deepseek_tier(pricing, now)
-        if now < DEEPSEEK_PEAK_PRICING_START
-          pricing[:legacy]
-        elsif deepseek_peak_hour?(now)
-          pricing[:peak]
-        else
+        # v4-pro migrates to V4.1 Flash on 2026-09-14; its entry carries
+        # flash_peak/flash_off_peak.
+        if pricing.key?(:flash_peak) && now >= DEEPSEEK_V4_PRO_FLASH_START
+          return deepseek_weekend?(now) || !deepseek_peak_hour?(now) ? pricing[:flash_off_peak] : pricing[:flash_peak]
+        end
+
+        if deepseek_weekend?(now) || !deepseek_peak_hour?(now)
           pricing[:off_peak]
+        else
+          pricing[:peak]
         end
       end
 
@@ -1063,6 +1229,13 @@ module Clacky
       def deepseek_peak_hour?(time)
         hour = time.utc.hour
         (hour >= 1 && hour < 4) || (hour >= 6 && hour < 10)
+      end
+
+      # Weekends (Sat/Sun, Beijing time) are billed entirely at off-peak
+      # rates regardless of hour.
+      def deepseek_weekend?(time)
+        weekday = (time.utc + (8 * 3600)).wday
+        weekday == 0 || weekday == 6
       end
     end
   end

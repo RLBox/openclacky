@@ -31,12 +31,12 @@ RSpec.describe Clacky::Media::OpenAICompat do
       let(:b64) { Base64.strict_encode64("PNG_BYTES") }
       let(:response_body) { JSON.generate({ "data" => [{ "b64_json" => b64 }] }) }
 
-      it "saves the image to <output_dir>/assets/generated/ and returns success" do
+      it "saves the image directly under output_dir and returns success" do
         Dir.mktmpdir do |tmp|
           result = provider.generate_image(prompt: "a cute cat", aspect_ratio: "square", output_dir: tmp)
 
           expect(result["success"]).to be true
-          expect(result["image"]).to start_with(File.join(tmp, "assets", "generated"))
+          expect(result["image"]).to start_with(tmp)
           expect(File.exist?(result["image"])).to be true
           expect(File.binread(result["image"])).to eq("PNG_BYTES")
           expect(result["size"]).to eq("1024x1024")
@@ -70,7 +70,7 @@ RSpec.describe Clacky::Media::OpenAICompat do
           result = provider.generate_image(prompt: "x", output_dir: tmp)
           expect(result["success"]).to be true
           expect(result["image"]).to eq("https://cdn.example.com/img.png")
-          expect(Dir.glob(File.join(tmp, "assets", "generated", "*"))).to be_empty
+          expect(Dir.glob(File.join(tmp, "*"))).to be_empty
         end
       end
     end
@@ -234,6 +234,112 @@ RSpec.describe Clacky::Media::OpenAICompat do
         result = editor.generate_image(prompt: "x", image: "@@@not-base64@@@", output_dir: Dir.pwd)
         expect(result["success"]).to be false
         expect(result["error_type"]).to eq("invalid_argument")
+      end
+    end
+  end
+
+  describe "#generate_transcription" do
+    let(:response_body) { JSON.generate({ "text" => "hello world", "usage" => { "cost" => 0.0001 } }) }
+    let(:fake_conn) { instance_double(Faraday::Connection) }
+    let(:fake_response) { instance_double(Faraday::Response, success?: true, status: 200, body: response_body) }
+
+    def stub_transcription(captured_holder, conn = fake_conn)
+      req_double = double("req")
+      allow(req_double).to receive(:headers).and_return({})
+      allow(req_double).to receive(:body=) { |b| captured_holder[:body] = b }
+      allow(conn).to receive(:post).with("audio/transcriptions").and_yield(req_double).and_return(fake_response)
+      req_double
+    end
+
+    context "on the openclacky gateway (multipart only — JSON unsupported upstream)" do
+      let(:entry) do
+        { "model" => "or-stt-whisper", "base_url" => "https://api.openclacky.com", "api_key" => "clacky-k" }
+      end
+
+      it "falls back to multipart form-data until the gateway supports input_audio" do
+        captured = {}
+        req_double = stub_transcription(captured)
+        allow(provider).to receive(:stt_connection).and_return(fake_conn)
+
+        result = provider.generate_transcription(
+          audio_base64: Base64.strict_encode64("RIFF....WAVE"),
+          mime_type: "audio/wav"
+        )
+
+        expect(result["success"]).to be true
+        expect(result["provider"]).to eq("openclacky")
+        expect(req_double.headers["Content-Type"]).to start_with("multipart/form-data; boundary=")
+        expect(captured[:body]).to include('name="file"; filename="chunk.wav"')
+        expect(captured[:body]).to include("RIFF....WAVE")
+      end
+
+      it "passes through prompt in multipart form" do
+        allow(provider).to receive(:stt_connection).and_return(fake_conn)
+        captured = {}
+        stub_transcription(captured)
+
+        provider.generate_transcription(
+          audio_base64: Base64.strict_encode64("RIFF"),
+          mime_type: "audio/wav",
+          prompt: "punctuation please"
+        )
+        expect(captured[:body]).to include('name="prompt"')
+        expect(captured[:body]).to include("punctuation please")
+      end
+    end
+
+    context "on OpenRouter" do
+      let(:entry) do
+        { "model" => "openai/whisper-large-v3-turbo", "base_url" => "https://openrouter.ai/api/v1", "api_key" => "or-k" }
+      end
+
+      it "uses base64 JSON so large files bypass the 25 MB multipart cap" do
+        captured = {}
+        allow(provider).to receive(:stt_json_connection).and_return(fake_conn)
+        stub_transcription(captured)
+
+        result = provider.generate_transcription(
+          audio_base64: Base64.strict_encode64("RIFF....WAVE"),
+          mime_type: "audio/wav"
+        )
+
+        expect(result["success"]).to be true
+        body = JSON.parse(captured[:body])
+        expect(body["model"]).to eq("openai/whisper-large-v3-turbo")
+        expect(body.dig("input_audio", "data")).to eq(Base64.strict_encode64("RIFF....WAVE"))
+        expect(body.dig("input_audio", "format")).to eq("wav")
+      end
+
+      it "maps audio/mp4 container to the m4a audio format" do
+        captured = {}
+        allow(provider).to receive(:stt_json_connection).and_return(fake_conn)
+        stub_transcription(captured)
+
+        provider.generate_transcription(audio_base64: Base64.strict_encode64("M4A"), mime_type: "audio/mp4")
+        expect(JSON.parse(captured[:body]).dig("input_audio", "format")).to eq("m4a")
+      end
+    end
+
+    context "on a generic OpenAI-style provider" do
+      let(:entry) do
+        { "model" => "whisper-1", "base_url" => "https://api.openai.com/v1", "api_key" => "sk-oai" }
+      end
+
+      it "falls back to multipart form-data" do
+        allow(provider).to receive(:stt_connection).and_return(fake_conn)
+        captured = {}
+        req_double = stub_transcription(captured)
+
+        result = provider.generate_transcription(
+          audio_base64: Base64.strict_encode64("RIFF....WAVE"),
+          mime_type: "audio/wav"
+        )
+
+        expect(result["success"]).to be true
+        expect(req_double.headers["Content-Type"]).to start_with("multipart/form-data; boundary=")
+        expect(captured[:body]).to include('name="file"; filename="chunk.wav"')
+        expect(captured[:body]).to include("RIFF....WAVE")
+        expect(captured[:body]).to include('name="model"')
       end
     end
   end

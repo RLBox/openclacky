@@ -16,7 +16,7 @@ module Clacky
 
     # === Output display ===
 
-    def show_assistant_message(content, files:)
+    def show_assistant_message(content, files:, interim: false, created_at: nil)
       puts_line(content) unless content.nil? || content.strip.empty?
       files.each { |f| puts_line("📄 File: #{f[:path]}") }
     end
@@ -24,21 +24,11 @@ module Clacky
     def show_tool_call(name, args)
       args_data = args.is_a?(String) ? (JSON.parse(args) rescue args) : args
 
-      # Special handling for request_user_feedback — display as a readable prompt
-      if name.to_s == "request_user_feedback"
-        question = args_data.is_a?(Hash) ? (args_data[:question] || args_data["question"]).to_s : ""
-        context  = args_data.is_a?(Hash) ? (args_data[:context]  || args_data["context"]).to_s  : ""
-        options  = args_data.is_a?(Hash) ? (args_data[:options]  || args_data["options"])        : nil
-        options  = Array(options) if options && !options.is_a?(Array)
-
-        parts = []
-        parts << "**Context:** #{context.strip}" if context && !context.strip.empty?
-        parts << "**Question:** #{question.strip}"
-        if options && !options.empty?
-          parts << "**Options:**"
-          options.each_with_index { |opt, i| parts << "  #{i + 1}. #{opt}" }
-        end
-        puts_line(parts.join("\n"))
+      # Special handling for ask_user — display as a readable prompt
+      if Clacky::Tools::AskUser.feedback_tool?(name)
+        questions = Clacky::Tools::AskUser.normalize_questions(args_data)
+        context   = args_data.is_a?(Hash) ? (args_data[:context] || args_data["context"]).to_s : ""
+        puts_line(Clacky::Tools::AskUser.render_text(questions, context)) unless questions.empty?
         return
       end
 
@@ -97,7 +87,7 @@ module Clacky
       puts_line("[shell] #{command}")
     end
 
-    def show_complete(iterations:, cost:, duration: nil, cache_stats: nil, awaiting_user_feedback: false, cost_source: nil)
+    def show_complete(iterations:, cost:, duration: nil, cache_stats: nil, awaiting_user_feedback: false, cost_source: nil, task_id: nil)
       parts = ["[done] iterations=#{iterations}", "cost=$#{cost.round(4)}"]
       parts << "duration=#{duration.round(1)}s" if duration
       puts_line(parts.join(" "))
@@ -123,6 +113,29 @@ module Clacky
 
     def show_success(message)
       puts_line("[ok] #{message}")
+    end
+
+    # Surface extension events the plain CLI cares about (e.g. advisor
+    # recommendations). Everything else is dropped, matching UIInterface's
+    # no-op default.
+    def emit(type, **data)
+      return unless type == "ext.advisor.recommendations"
+
+      options = data[:options] || data["options"]
+      return unless options.is_a?(Array)
+
+      lines = options.map do |opt|
+        action = (opt[:action] || opt["action"]).to_s.strip
+        next if action.empty?
+
+        reason = (opt[:reason] || opt["reason"]).to_s.strip
+        reason.empty? ? "- #{action}" : "- #{action} (#{reason})"
+      end.compact
+      return if lines.empty?
+
+      puts_line("")
+      puts_line("💡")
+      lines.each { |line| puts_line(line) }
     end
 
     def log(message, level: :info)

@@ -4,6 +4,199 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
+## [1.5.14] - 2026-09-10
+
+### Added
+- Add a click-driven live preview panel for workspace files and localhost dev servers
+- Open local files in the preview panel via file:// URLs and bare absolute paths
+- Add GPT-5.6 Sol/Terra/Luna and GPT-6 Astra models with Global CRIS pricing
+- Add the deepseek-flash model
+- Add an editable Chinese metadata form and field-level frontmatter update API for skills
+- Add a /think reasoning-effort switcher to the TUI
+- Render CSV/TSV files as read-only tables in the workspace
+- Add Parallel Free as the primary built-in web-search provider
+- Select text in a message and quote it into the composer (#526 - @kylezhang)
+- Syntax-highlight code in the file viewer
+- Send large STT audio as base64 JSON (#525 - @tomash)
+- Add a Files panel open-with menu, tree toggle, split preview, and in-menu download
+- Detect Windows apps for open-with in WSL
+- Skip registering the browser tool when it is disabled
+- Auto-snapshot the page after browser actions
+- Truncate long working directories in the session info bar
+- Highlight width-drag handles on hover
+
+### Improved
+- Switch the default model to Gemini 3.8 Flash
+- Use single-pane navigation on mobile (C-5779) (#539)
+- Polish the chat navigator layout and hover interactions (#527)
+- Improve message navigation in long conversations (#523)
+- Refine the billing tooltip UX (C-5778) (#537)
+- Let the git panel fill the aside height and free up diff width (#531)
+
+### Fixed
+- Restore the aside width after closing file previews (#545)
+- Replace undefined danger tokens with the error color variable (#542 - @sundevilyang)
+- Add hover and disabled feedback to danger and secondary buttons (#541, #540 - @sundevilyang)
+- Correct DeepSeek v4-pro and flash pricing
+- Collapse extension actions into a menu on narrow screens (C-5781) (#538)
+- Don't submit argumented commands on Enter
+- Scroll overflow menus and pin config action buttons
+- Sniff binary content before text preview (C-5690) (#535)
+- Require a slash prefix for channel help commands (C-5641) (#533)
+- Normalize the homepage URL scheme on read (C-5666) (#534)
+- Decode non-ASCII paths in git panel output (C-5777) (#530)
+- Refresh the file tree on working-dir switch and task completion
+- Harden extension developer guidance and manifest validation (#524)
+- Fix zip file encoding errors
+- Resolve file://~/ tilde paths from chat links
+- Align the open-button icon
+
+### More
+- Move the preview tab to the end of the left-nav order
+- Extract provider id constants to replace magic strings
+
+## [1.5.13] - 2026-09-03
+
+### Added
+- Add Gemini 3.8 Flash model and set it as the trial default
+- Add or-stt-gemini-3-8-flash speech-to-text model; default STT and video understanding to 3.8
+- Add OpenAI Responses API as a fourth API format (#490 - @kylezhang)
+- Add access-key API and config-reload API
+- Add Claude Fable 5.1, GLM-5.3-Flash and qwen3.8-max models with pricing
+- Default the Web UI to the OS/browser language on first visit
+- Make the workspace file tree resizable
+- Expose mounted drives in the directory picker
+- Personalize the new-session page title and empty-chat greeting with the AI's name
+- Localise built-in setup session titles
+
+### Improved
+- Replace native selects with shared CustomSelect dropdowns across settings
+- Overhaul the git & time-machine panel
+- Improve the directory picker (#521)
+
+### Fixed
+- Merge OpenClacky billing across all configured API keys
+- Preserve custom provider and API format when editing a model
+- Reclaim PTY file descriptors when a session shell dies
+- Wrap ANSI-coloured CJK text without IndexError
+- Prevent history edits while a session is running (#520)
+- Preserve attachment badges after compression (#516)
+- Flag hidden agents instead of dropping them
+- Install upgrades next to the running gem's base directory
+- Skip extension auto-sync for administrators (#515)
+- Support the mention menu with Windows IME (#513)
+- Validate extension version input (#514)
+- Keep mention chips anchored and on one line while typing
+- Fall back to uncolored markdown for CJK tables
+- Stabilise billing toolbar layout (#517)
+- Light the group unread dot for backend-created sessions (#518)
+- Translate maximum reasoning effort (#522)
+- Harden WSL Windows profile detection in the directory picker
+- Wrap download errors so the CDN fallback fires
+- Surface the git tab badge eagerly
+- Show the meeting panel only in general sessions
+- Whitelist the config top-level key in the extension verifier
+
+### More
+- Extract shared ModelPicker model dropdown component
+- Refine dropdown chevrons and submenu selection
+- Adjust sidebar panel order and labels
+- Update trial model copy to Gemini 3.7 Flash
+
+## [1.5.12] - 2026-08-27
+
+### Added
+- Add VS Code-style file tree with inline file viewer
+- Add quick-access sidebar for directory picker with WSL support
+- Add Web UI @mention references for files, directories and sessions
+- Add Gemini 3.7 Flash model with STT/video support; switch OCR default to DeepSeek vision
+- Add timestamps to assistant messages
+- Merge platform usage API data with local billing records
+- Refresh git panel on session completion
+- Allow disabling local extensions
+- Expose task mappings in core events (#496 - @YeEmrick)
+
+### Improved
+- Move file-trash sweep off the session save path and speed up session creation
+- Make recharge link a visible button on model cards
+
+### Fixed
+- Fix ask_user free-text input: render without options, guard IME composition, route Enter, render as text in IM channels, keep questions concise (#497 - @afumu)
+- Fix advisor recommendations: send structured options, keep card state per session, dismiss button no longer permanently suppresses
+- Fix home favorite pointing at the Windows profile under WSL
+- Fix session list pagination and pin truncation
+- Preserve task ids in compressed history (#500 - @YeEmrick)
+- Clear stale media model override when reverting to auto
+- Normalize gemini-3.7-flash name for pricing
+- Fix sidebar scrollbar visibility and session list styling
+- Fix messages loading created_at
+- Render parallel fan-out subagent phases as flat, isolated cards
+- Preserve subagent transcripts when an interrupted fan-out is resumed
+- Fix spinner in subagent raise process
+- Truncate messages carrying the system_injected flag
+- Stop reporting awaiting_feedback for question-mark endings
+- Detach channel_ui and keep channel_info unique on /bind and /unbind
+
+## [1.5.11] - 2026-08-23
+
+### Added
+- Creator Studio: separate Marketplace and Brand sections for published extensions
+- Advisor extension for next-job suggestions
+- ask_user tool with multi-question support (replaces feedback_user)
+- Sidebar states for awaiting-feedback and just-finished sessions
+- Auto-purge file-trash entries older than 8 days
+- DeepSeek V4 flash vision exp model preset
+- IM channel toggle to mute tool-call narration and previews
+
+### Improved
+- Unified internal thread management with graceful shutdown
+
+### Fixed
+- Skill decrypt retry now picks up a renewed license key
+- DeepSeek weekends billed entirely at off-peak rates
+- Skill and extension zip downloads fall back to a secondary CDN host
+- Session status dot aligned with name and channel badge
+- Project session tag top margin
+- Unified modal close button and ext-studio modal semantics
+- Unified checkbox accent and distinct verified badge
+- Edit-model modal overflow on small screens
+- Subagent UI fixes
+- Star History charts migrated to star-history.dera.page (#491 - @CrustyMozarella)
+
+## [1.5.10] - 2026-08-19
+
+### Added
+- Import extensions from a local zip file
+- Per-model API format override (#484 - @kylezhang)
+- Project pinning (pin to top)
+- Copy Session ID action in session menu
+- Price ratio on model switcher panel
+- Model search filter and provider filter dropdown in settings
+- Remark field for model configs
+- Custom vision model config
+- GPT-5.6 Sol/Terra/Luna presets and pricing
+- GLM-5.3 model support
+- Global IM status-messages toggle (default off)
+- Extension-defined tools support; extensions can disable skills
+- Server restart state and HTTP restart flag
+- Actionable web search provider errors
+- Localized display names for broadcast skill commands
+
+### Improved
+- Skill autocomplete dropdown UI with localized source labels
+- Skill auto-creation and evolution reporting refinements
+
+### Fixed
+- MCP: preserve CRLF pairs split across SSE chunk boundaries (#489 - @MohammedAlkindi)
+- Feishu: auto-refresh token and retry when revoked (99991663) (#483 - @chengoak)
+- Preserve head+tail for oversized terminal output (#455 - @shipinliang)
+- openclacky start failed when no TTY
+- Capture master/worker crash logs under LaunchAgent
+- ReferenceError in model modal _syncRemarkField
+- Remark field always visible in model modal
+- api_format field only shown for custom providers and validated before mutating model config
+- Media gen output dir handling
+
 ## [1.5.9] - 2026-08-14
 
 ### Added

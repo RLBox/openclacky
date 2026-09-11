@@ -59,8 +59,18 @@ module Clacky
 
           # Adjust height based on mode
           if @mode == :menu
-            visible_items = [@choices.length, 15].min
-            @height = visible_items + 4  # +4 for title, borders, and instructions
+            # Choices marked sticky: true (e.g. /config action buttons) are
+            # always rendered below the scrollable area, so they never scroll
+            # out of view no matter how many models precede them.
+            @scroll_count = @choices.count { |c| !c[:sticky] }
+            @sticky_count = @choices.length - @scroll_count
+            @visible_items = [@scroll_count, 15].min
+            @height = @visible_items + @sticky_count + 4  # +4 for title, borders, and instructions
+            # Scroll window: draw_menu_choices only renders this slice, so a
+            # menu with more choices than fit (e.g. /config with many models)
+            # scrolls instead of painting over the bottom border.
+            @window_start = 0
+            clamp_scroll_window
           else
             # Form mode - adjust height based on number of fields
             # Each field takes 2 rows (label + input)
@@ -369,11 +379,17 @@ module Clacky
           end
         end
 
-        # Draw menu choices
+        # Draw menu choices (only the visible scroll window, then sticky tail)
         private def draw_menu_choices(start_row, start_col)
-          @choices.each_with_index do |choice, index|
-            row = start_row + index
-            draw_menu_choice(choice, index, row, start_col)
+          window_end = [@window_start + @visible_items, @scroll_count].min
+          (@window_start...window_end).each do |index|
+            draw_menu_choice(@choices[index], index, start_row + index - @window_start, start_col)
+          end
+
+          sticky_row = start_row + (window_end - @window_start)
+          (@scroll_count...@choices.length).each do |index|
+            draw_menu_choice(@choices[index], index, sticky_row, start_col)
+            sticky_row += 1
           end
         end
 
@@ -437,6 +453,19 @@ module Clacky
             @selected_index = (@selected_index + direction) % @choices.length
             # Skip disabled choices
             break unless @choices[@selected_index][:disabled]
+          end
+          clamp_scroll_window
+        end
+
+        # Keep the cursor inside the visible window, scrolling when needed.
+        # Sticky choices are always on screen, so they never move the window.
+        private def clamp_scroll_window
+          return if @selected_index >= @scroll_count
+
+          if @selected_index < @window_start
+            @window_start = @selected_index
+          elsif @selected_index >= @window_start + @visible_items
+            @window_start = @selected_index - @visible_items + 1
           end
         end
       end

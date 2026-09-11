@@ -120,12 +120,15 @@ module Clacky
       # field (easy to miss @model / @use_bedrock) and then reused for a
       # later Agent.new, serving stale credentials.
       client_factory = lambda do
+        entry = agent_config.current_model
         Clacky::Client.new(
           agent_config.api_key,
           base_url: agent_config.base_url,
           model: agent_config.model_name,
           anthropic_format: agent_config.anthropic_format?,
-          api_format: agent_config.api_format
+          api_format: agent_config.api_format,
+          provider_id: agent_config.provider_id_for(entry),
+          capabilities: entry && entry["capabilities"]
         )
       end
 
@@ -342,6 +345,29 @@ module Clacky
         ui_controller.show_success("Switched to model: #{config.model_name}")
       end
 
+      # Handle the `/think` slash command — pick the reasoning effort level
+      # for the current session. "off" normalizes to nil (provider default),
+      # matching the Web UI's reasoning_effort switcher semantics.
+      private def handle_think_command(ui_controller, agent, session_manager = nil)
+        choice = ui_controller.show_reasoning_effort_menu(agent.reasoning_effort)
+        return if choice.nil?
+
+        agent.reasoning_effort = choice
+
+        # The override lives in the session file (not config.yml), so persist
+        # it now — otherwise it would be lost if the user quits before the
+        # next task.
+        session_manager&.save(agent.to_session_data(updated_at: Time.now))
+
+        # Reflect the change in the session bar (appended after the model name)
+        ui_controller.config[:reasoning_effort] = agent.reasoning_effort
+        ui_controller.update_sessionbar
+
+        current = agent.reasoning_effort
+        message = current ? "Thinking level set to #{current}" : "Thinking level: off (provider default)"
+        ui_controller.show_success(message)
+      end
+
       private def handle_time_machine_command(ui_controller, agent, session_manager)
         # Get task history from agent
         history = agent.get_task_history(limit: 10)
@@ -416,7 +442,7 @@ module Clacky
 
         if brand.heartbeat_due?
           Clacky::Logger.info("[Brand] check_brand_license_cli: heartbeat due, dispatching async...")
-          Thread.new do
+          Clacky::ThreadRegistry.spawn(name: "cli-brand-heartbeat") do
             begin
               result = brand.heartbeat!
               if result[:success]
@@ -871,6 +897,7 @@ module Clacky
             working_dir: working_dir,
             mode: agent_config.permission_mode.to_s,
             model: agent_config.model_name,
+            reasoning_effort: agent.reasoning_effort,
             theme: theme_name
           )
         end
@@ -994,6 +1021,9 @@ module Clacky
           when "/model"
             handle_model_command(ui_controller, agent_config, agent, session_manager)
             next
+          when "/think"
+            handle_think_command(ui_controller, agent, session_manager)
+            next
           when "/undo"
             handle_time_machine_command(ui_controller, agent, session_manager)
             next
@@ -1050,7 +1080,7 @@ module Clacky
           auto_name_session(agent, input)
 
           # Run agent in background thread
-          current_task_thread = Thread.new do
+          current_task_thread = Clacky::ThreadRegistry.spawn(name: "cli-agent-task") do
             begin
               # Set status to working when agent starts
               ui_controller.set_working_status
@@ -1346,8 +1376,8 @@ module Clacky
 
       # ── Security gate ──────────────────────────────────────────────────────
       # Binding to 0.0.0.0 exposes the server to the public network.
-      # Refuse to start unless CLACKY_ACCESS_KEY env var is set.
-      if options[:host] == "0.0.0.0" && !ENV.key?("CLACKY_ACCESS_KEY")
+      # Refuse to start unless an access key is available.
+      if options[:host] == "0.0.0.0" && !ENV.key?("CLACKY_ACCESS_KEY") && Clacky::AccessKey.from_file.nil?
         puts <<~MSG
           ╔══════════════════════════════════════════════════════════════╗
           ║  ⚠️  Security Warning: Refusing to start                      ║
@@ -1361,6 +1391,8 @@ module Clacky
           ║                                                              ║
           ║  Then export it:                                             ║
           ║    export CLACKY_ACCESS_KEY=<your-generated-key>             ║
+          ║                                                              ║
+          ║  Or write it to ~/.clacky/access_key                         ║
           ║                                                              ║
           ╚══════════════════════════════════════════════════════════════╝
         MSG
@@ -1415,12 +1447,12 @@ module Clacky
         end
 
         client_factory = lambda do
+          entry = agent_config.current_model
           Clacky::Client.new(
             agent_config.api_key,
             base_url: agent_config.base_url,
             model: agent_config.model_name,
             anthropic_format: agent_config.anthropic_format?,
-            api_format: agent_config.api_format
           )
         end
 
@@ -1465,6 +1497,7 @@ module Clacky
         # crash output (e.g. config/brand load failures) instead of losing it.
         Clacky::Logger.console = $stderr.isatty
         unless $stderr.isatty
+          Clacky::Logger.ensure_log_dir
           log_io = File.open(Clacky::Logger.current_log_file, "a")
           $stderr.reopen(log_io)
           log_io.close

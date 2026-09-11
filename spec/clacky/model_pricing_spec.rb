@@ -246,24 +246,11 @@ RSpec.describe Clacky::ModelPricing do
     end
     
     context "with DeepSeek V4 models" do
-      let(:legacy_time)   { Time.utc(2026, 8, 16, 2, 0, 0) }  # before cutover -> legacy flat
       let(:peak_time)     { Time.utc(2026, 8, 17, 2, 0, 0) }  # 02:00 UTC -> peak
       let(:off_peak_time) { Time.utc(2026, 8, 17, 5, 0, 0) }  # 05:00 UTC -> off-peak
-      let(:cutover_time)  { Time.utc(2026, 8, 16, 16, 0, 0) } # exact cutover -> off-peak (hour 16)
-
-      it "bills deepseek-v4-flash at legacy flat rate before cutover" do
-        usage = {
-          prompt_tokens: 100_000,         # 100K tokens
-          completion_tokens: 50_000        # 50K tokens
-        }
-
-        # Input: (100,000 / 1,000,000) * $0.14 = $0.014
-        # Output: (50,000 / 1,000,000) * $0.28 = $0.014
-        # Total: $0.028
-        result = described_class.calculate_cost(model: "deepseek-v4-flash", usage: usage, now: legacy_time)
-        expect(result[:cost]).to be_within(0.0001).of(0.028)
-        expect(result[:source]).to eq(:price)
-      end
+      let(:weekend_peak_time) { Time.utc(2026, 8, 29, 2, 0, 0) } # Beijing Sat 10:00 (UTC peak window) -> off-peak
+      let(:v4pro_flash_time) { Time.utc(2026, 9, 14, 6, 0, 0) } # 06:00 UTC -> after 9/14 cutover, peak
+      let(:v4pro_flash_off_peak_time) { Time.utc(2026, 9, 14, 5, 0, 0) } # 05:00 UTC -> after 9/14 cutover, off-peak
 
       it "bills deepseek-v4-flash at peak rate" do
         usage = {
@@ -271,11 +258,26 @@ RSpec.describe Clacky::ModelPricing do
           completion_tokens: 50_000        # 50K tokens
         }
 
-        # Input: (100,000 / 1,000,000) * $0.44 = $0.044
-        # Output: (50,000 / 1,000,000) * $1.32 = $0.066
-        # Total: $0.110
+        # Input: (100,000 / 1,000,000) * $0.30 = $0.03
+        # Output: (50,000 / 1,000,000) * $1.20 = $0.06
+        # Total: $0.09
         result = described_class.calculate_cost(model: "deepseek-v4-flash", usage: usage, now: peak_time)
-        expect(result[:cost]).to be_within(0.0001).of(0.110)
+        expect(result[:cost]).to be_within(0.0001).of(0.09)
+        expect(result[:source]).to eq(:price)
+      end
+
+      it "bills deepseek-flash (V4.1 Flash) at peak rate" do
+        usage = {
+          prompt_tokens: 100_000,
+          completion_tokens: 50_000
+        }
+
+        # Same rates as v4-flash:
+        # Input: (100,000 / 1,000,000) * $0.30 = $0.03
+        # Output: (50,000 / 1,000,000) * $1.20 = $0.06
+        # Total: $0.09
+        result = described_class.calculate_cost(model: "deepseek-flash", usage: usage, now: peak_time)
+        expect(result[:cost]).to be_within(0.0001).of(0.09)
         expect(result[:source]).to eq(:price)
       end
 
@@ -285,11 +287,44 @@ RSpec.describe Clacky::ModelPricing do
           completion_tokens: 50_000        # 50K tokens
         }
 
-        # Input: (100,000 / 1,000,000) * $0.22 = $0.022
-        # Output: (50,000 / 1,000,000) * $0.66 = $0.033
-        # Total: $0.055
+        # Input: (100,000 / 1,000,000) * $0.15 = $0.015
+        # Output: (50,000 / 1,000,000) * $0.60 = $0.03
+        # Total: $0.045
         result = described_class.calculate_cost(model: "deepseek-v4-flash", usage: usage, now: off_peak_time)
-        expect(result[:cost]).to be_within(0.0001).of(0.055)
+        expect(result[:cost]).to be_within(0.0001).of(0.045)
+        expect(result[:source]).to eq(:price)
+      end
+
+      it "bills deepseek-v4-flash at off-peak rate on a weekend during peak hours" do
+        usage = {
+          prompt_tokens: 100_000,         # 100K tokens
+          completion_tokens: 50_000        # 50K tokens
+        }
+
+        # Beijing Sat 10:00 (02:00 UTC) falls inside the peak window, but
+        # weekends are billed entirely at off-peak rates.
+        # Input: (100,000 / 1,000,000) * $0.15 = $0.015
+        # Output: (50,000 / 1,000,000) * $0.60 = $0.03
+        # Total: $0.045
+        result = described_class.calculate_cost(model: "deepseek-v4-flash", usage: usage, now: weekend_peak_time)
+        expect(result[:cost]).to be_within(0.0001).of(0.045)
+        expect(result[:source]).to eq(:price)
+      end
+
+      it "bills deepseek-v4-pro with cache at off-peak rate on a weekend" do
+        usage = {
+          prompt_tokens: 100_000,
+          completion_tokens: 50_000,
+          cache_read_input_tokens: 30_000
+        }
+
+        # Beijing Sat 10:00 (UTC peak window) -> off-peak rates (pre-9/14 old rate).
+        # Regular input: ((100_000 - 30_000) / 1_000_000) * $0.66   = $0.0462
+        # Output:        (50_000 / 1_000_000)             * $1.98   = $0.099
+        # Cache read:    (30_000 / 1_000_000)             * $0.022  = $0.00066
+        # Total: $0.14586
+        result = described_class.calculate_cost(model: "deepseek-v4-pro", usage: usage, now: weekend_peak_time)
+        expect(result[:cost]).to be_within(0.0001).of(0.14586)
         expect(result[:source]).to eq(:price)
       end
 
@@ -300,55 +335,81 @@ RSpec.describe Clacky::ModelPricing do
           cache_read_input_tokens: 30_000  # cache hit portion
         }
 
-        # Regular input (non-cached): ((100_000 - 30_000) / 1_000_000) * $1.32  = $0.0924
-        # Output:                     (50_000 / 1_000_000)             * $3.96  = $0.198
-        # Cache read:                 (30_000 / 1_000_000)             * $0.044 = $0.00132
+        # Regular input (non-cached): ((100_000 - 30_000) / 1_000_000) * $1.32   = $0.0924
+        # Output:                     (50_000 / 1_000_000)             * $3.96   = $0.198
+        # Cache read:                 (30_000 / 1_000_000)             * $0.044  = $0.00132
         # Total: $0.29172
         result = described_class.calculate_cost(model: "deepseek-v4-pro", usage: usage, now: peak_time)
         expect(result[:cost]).to be_within(0.0001).of(0.29172)
         expect(result[:source]).to eq(:price)
       end
 
-      it "bills deepseek-v4-pro with cache at legacy flat rate" do
+      it "bills deepseek-v4-pro at flash rates after the 9/14 cutover (peak)" do
         usage = {
-          prompt_tokens: 100_000,          # includes cache reads per OpenAI-style counting
+          prompt_tokens: 100_000,
           completion_tokens: 50_000,
-          cache_read_input_tokens: 30_000  # cache hit portion
+          cache_read_input_tokens: 30_000
         }
 
-        # Regular input (non-cached): ((100_000 - 30_000) / 1_000_000) * $0.435   = $0.03045
-        # Output:                     (50_000 / 1_000_000)             * $0.87    = $0.0435
-        # Cache read:                 (30_000 / 1_000_000)             * $0.003625 = $0.00010875
-        # Total: $0.07405875
-        result = described_class.calculate_cost(model: "deepseek-v4-pro", usage: usage, now: legacy_time)
-        expect(result[:cost]).to be_within(0.0001).of(0.07405875)
+        # After 2026-09-14 v4-pro is routed to V4.1 Flash and billed at flash rates.
+        # Regular input: ((100_000 - 30_000) / 1_000_000) * $0.30  = $0.021
+        # Output:        (50_000 / 1_000_000)             * $1.20  = $0.06
+        # Cache read:    (30_000 / 1_000_000)             * $0.006 = $0.00018
+        # Total: $0.08118
+        result = described_class.calculate_cost(model: "deepseek-v4-pro", usage: usage, now: v4pro_flash_time)
+        expect(result[:cost]).to be_within(0.0001).of(0.08118)
         expect(result[:source]).to eq(:price)
       end
 
-      it "uses peak/off-peak at the exact cutover instant" do
+      it "bills deepseek-v4-pro at flash rates after the 9/14 cutover (off-peak)" do
         usage = {
           prompt_tokens: 100_000,
-          completion_tokens: 50_000
+          completion_tokens: 50_000,
+          cache_read_input_tokens: 30_000
         }
 
-        # 16:00 UTC on 2026-08-16 is the cutover instant (hour 16 = off-peak).
-        result = described_class.calculate_cost(model: "deepseek-v4-flash", usage: usage, now: cutover_time)
-        expect(result[:cost]).to be_within(0.0001).of(0.055)
+        # Regular input: ((100_000 - 30_000) / 1_000_000) * $0.15  = $0.0105
+        # Output:        (50_000 / 1_000_000)             * $0.60  = $0.03
+        # Cache read:    (30_000 / 1_000_000)             * $0.003 = $0.00009
+        # Total: $0.04059
+        result = described_class.calculate_cost(model: "deepseek-v4-pro", usage: usage, now: v4pro_flash_off_peak_time)
+        expect(result[:cost]).to be_within(0.0001).of(0.04059)
         expect(result[:source]).to eq(:price)
       end
 
       it "maps legacy deepseek-chat alias to flash peak pricing" do
         usage = { prompt_tokens: 100_000, completion_tokens: 50_000 }
         result = described_class.calculate_cost(model: "deepseek-chat", usage: usage, now: peak_time)
-        expect(result[:cost]).to be_within(0.0001).of(0.110)
+        expect(result[:cost]).to be_within(0.0001).of(0.09)
         expect(result[:source]).to eq(:price)
       end
 
       it "maps legacy deepseek-reasoner alias to flash peak pricing" do
         usage = { prompt_tokens: 100_000, completion_tokens: 50_000 }
         result = described_class.calculate_cost(model: "deepseek-reasoner", usage: usage, now: peak_time)
-        expect(result[:cost]).to be_within(0.0001).of(0.110)
+        expect(result[:cost]).to be_within(0.0001).of(0.09)
         expect(result[:source]).to eq(:price)
+      end
+
+      it "bills deepseek-v4-flash-vision-exp at v4-flash rates" do
+        usage = {
+          prompt_tokens: 100_000,
+          completion_tokens: 50_000
+        }
+
+        # Same rates as v4-flash (peak):
+        # Input: (100,000 / 1,000,000) * $0.30 = $0.03
+        # Output: (50,000 / 1,000,000) * $1.20 = $0.06
+        # Total: $0.09
+        result = described_class.calculate_cost(model: "deepseek-v4-flash-vision-exp", usage: usage, now: peak_time)
+        expect(result[:cost]).to be_within(0.0001).of(0.09)
+        expect(result[:source]).to eq(:price)
+      end
+
+      it "normalizes deepseek-v4-flash-vision-exp to its own row (not v4-flash)" do
+        expect(described_class.normalize_model_name("deepseek-v4-flash-vision-exp")).to eq("deepseek-v4-flash-vision-exp")
+        expect(described_class.normalize_model_name("deepseek-v4-flash")).to eq("deepseek-v4-flash")
+        expect(described_class.normalize_model_name("deepseek-flash")).to eq("deepseek-flash")
       end
     end
 
@@ -511,38 +572,38 @@ RSpec.describe Clacky::ModelPricing do
     end
     
     context "with GPT-5.6 models (Sol / Terra / Luna)" do
-      it "bills gpt-5.6-luna at flat economy rates" do
+      it "bills gpt-5.6-luna at tiered rates (long tier above 200K)" do
         usage = { prompt_tokens: 1_000_000, completion_tokens: 1_000_000 }
 
-        # Input:  1M * $0.20 = $0.20
-        # Output: 1M * $1.20 = $1.20
-        # Total: $1.40
+        # Input:  1M * $0.40 = $0.40
+        # Output: 1M * $1.80 = $1.80
+        # Total: $2.20
         result = described_class.calculate_cost(model: "gpt-5.6-luna", usage: usage)
-        expect(result[:cost]).to be_within(0.0001).of(1.40)
+        expect(result[:cost]).to be_within(0.0001).of(2.20)
         expect(result[:source]).to eq(:price)
       end
 
-      it "bills gpt-5.6-terra at flat rates" do
+      it "bills gpt-5.6-terra at tiered rates (long tier above 200K)" do
         usage = { prompt_tokens: 1_000_000, completion_tokens: 1_000_000 }
 
-        # $2.00 + $12.00 = $14.00
+        # $4.00 + $18.00 = $22.00
         result = described_class.calculate_cost(model: "gpt-5.6-terra", usage: usage)
-        expect(result[:cost]).to be_within(0.0001).of(14.00)
+        expect(result[:cost]).to be_within(0.0001).of(22.00)
         expect(result[:source]).to eq(:price)
       end
 
-      it "bills gpt-5.6-sol at flat rates with cache read" do
+      it "bills gpt-5.6-sol at tiered rates with cache read" do
         usage = {
           prompt_tokens: 1_000_000,
           completion_tokens: 0,
           cache_read_input_tokens: 200_000
         }
 
-        # Regular input: (1_000_000 - 200_000)/1M * $2.50 = $2.00
-        # Cache read:     200_000 / 1M * $0.25            = $0.05
-        # Total: $2.05
+        # Regular input: (1_000_000 - 200_000)/1M * $8.00 = $6.40
+        # Cache read:     200_000 / 1M * $0.80            = $0.16
+        # Total: $6.56
         result = described_class.calculate_cost(model: "gpt-5.6-sol", usage: usage)
-        expect(result[:cost]).to be_within(0.0001).of(2.05)
+        expect(result[:cost]).to be_within(0.0001).of(6.56)
         expect(result[:source]).to eq(:price)
       end
 
@@ -551,7 +612,8 @@ RSpec.describe Clacky::ModelPricing do
           model: "openai/gpt-5.6-luna",
           usage: { prompt_tokens: 1_000_000, completion_tokens: 0 }
         )
-        expect(result[:cost]).to be_within(0.0001).of(0.20)
+        # 1M > 200K -> long tier input $0.40
+        expect(result[:cost]).to be_within(0.0001).of(0.40)
         expect(result[:source]).to eq(:price)
       end
 
@@ -563,14 +625,17 @@ RSpec.describe Clacky::ModelPricing do
         expect(pro[:source]).to eq(:price)
       end
 
-      it "keeps flat rates above 200K (no tier bump)" do
+      it "bumps to the long tier above 200K input tokens" do
         small = described_class.calculate_cost(
-          model: "gpt-5.6-terra", usage: { prompt_tokens: 10_000, completion_tokens: 0 }
+          model: "gpt-5.6-terra", usage: { prompt_tokens: 100_000, completion_tokens: 0 }
         )[:cost]
         large = described_class.calculate_cost(
           model: "gpt-5.6-terra", usage: { prompt_tokens: 250_000, completion_tokens: 0 }
         )[:cost]
-        expect(small / 10_000).to be_within(0.0000001).of(large / 250_000)
+
+        # Short tier: 100K * $2.00 = $0.20; long tier: 250K * $4.00 = $1.00
+        expect(small).to be_within(0.0001).of(0.20)
+        expect(large).to be_within(0.0001).of(1.00)
       end
 
       it "returns nil for :batch ids (half-price billing not modeled)" do
@@ -687,6 +752,14 @@ RSpec.describe Clacky::ModelPricing do
   # regardless of mainland-vs-intl endpoint. Flat-rate (no tiered billing).
   # Source: https://docs.z.ai/guides/overview/pricing
   describe "GLM pricing" do
+    it "bills glm-5.3-flash at its lower list rate (launch promo ignored)" do
+      usage = { prompt_tokens: 1_000_000, completion_tokens: 1_000_000 }
+      result = described_class.calculate_cost(model: "glm-5.3-flash", usage: usage)
+      # (1M/1M)*$0.15 + (1M/1M)*$0.50 = $0.65
+      expect(result[:cost]).to be_within(0.0001).of(0.65)
+      expect(result[:source]).to eq(:price)
+    end
+
     it "bills glm-5.3 at the GLM-5.2 flat rate (same base model, no separate Z.ai row yet)" do
       usage = { prompt_tokens: 100_000, completion_tokens: 50_000 }
       result = described_class.calculate_cost(model: "glm-5.3", usage: usage)
@@ -868,6 +941,16 @@ RSpec.describe Clacky::ModelPricing do
       expect(result[:source]).to eq(:price)
     end
 
+    it "bills qwen3.8-max at the same flat list rate as qwen3.7-max" do
+      result = described_class.calculate_cost(
+        model: "qwen3.8-max",
+        usage: { prompt_tokens: 1_000_000, completion_tokens: 1_000_000 }
+      )
+      # input 1M * $2.5 + output 1M * $7.5 = $10.00 (flat, no tier bump)
+      expect(result[:cost]).to be_within(0.0001).of(10.00)
+      expect(result[:source]).to eq(:price)
+    end
+
     it "bills qwen3.7-max at the flat list rate, not tiered" do
       result = described_class.calculate_cost(
         model: "qwen3.7-max",
@@ -944,6 +1027,26 @@ RSpec.describe Clacky::ModelPricing do
 
     it "normalizes bare upstream id gemini-3.6-flash" do
       expect(described_class.normalize_model_name("gemini-3.6-flash")).to eq("gemini-3.6-flash")
+    end
+  end
+
+  describe "Gemini 3.7 Flash pricing" do
+    it "normalizes platform alias or-gemini-3-7-flash" do
+      expect(described_class.normalize_model_name("or-gemini-3-7-flash")).to eq("gemini-3.7-flash")
+    end
+
+    it "normalizes bare upstream id gemini-3.7-flash" do
+      expect(described_class.normalize_model_name("gemini-3.7-flash")).to eq("gemini-3.7-flash")
+    end
+  end
+
+  describe "Gemini 3.8 Flash pricing" do
+    it "normalizes platform alias or-gemini-3-8-flash" do
+      expect(described_class.normalize_model_name("or-gemini-3-8-flash")).to eq("gemini-3.8-flash")
+    end
+
+    it "normalizes bare upstream id gemini-3.8-flash" do
+      expect(described_class.normalize_model_name("gemini-3.8-flash")).to eq("gemini-3.8-flash")
     end
   end
 

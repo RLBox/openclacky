@@ -96,7 +96,7 @@ module Clacky
         forward_to_subscribers { |sub| sub.show_user_message(content) if sub.respond_to?(:show_user_message) }
       end
 
-      def show_assistant_message(content, files:)
+      def show_assistant_message(content, files:, interim: false, created_at: nil)
         return if (content.nil? || content.to_s.strip.empty?) && files.empty?
 
         # Rewrite local image paths (file:// and bare absolute) to /api/local-image
@@ -105,31 +105,31 @@ module Clacky
         # Channel subscribers receive the original content so they can deliver
         # local images as native attachments via send_file().
         web_content = Clacky::Utils::FileProcessor.rewrite_local_image_urls(content.to_s)
-        emit("assistant_message", content: web_content, files: files)
-        forward_to_subscribers { |sub| sub.show_assistant_message(content, files: files) }
+        emit("assistant_message", content: web_content, files: files, created_at: created_at, interim: interim)
+        forward_to_subscribers { |sub| sub.show_assistant_message(content, files: files, interim: interim) }
       end
 
-      def show_feedback_request(question, context, options)
-        emit("request_feedback", question: question, context: context, options: options)
+      def show_feedback_request(question, context, options, questions: nil)
+        emit("request_feedback", question: question, context: context,
+                                 options: options, questions: questions || [])
       end
 
       def show_tool_call(name, args)
         args_data = args.is_a?(String) ? (JSON.parse(args) rescue args) : args
 
-        # Special handling for request_user_feedback — emit a dedicated UI event
-        if name.to_s == "request_user_feedback"
-          question = args_data.is_a?(Hash) ? (args_data[:question] || args_data["question"]).to_s : ""
-          context  = args_data.is_a?(Hash) ? (args_data[:context]  || args_data["context"]).to_s  : ""
-          options  = args_data.is_a?(Hash) ? (args_data[:options]  || args_data["options"])        : nil
-
-          # Normalize options to array (guard against malformed data)
-          options = Array(options) if options && !options.is_a?(Array)
+        # Special handling for ask_user — emit a dedicated UI event
+        if Clacky::Tools::AskUser.feedback_tool?(name)
+          questions = Clacky::Tools::AskUser.normalize_questions(args_data)
+          context   = args_data.is_a?(Hash) ? (args_data[:context] || args_data["context"]).to_s : ""
+          first     = questions.first || {}
 
           emit("request_feedback",
-               question: question,
+               question: first[:question].to_s,
                context: context,
-               options: options || [])
-          # Don't forward to IM subscribers — they get the formatted text version already
+               options: first[:options] || [],
+               questions: questions)
+          # IM subscribers render the same questions as plain text — they have no card.
+          forward_to_subscribers { |sub| sub.show_tool_call(name, args_data) }
           return
         end
 
@@ -190,8 +190,9 @@ module Clacky
         # Token usage is internal detail — intentionally not forwarded
       end
 
-      def show_complete(iterations:, cost:, duration: nil, cache_stats: nil, awaiting_user_feedback: false, cost_source: nil)
+      def show_complete(iterations:, cost:, duration: nil, cache_stats: nil, awaiting_user_feedback: false, cost_source: nil, task_id: nil)
         data = { iterations: iterations, cost: cost }
+        data[:task_id]                = task_id             if task_id
         data[:duration]               = duration            if duration
         data[:cache_stats]            = cache_stats         if cache_stats
         data[:awaiting_user_feedback] = awaiting_user_feedback if awaiting_user_feedback
@@ -200,7 +201,7 @@ module Clacky
         forward_to_subscribers do |sub|
           sub.show_complete(iterations: iterations, cost: cost, duration: duration,
                             cache_stats: cache_stats, awaiting_user_feedback: awaiting_user_feedback,
-                            cost_source: cost_source)
+                            cost_source: cost_source, task_id: task_id)
         end
       end
 

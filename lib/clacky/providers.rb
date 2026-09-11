@@ -29,8 +29,13 @@ module Clacky
         "name" => "OpenClacky",
         "base_url" => "https://api.openclacky.com",
         "api" => "bedrock",
-        "default_model" => "abs-claude-sonnet-5",
+        "default_model" => "or-gemini-3-8-flash",
         "models" => [
+          "abs-gpt-6-astra",
+          "abs-gpt-5.6-sol",
+          "abs-gpt-5.6-terra",
+          "abs-gpt-5.6-luna",
+          "abs-claude-fable-5-1",
           "abs-claude-fable-5",
           "abs-claude-opus-5",
           "abs-claude-opus-4-8",
@@ -40,9 +45,13 @@ module Clacky
           "abs-claude-sonnet-4-6",
           "abs-claude-sonnet-4-5",
           "abs-claude-haiku-4-5",
+          "dsk-deepseek-flash",
           "dsk-deepseek-v4-pro",
           "dsk-deepseek-v4-flash",
+          "dsk-deepseek-v4-flash-vision-exp",
           "or-gemini-3-1-pro",
+          "or-gemini-3-8-flash",
+          "or-gemini-3-7-flash",
           "or-gemini-3-6-flash",
           "or-gemini-3-5-flash"
         ],
@@ -95,43 +104,60 @@ module Clacky
         # routes them to Vertex AI Gemini (generateContent with inline
         # audio parts). The gateway returns transcription text.
         "stt_models" => [
+          "or-stt-gemini-3-8-flash",
+          "or-stt-gemini-3-7-flash",
           "or-stt-gemini-3-6-flash",
           "or-stt-gemini-3-5-flash",
           "or-stt-gemini-1-5-pro"
         ],
         "stt_model_aliases" => {
+          "or-stt-gemini-3-8-flash" => "Gemini 3.8 Flash STT",
+          "or-stt-gemini-3-7-flash" => "Gemini 3.7 Flash STT",
           "or-stt-gemini-3-6-flash" => "Gemini 3.6 Flash STT",
           "or-stt-gemini-3-5-flash" => "Gemini 3.5 Flash STT",
           "or-stt-gemini-1-5-pro"   => "Gemini 1.5 Pro STT"
         },
-        "default_stt_model" => "or-stt-gemini-3-6-flash",
+        "default_stt_model" => "or-stt-gemini-3-8-flash",
         # Video understanding models served by the openclacky gateway, which
         # routes video frames to Gemini (generateContent with inline image
         # parts). The gateway returns analysis text.
         "video_understanding_models" => [
+          "or-gemini-3-8-flash",
+          "or-gemini-3-7-flash",
           "or-gemini-3-6-flash",
           "or-gemini-3-5-flash",
           "or-gemini-3-1-pro"
         ],
         "video_understanding_model_aliases" => {
+          "or-gemini-3-8-flash" => "Gemini 3.8 Flash",
+          "or-gemini-3-7-flash" => "Gemini 3.7 Flash",
           "or-gemini-3-6-flash" => "Gemini 3.6 Flash",
           "or-gemini-3-5-flash" => "Gemini 3.5 Flash",
           "or-gemini-3-1-pro"   => "Gemini 3.1 Pro"
         },
-        "default_video_understanding_model" => "or-gemini-3-6-flash",
+        "default_video_understanding_model" => "or-gemini-3-8-flash",
         # Default OCR sidecar — used when the primary model is text-only.
         # Candidates are derived from the provider's vision-capable models;
         # this just picks the cheap+fast default to surface in "auto" mode.
-        "default_ocr_model" => "or-gemini-3-6-flash",
+        "default_ocr_model" => "or-gemini-3-8-flash",
         # Provider-level default: the Claude family served here is vision-capable.
         "capabilities" => { "vision" => true }.freeze,
         # Model-level overrides: DeepSeek models routed through this provider
-        # are text-only; images uploaded for them must be downgraded to disk refs.
-        # Gemini 3.1 Pro keeps the provider-default vision=true (it accepts
-        # image/audio/video input natively via OpenRouter).
+        # are text-only, except the flash-vision-exp variant which accepts
+        # image input; images uploaded for text-only models must be downgraded
+        # to disk refs. Gemini 3.1 Pro keeps the provider-default vision=true
+        # (it accepts image/audio/video input natively via OpenRouter).
         "model_capabilities" => {
-          "dsk-deepseek-v4-pro"   => { "vision" => false }.freeze,
-          "dsk-deepseek-v4-flash" => { "vision" => false }.freeze
+          "dsk-deepseek-flash"               => { "vision" => true }.freeze,
+          "dsk-deepseek-v4-pro"              => { "vision" => false }.freeze,
+          "dsk-deepseek-v4-flash"            => { "vision" => false }.freeze,
+          "dsk-deepseek-v4-flash-vision-exp" => { "vision" => true }.freeze
+        }.freeze,
+        # Bedrock GPT models (abs-gpt-*) are served through the OpenAI
+        # Responses API — their Chat Completions endpoint rejects function
+        # tools for reasoning models (GPT-6 Astra).
+        "model_api_overrides" => {
+          /\Aabs-gpt-/ => "openai-responses"
         }.freeze,
         # Per-primary lite pairing: keys are "strong" primary models, values
         # are the lite sidekick to auto-inject when that primary is the
@@ -140,6 +166,7 @@ module Clacky
         # themselves, so they're intentionally not listed here as keys —
         # no injection happens when the default model is already lite-class.
         "lite_models" => {
+          "abs-claude-fable-5-1"  => "abs-claude-haiku-4-5",
           "abs-claude-fable-5"    => "abs-claude-haiku-4-5",
           "abs-claude-opus-5"     => "abs-claude-haiku-4-5",
           "abs-claude-opus-4-8"   => "abs-claude-haiku-4-5",
@@ -148,12 +175,15 @@ module Clacky
           "abs-claude-sonnet-5"   => "abs-claude-haiku-4-5",
           "abs-claude-sonnet-4-6" => "abs-claude-haiku-4-5",
           "abs-claude-sonnet-4-5" => "abs-claude-haiku-4-5",
+          "abs-gpt-5.6-sol"       => "abs-gpt-5.6-luna",
+          "abs-gpt-5.6-terra"     => "abs-gpt-5.6-luna",
           "dsk-deepseek-v4-pro"   => "dsk-deepseek-v4-flash",
           "or-gemini-3-1-pro"     => "or-gemini-3-6-flash"
         },
         # Fallback chain: if a model is unavailable, try the next one in order.
         # Keys are primary model names; values are the fallback model to use instead.
         "fallback_models" => {
+          "abs-claude-fable-5-1"  => "abs-claude-fable-5",
           "abs-claude-fable-5"    => "abs-claude-opus-5",
           "abs-claude-opus-5"     => "abs-claude-opus-4-8",
           "abs-claude-sonnet-5"   => "abs-claude-sonnet-4-6",
@@ -250,11 +280,19 @@ module Clacky
         # deprecated on 2026-07-24; they map to deepseek-v4-flash's non-thinking
         # and thinking modes respectively. Prefer deepseek-v4-flash / deepseek-v4-pro.
         "models" => [
-          "deepseek-v4-flash",
+          "deepseek-flash",
           "deepseek-v4-pro",
+          "deepseek-v4-flash",
+          "deepseek-v4-flash-vision-exp",
         ],
-        # DeepSeek V4 API does not accept image inputs — text-only across all models.
+        # DeepSeek V4 API is text-only across all models, except the
+        # flash-vision-exp variant which accepts image input. V4.1 Flash
+        # (deepseek-flash) is natively multimodal.
         "capabilities" => { "vision" => false }.freeze,
+        "model_capabilities" => {
+          "deepseek-flash"               => { "vision" => true }.freeze,
+          "deepseek-v4-flash-vision-exp" => { "vision" => true }.freeze
+        }.freeze,
         "website_url" => "https://platform.deepseek.com/api_keys"
       }.freeze,
 
@@ -263,7 +301,7 @@ module Clacky
         "base_url" => "https://open.bigmodel.cn/api/paas/v4",
         "api" => "openai-completions",
         "default_model" => "glm-5.3",
-        "models" => ["glm-5.3", "glm-5.2", "glm-5.1", "glm-5", "glm-5-turbo", "glm-5v-turbo", "glm-4.7"],
+        "models" => ["glm-5.3", "glm-5.3-flash", "glm-5.2", "glm-5.1", "glm-5", "glm-5-turbo", "glm-5v-turbo", "glm-4.7"],
         # Zhipu / Z.ai expose four functionally-equivalent endpoints:
         # two regional sites (mainland open.bigmodel.cn + international api.z.ai)
         # each with a general-billing and a Coding-Plan subpath. They share the
@@ -279,10 +317,12 @@ module Clacky
           { "label" => "International · Pay-as-you-go", "label_key" => "settings.models.baseurl.variant.international_payg",  "base_url" => "https://api.z.ai/api/paas/v4",                "region" => "intl" }.freeze,
           { "label" => "International · Coding Plan",   "label_key" => "settings.models.baseurl.variant.international_coding","base_url" => "https://api.z.ai/api/coding/paas/v4",         "region" => "intl" }.freeze
         ].freeze,
-        # GLM models are text-only except glm-5v-turbo which is vision-capable ("v" = visual).
+        # GLM models are text-only except the vision-capable SKUs: glm-5v-turbo
+        # ("v" = visual) and glm-5.3-flash (GLM-5's first natively-multimodal model).
         "capabilities" => { "vision" => false }.freeze,
         "model_capabilities" => {
-          "glm-5v-turbo" => { "vision" => true }.freeze
+          "glm-5v-turbo" => { "vision" => true }.freeze,
+          "glm-5.3-flash" => { "vision" => true }.freeze
         }.freeze,
         "default_ocr_model" => "glm-5v-turbo",
         "website_url" => "https://open.bigmodel.cn/console/overview"
@@ -397,6 +437,7 @@ module Clacky
         "api" => "openai-completions",
         "default_model" => "gpt-5.5",
         "models" => [
+          "gpt-6-astra",
           "gpt-5.6-sol",
           "gpt-5.6-terra",
           "gpt-5.6-luna",
@@ -433,8 +474,9 @@ module Clacky
         "name" => "Qwen (Alibaba)",
         "base_url" => "https://dashscope.aliyuncs.com/compatible-mode/v1",
         "api" => "openai-completions",
-        "default_model" => "qwen3.7-max",
+        "default_model" => "qwen3.8-max",
         "models" => [
+          "qwen3.8-max",
           "qwen3.7-max",
           "qwen3.6-plus",
           "qwen3.6-max",
@@ -453,6 +495,7 @@ module Clacky
         }.freeze,
         "default_ocr_model" => "qwen3.6-flash",
         "lite_models" => {
+          "qwen3.8-max"      => "qwen3.6-flash",
           "qwen3.7-max"      => "qwen3.6-flash",
           "qwen3.6-plus"     => "qwen3.6-flash",
           "qwen3.6-max"      => "qwen3.6-flash",
@@ -677,6 +720,23 @@ module Clacky
       }.freeze
 
     }.freeze
+
+    # Canonical provider identifiers. Mirror the PRESETS keys above; keep both
+    # in sync when adding or renaming a provider.
+    OPENCLACKY_ID     = "openclacky"
+    OPENROUTER_ID     = "openrouter"
+    DEEPSEEKV4_ID     = "deepseekv4"
+    GLM_ID            = "glm"
+    KIMI_ID           = "kimi"
+    KIMI_CODING_ID    = "kimi-coding"
+    MINIMAX_ID        = "minimax"
+    ANTHROPIC_ID      = "anthropic"
+    OPENAI_ID         = "openai"
+    QWEN_ID           = "qwen"
+    MIMO_ID           = "mimo"
+    VOLCENGINE_ARK_ID = "volcengine-ark"
+    OLLAMA_ID         = "ollama"
+    ORCAROUTER_ID     = "orcarouter"
 
     MEDIA_KINDS = %w[image video audio stt video_understanding].freeze
 
@@ -1137,6 +1197,13 @@ module Clacky
 
         model_caps = preset.dig("model_capabilities", model_name) || {}
         provider_caps.merge(model_caps)
+      end
+
+      # True when +id+ names a known preset. Callers use this to decide
+      # whether a model entry's `provider_id` can drive capability lookups,
+      # or whether it should fall through to base_url matching instead.
+      def preset?(id)
+        id.is_a?(String) && PRESETS.key?(id)
       end
 
       # Check if a provider+model supports a capability.

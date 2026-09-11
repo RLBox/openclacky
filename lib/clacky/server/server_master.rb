@@ -27,6 +27,15 @@ module Clacky
       # Worker exits with this code to request a hot restart (e.g. after gem upgrade).
       RESTART_EXIT_CODE        = 75
       MAX_CONSECUTIVE_FAILURES = 5
+      # Grace period for a worker to finish its shutdown_proc before KILL.
+      # Worker cleanup is tuned to finish in ~2s (parallel agent interrupt,
+      # 1s stopper joins, 1s force_stop grace), so 3s is the target ceiling.
+      #
+      # TEMP for manual debugging: extended to 10s so a slow worker teardown
+      # does not get KILLed mid-cleanup while we measure where time goes.
+      # Override with CLACKY_MASTER_GRACE_SECONDS (e.g. 15) without editing code.
+      # Revert to 3 once the worker side is proven to finish in time.
+      WORKER_GRACE_EXIT_SECONDS = ENV.fetch("CLACKY_MASTER_GRACE_SECONDS", "10").to_i
 
       def initialize(host:, port:, argv: nil, extra_flags: [])
         @host   = host
@@ -162,7 +171,12 @@ module Clacky
         # When running under a LaunchAgent there is no terminal, so redirect the
         # worker's stderr to the daily log file to capture crash output (e.g.
         # Ruby load errors that happen before the logger is reachable).
-        stderr_target = $stderr.isatty ? :err : File.open(Clacky::Logger.current_log_file, "a")
+        if $stderr.isatty
+          stderr_target = :err
+        else
+          Clacky::Logger.ensure_log_dir
+          stderr_target = File.open(Clacky::Logger.current_log_file, "a")
+        end
         pid = spawn(env, ruby, script, *worker_argv, pgroup: 0, err: stderr_target)
         stderr_target.close unless stderr_target == :err
         Clacky::Logger.info("[Master PID=#{Process.pid}] Spawned worker PID=#{pid} pgroup=#{pid}")
@@ -179,7 +193,7 @@ module Clacky
         # also get a chance to shut down cleanly (triggering interrupt_all_agents).
         begin
           Process.kill("TERM", -old_pid)
-          deadline = Time.now + 10
+          deadline = Time.now + WORKER_GRACE_EXIT_SECONDS
           loop do
             pid, = Process.waitpid2(old_pid, Process::WNOHANG)
             break if pid
@@ -205,8 +219,11 @@ module Clacky
             # TERM the entire worker process group so grandchildren (node MCP, etc.)
             # are also signalled and can clean up before we force-kill.
             Process.kill("TERM", -@worker_pid)
-            # Wait up to 10s for worker graceful exit (interrupt_all_agents + save), then KILL
-            deadline = Time.now + 10
+            # Wait for worker graceful exit, then KILL the whole group as a
+            # last resort. Deadline must cover the worker's shutdown_proc
+            # worst case (~5.5s), otherwise every Ctrl+C logs a spurious
+            # "did not exit in time" and kills the worker mid-cleanup.
+            deadline = Time.now + WORKER_GRACE_EXIT_SECONDS
             loop do
               pid, = Process.waitpid2(@worker_pid, Process::WNOHANG)
               break if pid

@@ -26,6 +26,8 @@ module Clacky
       # the same Clacky proxy on a different endpoint. The *model prefix* is
       # the source of truth for which upstream format the proxy expects:
       #
+      #   abs-gpt-* → OpenAI-compatible (POST /chat/completions) — GPT models
+      #               on Bedrock use the OpenAI endpoint, not Converse
       #   abs-*  → Bedrock Converse  (POST /model/{id}/converse)
       #   dsk-*  → OpenAI-compatible (POST /chat/completions)
       #   or-*   → OpenAI-compatible (POST /chat/completions)
@@ -38,7 +40,10 @@ module Clacky
       # will route correctly without touching this file.
       def self.bedrock_api_key?(api_key, model)
         return true if api_key.to_s.start_with?("ABSK")
-        model.to_s.start_with?("abs-")
+        model_str = model.to_s
+        # abs-gpt-* is served through Bedrock's OpenAI-compatible endpoint.
+        return false if model_str.start_with?("abs-gpt-")
+        model_str.start_with?("abs-")
       end
 
       module_function

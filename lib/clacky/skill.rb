@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "yaml"
+require "json"
 require "pathname"
 require_relative "utils/file_ignore_helper"
 require_relative "utils/gitignore_parser"
@@ -616,6 +617,53 @@ module Clacky
     rescue => e
       # If ERB fails (e.g. unknown variable), return content as-is
       content
+    end
+
+    class << self
+      # Rebuild a raw SKILL.md string with the editable frontmatter fields
+      # (name/name_zh/description/description_zh) and body updated, preserving
+      # every other frontmatter line untouched.
+      def update_frontmatter_fields(raw_content, fields)
+        scalar = lambda do |value|
+          s = value.to_s
+          if s.empty? || s != s.strip
+            JSON.generate(s)
+          elsif s.match?(/\A[a-zA-Z0-9][a-zA-Z0-9 _.\-\/]*\z/)
+            s
+          else
+            JSON.generate(s)
+          end
+        end
+
+        editable = {
+          "name"           => fields["name"].to_s.strip,
+          "name_zh"        => fields["name_zh"].to_s.strip,
+          "description"    => fields["description"].to_s.strip,
+          "description_zh" => fields["description_zh"].to_s.strip
+        }
+        body = fields["body"].to_s.sub(/\A\n+/, "")
+
+        match = raw_content.match(/\A---\n(.*?)\n---[ \t]*\n?/m)
+        yaml_block = match ? match[1] : ""
+
+        lines = yaml_block.empty? ? [] : yaml_block.split("\n", -1)
+        updated = {}
+        new_lines = lines.map do |line|
+          key = line[/\A([a-zA-Z0-9_-]+):/, 1]
+          if editable.key?(key) && !updated[key]
+            updated[key] = true
+            "#{key}: #{scalar.call(editable[key])}"
+          else
+            line
+          end
+        end
+        editable.each do |key, value|
+          next if updated[key]
+          new_lines << "#{key}: #{scalar.call(value)}"
+        end
+
+        "---\n#{new_lines.join("\n")}\n---\n\n#{body}"
+      end
     end
 
 

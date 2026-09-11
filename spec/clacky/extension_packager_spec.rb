@@ -2,6 +2,8 @@
 
 require "spec_helper"
 require "zip"
+require "stringio"
+require "zlib"
 
 RSpec.describe Clacky::ExtensionPackager do
   let(:local)     { Dir.mktmpdir }
@@ -68,6 +70,15 @@ RSpec.describe Clacky::ExtensionPackager do
 
       expect { described_class.pack("broken", source_dir: local, out_dir: out) }
         .to raise_error(described_class::Error, /verify found errors/)
+    end
+
+    it "blocks packing when the manifest version is invalid" do
+      dir = scaffold("bad-version")
+      yml = File.join(dir, "ext.yml")
+      File.write(yml, File.read(yml).sub(/^version:.*$/, "version: 测试test"))
+
+      expect { described_class.pack("bad-version", source_dir: local, out_dir: out) }
+        .to raise_error(described_class::Error, /schema.invalid_version/)
     end
 
     it "refuses to pack a container whose produced zip exceeds the size limit" do
@@ -248,6 +259,93 @@ RSpec.describe Clacky::ExtensionPackager do
 
       expect(res.ext_id).to eq("demo")
       expect(File).to exist(File.join(installed, "demo", "ext.yml"))
+    end
+  end
+
+  describe ".install from URL with CDN failover" do
+    def packed_zip_bytes(id)
+      scaffold(id)
+      File.binread(described_class.pack(id, source_dir: local, out_dir: out).path)
+    end
+
+    it "falls back to the secondary CDN host when the primary connection is reset" do
+      zip_bytes   = packed_zip_bytes("demo")
+      primary_url = "#{Clacky::PlatformHttpClient::PRIMARY_HOST}/rails/active_storage/demo.zip"
+      called_urls = []
+
+      allow(URI).to receive(:open) do |url, *_args, &blk|
+        called_urls << url
+        if url.start_with?(Clacky::PlatformHttpClient::PRIMARY_HOST)
+          raise Errno::ECONNRESET, "Connection reset by peer"
+        end
+        blk.call(StringIO.new(zip_bytes))
+      end
+
+      res = described_class.install(primary_url, installed_dir: installed)
+
+      expect(res.ext_id).to eq("demo")
+      expect(File).to exist(File.join(installed, "demo", "ext.yml"))
+      expect(called_urls).to contain_exactly(
+        primary_url,
+        primary_url.sub(Clacky::PlatformHttpClient::PRIMARY_HOST, Clacky::PlatformHttpClient::SECONDARY_HOST)
+      )
+    end
+
+    it "raises a packaged Error instead of a raw connection reset when both hosts fail" do
+      allow(URI).to receive(:open) { raise Errno::ECONNRESET, "Connection reset by peer" }
+
+      url = "#{Clacky::PlatformHttpClient::PRIMARY_HOST}/rails/active_storage/demo.zip"
+      expect { described_class.install(url, installed_dir: installed) }
+        .to raise_error(described_class::Error, /failed to download .*Connection reset by peer/)
+    end
+
+    it "falls back on unexpected error classes too, e.g. a corrupt gzip stream" do
+      zip_bytes   = packed_zip_bytes("demo")
+      primary_url = "#{Clacky::PlatformHttpClient::PRIMARY_HOST}/rails/active_storage/demo.zip"
+      called_urls = []
+
+      allow(URI).to receive(:open) do |url, *_args, &blk|
+        called_urls << url
+        raise Zlib::DataError, "bad gzip" if url.start_with?(Clacky::PlatformHttpClient::PRIMARY_HOST)
+        blk.call(StringIO.new(zip_bytes))
+      end
+
+      res = described_class.install(primary_url, installed_dir: installed)
+
+      expect(res.ext_id).to eq("demo")
+      expect(called_urls.length).to eq(2)
+    end
+  end
+
+  describe ".install_bytes" do
+    def packed_bytes(id)
+      scaffold(id)
+      File.binread(described_class.pack(id, source_dir: local, out_dir: out).path)
+    end
+
+    it "installs raw zip bytes into the installed layer" do
+      bytes = packed_bytes("demo")
+      res = described_class.install_bytes(bytes, filename: "demo.zip", installed_dir: installed)
+
+      expect(res.ext_id).to eq("demo")
+      expect(File).to exist(File.join(installed, "demo", "ext.yml"))
+    end
+
+    it "rejects empty data" do
+      expect { described_class.install_bytes("", filename: "x.zip", installed_dir: installed) }
+        .to raise_error(described_class::Error, /empty upload/)
+    end
+
+    it "rejects a non-zip filename" do
+      bytes = packed_bytes("demo")
+      expect { described_class.install_bytes(bytes, filename: "demo.tar", installed_dir: installed) }
+        .to raise_error(described_class::Error, /\.zip/)
+    end
+
+    it "rejects data exceeding the size limit" do
+      stub_const("Clacky::ExtensionPackager::MAX_ZIP_SIZE", 1)
+      expect { described_class.install_bytes("xx", filename: "x.zip", installed_dir: installed) }
+        .to raise_error(described_class::Error, /exceeds .* limit/)
     end
   end
 end

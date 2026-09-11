@@ -31,6 +31,7 @@ module Clacky
           working_dir: config[:working_dir],
           mode: config[:mode],
           model: config[:model],
+          reasoning_effort: config[:reasoning_effort],
           theme: config[:theme]
         }
 
@@ -81,6 +82,7 @@ module Clacky
           working_dir: @config[:working_dir],
           mode: @config[:mode],
           model: @config[:model],
+          reasoning_effort: @config[:reasoning_effort],
           tasks: @tasks_count,
           cost: @total_cost
         )
@@ -124,6 +126,7 @@ module Clacky
           working_dir: @config[:working_dir],
           mode: @config[:mode],
           model: @config[:model],
+          reasoning_effort: @config[:reasoning_effort],
           tasks: @tasks_count,
           cost: @total_cost,
           cost_source: cost_source,
@@ -448,7 +451,7 @@ module Clacky
 
       # Show assistant message
       # @param content [String] Message content
-      def show_assistant_message(content, files:)
+      def show_assistant_message(content, files:, interim: false, created_at: nil)
         # Filter out thinking tags from models like MiniMax M2.1 that use <think>...</think>
         filtered_content = filter_thinking_tags(content)
         return if filtered_content.nil? || filtered_content.strip.empty?
@@ -544,25 +547,29 @@ module Clacky
         @stdout_lines = nil
         @stdout_partial_tail = false
 
-        # Special handling for request_user_feedback: render as a readable interactive card
-        # with the full question and options, rather than the truncated format_call summary.
-        if name.to_s == "request_user_feedback"
+        # Special handling for ask_user: render as a readable interactive card
+        # with the full questions and options, rather than the truncated format_call summary.
+        if Clacky::Tools::AskUser.feedback_tool?(name)
           args_data = args.is_a?(String) ? (JSON.parse(args, symbolize_names: true) rescue {}) : args
-          args_data = args_data.transform_keys(&:to_sym) if args_data.is_a?(Hash)
+          questions = Clacky::Tools::AskUser.normalize_questions(args_data)
+          context   = Clacky::Tools::AskUser.fetch_key(args_data, :context).to_s.strip
 
-          question = args_data[:question].to_s.strip
-          context  = args_data[:context].to_s.strip
-          options  = Array(args_data[:options])
-
-          theme = ThemeManager.current_theme
           parts = []
-
           parts << context unless context.empty?
-          parts << question unless question.empty?
 
-          if options.any?
-            parts << ""
-            options.each_with_index { |opt, i| parts << "  #{i + 1}. #{opt}" }
+          multiple = questions.size > 1
+          questions.each_with_index do |q, q_index|
+            parts << "" unless parts.empty?
+            parts << (multiple ? "#{q_index + 1}. #{q[:question]}" : q[:question])
+            parts << q[:description] unless q[:description].empty?
+
+            next if q[:options].empty?
+
+            q[:options].each_with_index do |opt, i|
+              marker = q[:recommended] == i ? "  ← recommended" : ""
+              parts << "  #{i + 1}. #{opt}#{marker}"
+            end
+            parts << "  #{q[:options].size + 1}. Other — type your own answer" if q[:allow_free_text]
           end
 
           card_text = parts.join("\n")
@@ -625,7 +632,7 @@ module Clacky
       # @param duration [Float] Duration in seconds
       # @param cache_stats [Hash] Cache statistics
       # @param awaiting_user_feedback [Boolean] Whether agent is waiting for user feedback
-      def show_complete(iterations:, cost:, duration: nil, cache_stats: nil, awaiting_user_feedback: false, cost_source: nil)
+      def show_complete(iterations:, cost:, duration: nil, cache_stats: nil, awaiting_user_feedback: false, cost_source: nil, task_id: nil)
         # Update status back to 'idle' when task is complete
         update_sessionbar(status: 'idle')
 
@@ -1267,6 +1274,7 @@ module Clacky
           "",
           theme.format_text("Commands:", :info),
           "  #{theme.format_text("/model", :success)}       - Quickly switch the current model",
+          "  #{theme.format_text("/think", :success)}       - Set the thinking (reasoning) effort level",
           "  #{theme.format_text("/config", :success)}      - Configure models, API keys, settings",
           "  #{theme.format_text("/goal", :success)}        - Set a standing goal for autonomous work",
           "    #{theme.format_text("/goal <text>", :dim)}       Set a goal and start working toward it",
@@ -1360,7 +1368,7 @@ module Clacky
         end
       end
 
-      # Auto-approve countdown for request_user_feedback: show a single live
+      # Auto-approve countdown for ask_user: show a single live
       # countdown line. If the user presses any key before timeout, collect
       # their answer and return it (intervention). Otherwise return :timeout so
       # the agent auto-decides and continues.
@@ -1387,7 +1395,7 @@ module Clacky
         }
         @feedback_countdown = session
 
-        session[:watchdog] = Thread.new do
+        session[:watchdog] = Clacky::ThreadRegistry.spawn(name: "ui-watchdog") do
           remaining = seconds.to_i
           while remaining.positive?
             break if session[:intervened]
@@ -1531,7 +1539,7 @@ module Clacky
         # Use a dedicated stop flag so we can join() the thread cleanly and
         # avoid Thread#kill interrupting the thread while it holds @render_mutex.
         @fullscreen_refresh_stop = false
-        @fullscreen_refresh_thread = Thread.new do
+        @fullscreen_refresh_thread = Clacky::ThreadRegistry.spawn(name: "ui-fullscreen-refresh") do
           until @fullscreen_refresh_stop || !@layout.fullscreen_mode?
             sleep 0.3
             next if @fullscreen_refresh_stop || !@layout.fullscreen_mode?
@@ -1799,6 +1807,7 @@ module Clacky
             working_dir: @config[:working_dir],
             mode: @config[:mode],
             model: @config[:model],
+            reasoning_effort: @config[:reasoning_effort],
             tasks: @tasks_count,
             cost: @total_cost
           )
@@ -1867,14 +1876,15 @@ module Clacky
             }
           end
 
-          # Add action buttons
-          choices << { name: "─" * 50, disabled: true }
-          choices << { name: "[+] Add New Model", value: { action: :add } }
+          # Add action buttons (sticky: always visible below the scrollable
+          # model list, so a long model list can't push them off screen)
+          choices << { name: "─" * 50, disabled: true, sticky: true }
+          choices << { name: "[+] Add New Model", value: { action: :add }, sticky: true }
           if current_config.models.length > 0
-            choices << { name: "[*] Edit Current Model", value: { action: :edit } }
-            choices << { name: "[-] Delete Model", value: { action: :delete } } if current_config.models.length > 1
+            choices << { name: "[*] Edit Current Model", value: { action: :edit }, sticky: true }
+            choices << { name: "[-] Delete Model", value: { action: :delete }, sticky: true } if current_config.models.length > 1
           end
-          choices << { name: "[X] Close", value: { action: :close } }
+          choices << { name: "[X] Close", value: { action: :close }, sticky: true }
 
           # Show menu
           result = modal.show(
@@ -1899,7 +1909,7 @@ module Clacky
             if new_model
               # Determine anthropic_format based on provider
               # For Anthropic provider, use Anthropic API format
-              anthropic_format = new_model[:provider] == "anthropic"
+              anthropic_format = new_model[:provider] == Clacky::Providers::ANTHROPIC_ID
 
               current_config.add_model(
                 model: new_model[:model],
@@ -2115,6 +2125,37 @@ module Clacky
         )
 
         result # Return selected task_id or nil
+      end
+
+      # Show a reasoning-effort picker for the `/think` command.
+      # @param current_effort [String, nil] the agent's current effort level
+      # @return [String, nil] the chosen level ("off"/"low"/.../"max") or nil if cancelled
+      public def show_reasoning_effort_menu(current_effort)
+        modal = Components::ModalComponent.new
+
+        descriptions = {
+          "off"    => "Provider default (no effort override)",
+          "low"    => "Light reasoning - fastest",
+          "medium" => "Balanced reasoning",
+          "high"   => "Deep reasoning",
+          "xhigh"  => "Extra deep reasoning",
+          "max"    => "Maximum reasoning - slowest"
+        }
+
+        active_index = nil
+        choices = descriptions.keys.each_with_index.map do |level, idx|
+          is_current = current_effort.nil? ? level == "off" : level == current_effort
+          active_index = idx if is_current
+          marker = is_current ? "● " : "  "
+          { name: "#{marker}#{level} - #{descriptions[level]}", value: level }
+        end
+
+        modal.show(
+          title: "Thinking Level - Set Reasoning Effort",
+          choices: choices,
+          initial_index: active_index,
+          on_close: -> { @layout.rerender_all }
+        )
       end
 
       # Show form for editing a model

@@ -45,10 +45,10 @@ module Clacky
     include FakeToolCallDetector
 
     attr_reader :session_id, :name, :history, :iterations, :total_cost, :working_dir, :created_at, :total_tasks, :todos,
-                :cache_stats, :cost_source, :ui, :skill_loader, :agent_profile,
-                :status, :error, :updated_at, :source, :config,
-                :latest_latency,  # Hash of latency metrics from the most recent LLM call (see Client#send_messages_with_tools)
-                :reasoning_effort
+      :cache_stats, :cost_source, :ui, :skill_loader, :agent_profile,
+      :status, :error, :updated_at, :source, :config,
+      :latest_latency,  # Hash of latency metrics from the most recent LLM call (see Client#send_messages_with_tools)
+      :reasoning_effort
     attr_accessor :pinned
     attr_accessor :channel_info
     attr_accessor :project_id
@@ -108,10 +108,12 @@ module Clacky
       @ui = ui  # UIController for direct UI interaction
       @debug_logs = []  # Debug logs for troubleshooting
       @pending_injections = []     # Pending inline skill injections to flush after observe()
-      @pending_subagent_transcripts = {} # tool_call_id => subagent trail, attached by observe()
+      @pending_subagent_transcripts = {} # tool_call_id => [subagent trails], attached by observe()
+      @subagent_transcripts_mutex = Mutex.new # fan-out collects from worker threads
       @pending_script_tmpdirs = [] # Decrypted-script tmpdirs that live for the agent's lifetime
       @pending_error_rollback = false  # Deferred rollback flag set by restore_session on error
       @last_run_interrupted = false    # Set when run() exits via AgentInterrupted; tells the next run() to keep the task-start snapshot (continuation of the same task across a relay, not a brand-new task)
+      @cancel_flag = CancelFlag.new # Cooperative cancel: set by fan_out_labeled when the parent is interrupted; subagents on worker threads observe it via check_stale!
 
       # Compression tracking
       @compression_level = 0  # Tracks how many times we've compressed (for progressive summarization)
@@ -222,12 +224,15 @@ module Clacky
     # Rebuild the underlying Client (and dependent components) to pick up
     # credentials/model name from the currently-selected model in @config.
     private def rebuild_client_for_current_model!
+      entry = @config.current_model
       @client = Clacky::Client.new(
         @config.api_key,
         base_url: @config.effective_base_url,
         model: @config.model_name,
         anthropic_format: @config.anthropic_format?,
-        api_format: @config.api_format
+        api_format: @config.api_format,
+        provider_id: @config.provider_id_for(entry),
+        capabilities: entry && entry["capabilities"]
       )
       # Update message compressor with new client and model
       @message_compressor = MessageCompressor.new(@client, model: current_model)
@@ -471,7 +476,12 @@ module Clacky
       @name = new_name.to_s.strip
     end
 
-    def run(user_input, files: [], display_text: nil, created_at: nil)
+    def run(user_input, files: nil, reference_contexts: nil, display_text: nil, created_at: nil, references_display: nil)
+      # Initialized here (not mid-body) because run's rescue/ensure are
+      # method-level and must be able to reference them on any exit path.
+      result = nil
+      run_turn_started = false
+
       # Intercept /goal ... commands before any task/LLM work. Control-plane
       # commands (status/pause/resume/clear) return immediately without a turn;
       # `/goal <text>` sets the goal, then falls through to run the first turn.
@@ -494,6 +504,10 @@ module Clacky
       # subsequent `think` call will re-emit show_progress, which is an
       # idempotent update on the same progress UI element.
       @ui&.show_progress
+
+      # A reused agent may carry a cancel flag set by a previously-interrupted
+      # fan-out batch; a fresh task must start uncancelled.
+      @cancel_flag = CancelFlag.new
 
       # Start new task for Time Machine
       task_id = start_new_task(title: display_text.to_s.empty? ? user_input.to_s : display_text.to_s)
@@ -561,9 +575,12 @@ module Clacky
       all_disk_files = disk_files + downgraded
 
       # Format user message — text + inline vision images
-      # Store the tmp path alongside the data_url so the history replay can
-      # reconstruct the image if the base64 was stripped (e.g. after compression).
-      user_content = format_user_content(user_input, vision_images.map { |v| { url: v[:url], path: v[:path] } })
+      # Store the tmp path and original name alongside the data_url: the path supports
+      # normal replay, while the name becomes the lightweight badge after compression.
+      user_content = format_user_content(
+        user_input,
+        vision_images.map { |v| { url: v[:url], path: v[:path], name: v[:name] } }
+      )
 
       # Parse disk files — agent's responsibility, not the upload layer.
       # process_path runs the parser script and returns a FileRef with preview_path or parse_error.
@@ -577,10 +594,19 @@ module Clacky
         # "too large" note for downgraded images.
         downgrade_reason = f[:downgrade_reason] || f["downgrade_reason"]
         ocr_text         = f[:ocr_text]         || f["ocr_text"]
+        reference        = f[:reference]        || f["reference"]
+
+        # Directory references: capture only the path so the LLM can explore
+        # on demand with the read/shell tools.
+        if File.directory?(path.to_s)
+          next { name: name || File.basename(path.to_s), type: "directory", path: path.to_s,
+                 reference: reference }
+        end
+
         ref = Utils::FileProcessor.process_path(path, name: name)
         { name: ref.name, type: ref.type.to_s, path: ref.original_path,
           preview_path: ref.preview_path, parse_error: ref.parse_error, parser_path: ref.parser_path,
-          downgrade_reason: downgrade_reason, ocr_text: ocr_text }
+          downgrade_reason: downgrade_reason, ocr_text: ocr_text, reference: reference }
       end
 
       # Build display_files for replay: lightweight metadata so the UI can reconstruct
@@ -589,6 +615,10 @@ module Clacky
       # images (provider has no vision / too large / OCR'd) DO need path here so the
       # UI can re-render them from the on-disk copy across session switches.
       display_files = all_disk_files.filter_map do |f|
+        # @mention file/directory references are replayed from display_references
+        # (with mention badges), so skip them here to avoid double-rendering as
+        # plain attachment badges.
+        next if f[:reference] || f["reference"]
         name = f[:name] || f["name"]
         next unless name
         { name: name, type: f[:type] || f["type"] || "file",
@@ -612,7 +642,8 @@ module Clacky
                         display_text: display_text,
                         skill_command: skill_command[:found] ? skill_command[:skill_name] : nil,
                         skill_command_display: skill_command_display,
-                        display_files: display_files.empty? ? nil : display_files })
+                        display_files: display_files.empty? ? nil : display_files,
+                        display_references: Array(references_display).empty? ? nil : references_display })
       @total_tasks += 1
 
       # Inject disk file references as a system_injected message so:
@@ -637,6 +668,12 @@ module Clacky
           ocr_text         = f[:ocr_text]         || f["ocr_text"]
 
           next unless name
+
+          # Directory reference: emit only the path so the LLM can explore on
+          # demand with the read/shell tools.
+          if type == "directory"
+            next ["[Directory: #{name}]", "Path: #{path}"].join("\n")
+          end
 
           lines = ["[File: #{name}]", "Type: #{type || "file"}"]
           lines << "Size: #{format_size(size_bytes)}" if size_bytes
@@ -678,274 +715,295 @@ module Clacky
         end
       end
 
+      # Inject referenced past chats (the @mention "send as reference" behavior)
+      # as a system_injected message — same mechanism as file references: the LLM
+      # sees the context, but replay_history skips it and no user bubble renders.
+      Array(reference_contexts).each do |ctx|
+        next if ctx.to_s.strip.empty?
+        @history.append({ role: "user", content: ctx, system_injected: true, task_id: task_id })
+      end
+
+      run_turn_started = true
       # If the user typed a slash command targeting a skill with disable-model-invocation: true,
       # inject the skill content as a synthetic assistant message so the LLM can act on it.
       # Skills already in the system prompt (model_invocation_allowed?) are skipped.
+      # Covered by run's method-level ensure so a fork_subagent failure (e.g.
+      # skill-declared model not found) still stops the progress spinner.
       inject_skill_command_as_assistant_message(skill_command, task_id)
 
       @hooks.trigger(:on_start, user_input)
 
-      result = nil
-      begin
-        # Track if request_user_feedback was called
-        awaiting_user_feedback = false
-        # Track if task was interrupted by user (denied tool execution)
-        task_interrupted = false
+      # Track if ask_user was called
+      awaiting_user_feedback = false
+      # Heuristic sibling of the above: the reply merely ended with a question
+      # mark. Kept separate because it must never reach build_result — the
+      # session status it feeds shows a "waiting" badge to the user, and a
+      # rhetorical closing question is not a request for input.
+      turn_unfinished = false
+      # Track if task was interrupted by user (denied tool execution)
+      task_interrupted = false
 
-        loop do
-          @iterations += 1
-          @hooks.trigger(:on_iteration, @iterations)
+      loop do
+        Clacky::Shutdown.checkpoint!
+        @iterations += 1
+        @hooks.trigger(:on_iteration, @iterations)
 
-          # Think: LLM reasoning with tool support
-          response = think
+        # Think: LLM reasoning with tool support
+        response = think
 
-          # Debug: check for potential infinite loops
-          if @config.verbose
-            @ui&.log("Iteration #{@iterations}: finish_reason=#{response[:finish_reason]}, tool_calls=#{response[:tool_calls]&.size || 'nil'}", level: :debug)
+        # Debug: check for potential infinite loops
+        if @config.verbose
+          @ui&.log("Iteration #{@iterations}: finish_reason=#{response[:finish_reason]}, tool_calls=#{response[:tool_calls]&.size || 'nil'}", level: :debug)
+        end
+
+        # Skip if compression happened (response is nil)
+        next if response.nil?
+
+        # [DIAG] Only log when finish_reason=="stop" AND tool_calls non-empty —
+        # the suspicious combo that indicates an upstream-truncated tool_use
+        # response. Normal responses produce no log line here to avoid noise.
+        begin
+          tool_calls = response[:tool_calls] || []
+          if response[:finish_reason] == "stop" && !tool_calls.empty?
+            tc_summary = tool_calls.map do |c|
+              args_str = c[:arguments].is_a?(String) ? c[:arguments] : c[:arguments].to_s
+              {
+                name: c[:name].to_s,
+                args_len: args_str.length,
+                args_head: args_str[0, 120]
+              }
+            end
+            Clacky::Logger.warn("agent.think_response",
+                                session_id: @session_id,
+                                iteration: @iterations,
+                                finish_reason: response[:finish_reason].to_s,
+                                tool_calls_count: tool_calls.size,
+                                tool_calls: tc_summary,
+                                content_len: response[:content].to_s.length,
+                                completion_tokens: response.dig(:token_usage, :completion_tokens),
+                                ttft_ms: response.dig(:latency, :ttft_ms),
+                                suspicious_truncation: true
+                               )
           end
+        rescue StandardError => e
+          Clacky::Logger.warn("agent.think_response.log_failed", error: e.message)
+        end
 
-          # Skip if compression happened (response is nil)
-          next if response.nil?
-
-          # [DIAG] Only log when finish_reason=="stop" AND tool_calls non-empty —
-          # the suspicious combo that indicates an upstream-truncated tool_use
-          # response. Normal responses produce no log line here to avoid noise.
-          begin
-            tool_calls = response[:tool_calls] || []
-            if response[:finish_reason] == "stop" && !tool_calls.empty?
-              tc_summary = tool_calls.map do |c|
-                args_str = c[:arguments].is_a?(String) ? c[:arguments] : c[:arguments].to_s
-                {
-                  name: c[:name].to_s,
-                  args_len: args_str.length,
-                  args_head: args_str[0, 120]
-                }
-              end
-              Clacky::Logger.warn("agent.think_response",
-                session_id: @session_id,
-                iteration: @iterations,
-                finish_reason: response[:finish_reason].to_s,
-                tool_calls_count: tool_calls.size,
-                tool_calls: tc_summary,
-                content_len: response[:content].to_s.length,
-                completion_tokens: response.dig(:token_usage, :completion_tokens),
-                ttft_ms: response.dig(:latency, :ttft_ms),
-                suspicious_truncation: true
-              )
-            end
-          rescue StandardError => e
-            Clacky::Logger.warn("agent.think_response.log_failed", error: e.message)
+        # Detect fake tool-calls written as XML/text in content (model bug
+        # where it emits `<invoke name="...">` instead of using the
+        # structured tool_calls field). Only triggers when tool_calls is
+        # absent — a real call alongside stray XML is not our problem here.
+        if (response[:tool_calls].nil? || response[:tool_calls].empty?) &&
+            fake_tool_call_in_content?(response[:content])
+          case handle_fake_tool_call(response)
+          when :retry then next
+          when :stop then break
           end
+        end
 
-          # Detect fake tool-calls written as XML/text in content (model bug
-          # where it emits `<invoke name="...">` instead of using the
-          # structured tool_calls field). Only triggers when tool_calls is
-          # absent — a real call alongside stray XML is not our problem here.
-          if (response[:tool_calls].nil? || response[:tool_calls].empty?) &&
-             fake_tool_call_in_content?(response[:content])
-            case handle_fake_tool_call(response)
-            when :retry then next
-            when :stop then break
-            end
+        # Check if done (no more tool calls needed).
+        #
+        # Defensive rule: we ONLY exit on empty/missing tool_calls.
+        # We used to also short-circuit on finish_reason=="stop", but
+        # upstream routers (OpenRouter → Anthropic/Bedrock) can return the
+        # contradictory combo `finish_reason=="stop" + non-empty tool_calls
+        # with truncated args`, which caused the agent to silently treat a
+        # truncated response as "task complete". Truncation is now caught
+        # earlier by LlmCaller#detect_upstream_truncation! (which raises
+        # UpstreamTruncatedError → RetryableError); this branch stays as
+        # a belt-and-braces guard: if that detector ever misses a new
+        # truncation pattern, we still won't silently exit while the model
+        # is mid-tool_call.
+        if response[:tool_calls].nil? || response[:tool_calls].empty?
+          content_str = response[:content].to_s
+          stripped = content_str.strip
+          ends_with_question = stripped.end_with?("?", "？")
+          finish_reason_str = response[:finish_reason].to_s
+          completion_tokens = response.dig(:token_usage, :completion_tokens)
+
+          Clacky::Logger.info("agent.loop_break_normal",
+                              session_id: @session_id,
+                              iteration: @iterations,
+                              branch: (response[:tool_calls].nil? ? "tool_calls_nil" : "tool_calls_empty"),
+                              finish_reason: finish_reason_str,
+                              tool_calls_count: (response[:tool_calls] || []).size,
+                              completion_tokens: completion_tokens,
+                              max_tokens: @config.max_tokens,
+                              content_len: content_str.length,
+                              content_ends_with_question: ends_with_question
+                             )
+
+          if finish_reason_str == "length"
+            Clacky::Logger.warn("agent.loop_break_on_length",
+                                session_id: @session_id,
+                                iteration: @iterations,
+                                completion_tokens: completion_tokens,
+                                max_tokens: @config.max_tokens,
+                                content_len: content_str.length,
+                                content_tail: content_str[-200, 200]
+                               )
           end
-
-          # Check if done (no more tool calls needed).
-          #
-          # Defensive rule: we ONLY exit on empty/missing tool_calls.
-          # We used to also short-circuit on finish_reason=="stop", but
-          # upstream routers (OpenRouter → Anthropic/Bedrock) can return the
-          # contradictory combo `finish_reason=="stop" + non-empty tool_calls
-          # with truncated args`, which caused the agent to silently treat a
-          # truncated response as "task complete". Truncation is now caught
-          # earlier by LlmCaller#detect_upstream_truncation! (which raises
-          # UpstreamTruncatedError → RetryableError); this branch stays as
-          # a belt-and-braces guard: if that detector ever misses a new
-          # truncation pattern, we still won't silently exit while the model
-          # is mid-tool_call.
-          if response[:tool_calls].nil? || response[:tool_calls].empty?
-            content_str = response[:content].to_s
-            stripped = content_str.strip
-            ends_with_question = stripped.end_with?("?", "？")
-            finish_reason_str = response[:finish_reason].to_s
-            completion_tokens = response.dig(:token_usage, :completion_tokens)
-
-            Clacky::Logger.info("agent.loop_break_normal",
-              session_id: @session_id,
-              iteration: @iterations,
-              branch: (response[:tool_calls].nil? ? "tool_calls_nil" : "tool_calls_empty"),
-              finish_reason: finish_reason_str,
-              tool_calls_count: (response[:tool_calls] || []).size,
-              completion_tokens: completion_tokens,
-              max_tokens: @config.max_tokens,
-              content_len: content_str.length,
-              content_ends_with_question: ends_with_question
-            )
-
-            if finish_reason_str == "length"
-              Clacky::Logger.warn("agent.loop_break_on_length",
-                session_id: @session_id,
-                iteration: @iterations,
-                completion_tokens: completion_tokens,
-                max_tokens: @config.max_tokens,
-                content_len: content_str.length,
-                content_tail: content_str[-200, 200]
-              )
-            end
-            if response[:content] && !response[:content].empty?
-              emit_assistant_message(response[:content], reasoning_content: response[:reasoning_content])
-            end
-
-            # Show token usage after the assistant message so WebUI renders it below the bubble
-            @ui&.show_token_usage(response[:token_usage]) if response[:token_usage]
-
-            # Debug: log why we're stopping
-            if @config.verbose && (response[:tool_calls].nil? || response[:tool_calls].empty?)
-              reason = response[:finish_reason] == "stop" ? "API returned finish_reason=stop" : "No tool calls in response"
-              @ui&.log("Stopping: #{reason}", level: :debug)
-              if response[:content] && response[:content].is_a?(String)
-                preview = response[:content].length > 200 ? response[:content][0...200] + "..." : response[:content]
-                @ui&.log("Response content: #{preview}", level: :debug)
-              end
-            end
-
-            # If the assistant ended its turn with a question, treat this as
-            # an in-flight conversation (agent is awaiting the user's reply)
-            # and skip skill evolution — the task isn't truly complete yet.
-            awaiting_user_feedback = true if ends_with_question
-
-            break
-          end
-
-          # Show assistant message if there's content before tool calls
           if response[:content] && !response[:content].empty?
-            emit_assistant_message(response[:content], reasoning_content: response[:reasoning_content])
+            emit_assistant_message(response[:content], reasoning_content: response[:reasoning_content], created_at: response[:created_at])
           end
 
-          # Show token usage after assistant message (or immediately if no message).
-          # This ensures WebUI renders the token line below the assistant bubble.
+          # Show token usage after the assistant message so WebUI renders it below the bubble
           @ui&.show_token_usage(response[:token_usage]) if response[:token_usage]
 
-          # Act: Execute tool calls
-          action_result = act(response[:tool_calls])
-
-          # Check if request_user_feedback was called
-          if action_result[:awaiting_feedback]
-            awaiting_user_feedback = true
-            observe(response, action_result[:tool_results])
-            flush_pending_injections
-            break
-          end
-
-          # Observe: Add tool results to conversation context
-          observe(response, action_result[:tool_results])
-
-          # Flush any inline skill injections enqueued by invoke_skill during act().
-          # Must happen AFTER observe() so toolResult is appended before skill instructions,
-          # producing a legal message sequence for all API providers (especially Bedrock).
-          flush_pending_injections
-
-          # Check if user denied any tool
-          if action_result[:denied]
-            task_interrupted = true
-            # If user provided feedback, treat it as a user question/instruction
-            if action_result[:feedback] && !action_result[:feedback].empty?
-              # Add user feedback as a new user message with system_injected marker
-              @history.append({
-                role: "user",
-                content: "The user has a question/feedback for you: #{action_result[:feedback]}\n\nPlease respond to the user's question/feedback before continuing with any actions.",
-                system_injected: true
-              })
-              # Continue loop to let agent respond to feedback
-              next
-            else
-              # User just said "no" without feedback - stop and wait
-              @ui&.show_assistant_message("Tool execution was denied. Please give more instructions...", files: [])
-              break
+          # Debug: log why we're stopping
+          if @config.verbose && (response[:tool_calls].nil? || response[:tool_calls].empty?)
+            reason = response[:finish_reason] == "stop" ? "API returned finish_reason=stop" : "No tool calls in response"
+            @ui&.log("Stopping: #{reason}", level: :debug)
+            if response[:content] && response[:content].is_a?(String)
+              preview = response[:content].length > 200 ? response[:content][0...200] + "..." : response[:content]
+              @ui&.log("Response content: #{preview}", level: :debug)
             end
           end
+
+          # If the assistant ended its turn with a question, treat this as
+          # an in-flight conversation (agent is awaiting the user's reply)
+          # and skip skill evolution — the task isn't truly complete yet.
+          turn_unfinished = true if ends_with_question
+
+          break
         end
 
-      result = build_result
-
-        # Run skill evolution hooks after main loop completes
-        # Skip if task was interrupted by user (denied tool) or awaiting user feedback
-        # Only for main agent (not subagents) to avoid recursive evolution
-        unless @is_subagent || task_interrupted || awaiting_user_feedback
-          run_skill_evolution_hooks
+        # Show assistant message if there's content before tool calls
+        if response[:content] && !response[:content].empty?
+          emit_assistant_message(response[:content], reasoning_content: response[:reasoning_content], interim: true, created_at: response[:created_at])
         end
 
-        # Run long-term memory update as a forked subagent BEFORE we print
-        # show_complete. Running it as a subagent (rather than inline in
-        # the main loop) gives us correct visual ordering structurally:
-        # the subagent blocks until done, its progress spinner finishes,
-        # and only then [OK] Task Complete is printed. No cleanup dance,
-        # no cross-method progress handle holding.
-        # Skip on interrupt / feedback / subagent (self-guarded inside too).
-        unless @is_subagent || task_interrupted || awaiting_user_feedback
-          run_memory_update_subagent
+        # Show token usage after assistant message (or immediately if no message).
+        # This ensures WebUI renders the token line below the assistant bubble.
+        @ui&.show_token_usage(response[:token_usage]) if response[:token_usage]
+
+        # Act: Execute tool calls
+        action_result = act(response[:tool_calls])
+
+        # Check if ask_user was called
+        if action_result[:awaiting_feedback]
+          awaiting_user_feedback = true
+          observe(response, action_result[:tool_results])
+          flush_pending_injections
+          break
         end
 
-        if @is_subagent
-          # Parent agent (skill_manager) prints the completion summary; skip here.
-        else
-          @ui&.show_complete(
-            iterations: result[:iterations],
-            cost: result[:total_cost_usd],
-            cost_source: result[:cost_source],
-            duration: result[:duration_seconds],
-            cache_stats: result[:cache_stats],
-            awaiting_user_feedback: awaiting_user_feedback
-          )
+        # Observe: Add tool results to conversation context
+        observe(response, action_result[:tool_results])
+
+        # Flush any inline skill injections enqueued by invoke_skill during act().
+        # Must happen AFTER observe() so toolResult is appended before skill instructions,
+        # producing a legal message sequence for all API providers (especially Bedrock).
+        flush_pending_injections
+
+        # Check if user denied any tool
+        if action_result[:denied]
+          task_interrupted = true
+          # If user provided feedback, treat it as a user question/instruction
+          if action_result[:feedback] && !action_result[:feedback].empty?
+            # Add user feedback as a new user message with system_injected marker
+            @history.append({
+              role: "user",
+              content: "The user has a question/feedback for you: #{action_result[:feedback]}\n\nPlease respond to the user's question/feedback before continuing with any actions.",
+              system_injected: true
+            })
+            # Continue loop to let agent respond to feedback
+            next
+          else
+            # User just said "no" without feedback - stop and wait
+            @ui&.show_assistant_message("Tool execution was denied. Please give more instructions...", files: [])
+            break
+          end
         end
-        @hooks.trigger(:on_complete, result)
-
-        # Standing-goal loop: after a completed turn, ask the judge whether the
-        # goal is met. If not (and budget/health allow), auto-run the next turn
-        # in this same thread. Skipped for subagents and interrupts.
-        # awaiting_user_feedback (agent ended with '?') is intentionally not
-        # checked here - maybe_continue_goal is a no-op when no goal is active,
-        # and when one is active the judge decides done/continue, not punctuation.
-        unless @is_subagent || task_interrupted
-          continuation = maybe_continue_goal(result)
-          return continuation if continuation
-        end
-
-        result
-      rescue Clacky::AgentInterrupted
-        # Mark this run as interrupted so the next run() (e.g. user's
-        # supplementary message during a running task) keeps the existing
-        # task-start snapshot — the completion summary should reflect the
-        # entire task across the relay, not just the post-interrupt portion.
-        @last_run_interrupted = true
-        # Let CLI handle the interrupt message
-        raise
-      rescue StandardError => e
-        # Log complete error information to debug_logs for troubleshooting
-        @debug_logs << {
-          timestamp: Time.now.iso8601,
-          event: "agent_run_error",
-          error_class: e.class.name,
-          error_message: e.message,
-          backtrace: e.backtrace&.first(30) # Keep first 30 lines of backtrace
-        }
-        Clacky::Logger.error("agent_run_error", error: e)
-
-        # 400 errors mean our request was malformed — roll back history so the bad
-        # message is not replayed on the next user turn.
-        # Other errors (auth, network, etc.) leave history intact for retry.
-        @pending_error_rollback = true if e.is_a?(Clacky::BadRequestError)
-
-        # Build error result for session data, but let CLI handle error display
-        result = build_result(:error, error: e.message)
-        raise
-      ensure
-        # Safety net: ensure any lingering progress spinner is stopped.
-        @ui&.show_progress(phase: "done")
-
-        # Fire-and-forget telemetry after every agent run.
-        # Tracks daily active users (distinct devices per day) and task volume.
-        Clacky::Telemetry.task!(result: result)
       end
+
+      result = build_result(awaiting_user_feedback: awaiting_user_feedback)
+
+      # Run skill evolution hooks after main loop completes
+      # Skip if task was interrupted by user (denied tool) or awaiting user feedback
+      # Only for main agent (not subagents) to avoid recursive evolution
+      unless @is_subagent || task_interrupted || awaiting_user_feedback || turn_unfinished
+        run_skill_evolution_hooks
+      end
+
+      # Run long-term memory update as a forked subagent BEFORE we print
+      # show_complete. Running it as a subagent (rather than inline in
+      # the main loop) gives us correct visual ordering structurally:
+      # the subagent blocks until done, its progress spinner finishes,
+      # and only then [OK] Task Complete is printed. No cleanup dance,
+      # no cross-method progress handle holding.
+      # Skip on interrupt / feedback / subagent (self-guarded inside too).
+      unless @is_subagent || task_interrupted || awaiting_user_feedback || turn_unfinished
+        run_memory_update_subagent
+      end
+
+      if @is_subagent
+        # Parent agent (skill_manager) prints the completion summary; skip here.
+      else
+        @ui&.show_complete(
+          task_id: result[:task_id],
+          iterations: result[:iterations],
+          cost: result[:total_cost_usd],
+          cost_source: result[:cost_source],
+          duration: result[:duration_seconds],
+          cache_stats: result[:cache_stats],
+          awaiting_user_feedback: awaiting_user_feedback
+        )
+      end
+      @hooks.trigger(:on_complete, result)
+
+      # Standing-goal loop: after a completed turn, ask the judge whether the
+      # goal is met. If not (and budget/health allow), auto-run the next turn
+      # in this same thread. Skipped for subagents and interrupts.
+      # awaiting_user_feedback (agent ended with '?') is intentionally not
+      # checked here - maybe_continue_goal is a no-op when no goal is active,
+      # and when one is active the judge decides done/continue, not punctuation.
+      unless @is_subagent || task_interrupted
+        continuation = maybe_continue_goal(result)
+        return continuation if continuation
+      end
+
+      result
+    rescue Clacky::AgentInterrupted
+      # A cancelled fan-out captured its subagents' progress but never reached
+      # observe() to persist it — anchor those trails now so a page reload
+      # after the interrupt still shows what the subagents did.
+      flush_pending_subagent_transcripts_on_interrupt
+      # Mark this run as interrupted so the next run() (e.g. user's
+      # supplementary message during a running task) keeps the existing
+      # task-start snapshot — the completion summary should reflect the
+      # entire task across the relay, not just the post-interrupt portion.
+      @last_run_interrupted = true
+      # Let CLI handle the interrupt message
+      raise
+    rescue StandardError => e
+      # Log complete error information to debug_logs for troubleshooting
+      @debug_logs << {
+        timestamp: Time.now.iso8601,
+        event: "agent_run_error",
+        error_class: e.class.name,
+        error_message: e.message,
+        backtrace: e.backtrace&.first(30) # Keep first 30 lines of backtrace
+      }
+      Clacky::Logger.error("agent_run_error", error: e)
+
+      # 400 errors mean our request was malformed — roll back history so the bad
+      # message is not replayed on the next user turn.
+      # Other errors (auth, network, etc.) leave history intact for retry.
+      @pending_error_rollback = true if e.is_a?(Clacky::BadRequestError)
+
+      # Build error result for session data, but let CLI handle error display
+      result = build_result(:error, error: e.message)
+      raise
+    ensure
+      # Safety net: ensure any lingering progress spinner is stopped.
+      @ui&.show_progress(phase: "done")
+
+      # Fire-and-forget telemetry after every agent run.
+      # Tracks daily active users (distinct devices per day) and task volume.
+      # Guarded by run_turn_started so goal control commands (which return
+      # before the task turn) are not counted as agent runs.
+      Clacky::Telemetry.task!(result: result) if run_turn_started
     end
 
     private def think
@@ -1038,10 +1096,10 @@ module Clacky
           # Create a response that tells the user to break down the task
           error_response = {
             content: "I apologize, but this task is too complex to complete in a single response. " \
-                     "Please break it down into smaller steps, or reduce the amount of content to generate at once.\n\n" \
-                     "For example, when creating a long document:\n" \
-                     "1. First create the file with a basic structure\n" \
-                     "2. Then use edit() to add content section by section",
+            "Please break it down into smaller steps, or reduce the amount of content to generate at once.\n\n" \
+            "For example, when creating a long document:\n" \
+            "1. First create the file with a basic structure\n" \
+            "2. Then use edit() to add content section by section",
             finish_reason: "stop",
             tool_calls: nil
           }
@@ -1077,12 +1135,13 @@ module Clacky
         @history.append({
           role: "user",
           content: "[SYSTEM] Your previous response was truncated because it exceeded the output token limit (max_tokens=#{@config.max_tokens}). " \
-                   "The incomplete tool call has been discarded. Please retry with a different approach:\n" \
-                   "- For long file content: create the file with a basic structure first, then use edit() to add content section by section\n" \
-                   "- Break down large tasks into multiple smaller tool calls\n" \
-                   "- Keep each tool call argument under 2000 characters\n" \
-                   "- Use multiple tool calls instead of one large call",
-          truncated: true
+          "The incomplete tool call has been discarded. Please retry with a different approach:\n" \
+          "- For long file content: create the file with a basic structure first, then use edit() to add content section by section\n" \
+          "- Break down large tasks into multiple smaller tool calls\n" \
+          "- Keep each tool call argument under 2000 characters\n" \
+          "- Use multiple tool calls instead of one large call",
+          truncated: true,
+          system_injected: true
         })
 
         # Close the current spinner so the warning appears cleanly;
@@ -1095,7 +1154,11 @@ module Clacky
       end
 
       # Add assistant response to history
-      msg = { role: "assistant", task_id: @current_task_id }
+      created_at = Time.now.to_f
+      msg = { role: "assistant", task_id: @current_task_id, created_at: created_at }
+      # Surface the storage timestamp to the caller so the live UI emit uses
+      # the same created_at that replay will later read back from history.
+      response[:created_at] = created_at
       # Always include content field (some APIs require it even with tool_calls)
       # Use empty string instead of null for better compatibility
       msg[:content] = response[:content] || ""
@@ -1142,6 +1205,7 @@ module Clacky
     # to history — guarantees a stale thread cannot corrupt history with
     # tool messages that no longer have a matching assistant tool_calls.
     private def check_stale!
+      raise Clacky::AgentInterrupted, "Fan-out batch cancelled by a newer task" if @cancel_flag&.cancelled?
       return unless @task_thread
       return if Thread.current == @task_thread
       raise Clacky::AgentInterrupted, "Task superseded by a newer task on another thread"
@@ -1217,18 +1281,18 @@ module Clacky
             remaining_calls = tool_calls[(index + 1)..-1] || []
             remaining_calls.each do |remaining_call|
               reason = user_feedback && !user_feedback.empty? ?
-                       user_feedback :
-                       "Auto-denied due to user rejection of previous tool"
+                user_feedback :
+                "Auto-denied due to user rejection of previous tool"
               results << build_denied_result(remaining_call, reason, system_injected)
             end
             break
           end
         end
 
-        # Special handling for request_user_feedback
+        # Special handling for the ask_user family
         # The interactive countdown (auto_approve) is handled after the tool
         # executes, once the question itself has been rendered to the user.
-        unless call[:name] == "request_user_feedback"
+        unless Tools::AskUser.feedback_tool?(call[:name])
           @ui&.show_tool_call(call[:name], redact_tool_args(call[:arguments]))
         end
 
@@ -1250,6 +1314,11 @@ module Clacky
           if call[:name] == "invoke_skill"
             args[:agent] = self
             args[:skill_loader] = @skill_loader
+            args[:tool_call_id] = call[:id]
+          end
+
+          # Same anchor for extension tools that fan out to their own subagents.
+          if tool && tool.class.respond_to?(:receives_tool_call_id) && tool.class.receives_tool_call_id
             args[:tool_call_id] = call[:id]
           end
 
@@ -1318,10 +1387,13 @@ module Clacky
             @ui&.update_todos(@todos.dup) unless action == "list"
           end
 
-          # Special handling for request_user_feedback: emit as interactive feedback card
-          if call[:name] == "request_user_feedback"
+          # Special handling for ask_user: emit as interactive feedback card.
+          # A rejected call (no usable question) falls through to the normal
+          # result path so the model sees the error and can retry.
+          if Tools::AskUser.feedback_tool?(call[:name]) &&
+              result.is_a?(Hash) && result[:awaiting_feedback]
             # Pass the raw call arguments to show_tool_call so the WebUI controller
-            # can extract question/context/options and emit a "request_feedback" event
+            # can extract the questions and emit a "request_feedback" event
             # (renders as a clickable card in the browser).
             # Fallback UIs (terminal, IM channels) receive the formatted text message.
             @ui&.show_tool_call(call[:name], call[:arguments])
@@ -1455,24 +1527,46 @@ module Clacky
       end
     end
 
-    # Attach captured subagent transcripts (set by execute_skill_with_subagent)
-    # to their own invoke_skill tool result messages just appended by observe().
-    # Each transcript rides on its tool message as :subagent_transcript — an
-    # internal field stripped before the LLM call but persisted to session.json
-    # and replayed to the WebUI. Keyed by tool_call_id so a turn with several
-    # invoke_skill calls attaches each subagent's trail to the call that spawned
-    # it. Consumed entries are deleted so each fires exactly once.
+    # Attach captured subagent transcripts (set by execute_skill_with_subagent
+    # and fan_out_labeled) to the tool result messages just appended by
+    # observe(). Each transcript rides on its tool message as an internal field
+    # stripped before the LLM call but persisted to session.json and replayed to
+    # the WebUI. Keyed by tool_call_id so a turn with several such calls attaches
+    # each trail to the call that spawned it. Consumed entries are deleted so
+    # each fires exactly once.
+    # A single subagent is just a batch of one, so both invoke_skill and
+    # fan-out land in the same buffer and the same message field.
     private def attach_pending_subagent_transcripts(response)
       return if @pending_subagent_transcripts.empty?
 
+      # Not filtered by tool name: any tool may spawn subagents, and the
+      # tool_call_id it recorded under is already the anchor.
       Array(response[:tool_calls]).each do |tc|
-        next unless (tc[:name] || tc.dig(:function, :name)) == "invoke_skill"
+        batch = @subagent_transcripts_mutex.synchronize { @pending_subagent_transcripts.delete(tc[:id]) }
+        next if batch.nil? || batch.empty?
 
-        transcript = @pending_subagent_transcripts.delete(tc[:id])
-        next unless transcript
-
-        @history.attach_to_tool_result(tc[:id], :subagent_transcript, transcript)
+        @history.attach_to_tool_result(tc[:id], :subagent_transcript, batch.sort_by { |t| t[:index] || 0 })
       end
+    end
+
+    # Interrupt-path counterpart to attach_pending_subagent_transcripts: a
+    # cancelled fan-out never reaches observe(), so its captured job trails
+    # would otherwise die in @pending_subagent_transcripts (memory only) and
+    # vanish on the next page reload. Anchor whatever was captured onto the
+    # last history message so it persists to session.json and replays.
+    private def flush_pending_subagent_transcripts_on_interrupt
+      pending = @subagent_transcripts_mutex.synchronize do
+        snapshot = @pending_subagent_transcripts.dup
+        @pending_subagent_transcripts.clear
+        snapshot
+      end
+      return if pending.empty?
+
+      by_id = {}
+      pending.each { |id, trails| by_id[id] = Array(trails).sort_by { |t| t[:index] || 0 } }
+      @history.settle_interrupted_tool_calls(by_id)
+    rescue StandardError => e
+      Clacky::Logger.warn("agent.flush_subagent_transcripts_failed", error: e.message)
     end
 
     # Cap oversized tool result content to keep a single tool message from
@@ -1489,6 +1583,12 @@ module Clacky
     # and the final error summary.
     TERMINAL_HEAD_CHARS = 40_000
     TERMINAL_TAIL_CHARS = 40_000
+
+    # Per-subagent transcript budget. Mirrors the intent of
+    # MessageHistory::MAX_EXT_EVENTS_PER_MESSAGE: milestones are worth keeping,
+    # runaway trails are not. A fan-out stores one of these per job.
+    MAX_TRANSCRIPT_EVENTS = 200
+    MAX_TRANSCRIPT_BYTES  = 64 * 1024
 
     private def truncate_oversized_tool_content(msg, tool_name: nil)
       content = msg[:content]
@@ -1585,13 +1685,14 @@ module Clacky
       !@start_time.nil?
     end
 
-    private def build_result(status = :success, error: nil)
+    private def build_result(status = :success, error: nil, awaiting_user_feedback: false)
       task_iterations = @iterations - (@task_start_iterations || 0)
       task_cost = @total_cost - (@task_start_cost || 0)
 
       {
         status: status,
         session_id: @session_id,
+        task_id: @current_task_id,
         model: current_model,
         provider: current_provider,
         iterations: task_iterations,
@@ -1600,7 +1701,8 @@ module Clacky
         cost_source: @task_cost_source,
         cache_stats: @task_cache_stats || @cache_stats,
         history: @history,
-        error: error
+        error: error,
+        awaiting_user_feedback: awaiting_user_feedback
       }
     end
 
@@ -1639,9 +1741,9 @@ module Clacky
       @tool_registry.register(Tools::WebSearch.new)
       @tool_registry.register(Tools::WebFetch.new)
       @tool_registry.register(Tools::TodoManager.new)
-      @tool_registry.register(Tools::RequestUserFeedback.new)
+      @tool_registry.register(Tools::AskUser.new)
       @tool_registry.register(Tools::InvokeSkill.new)
-      @tool_registry.register(Tools::Browser.new)
+      @tool_registry.register(Tools::Browser.new) if Tools::Browser.available?
     end
 
     # Register tools the agent declared via `tools:` — each id maps to
@@ -1662,7 +1764,7 @@ module Clacky
         @tool_registry.register(tool)
       rescue StandardError, ScriptError => e
         Clacky::Logger.warn("agent.register_extension_tool",
-          error: e.message, tool: id)
+                            error: e.message, tool: id)
       end
     end
 
@@ -1718,11 +1820,16 @@ module Clacky
     # the jobs over — forking deep-copies parent config + history, which must
     # not race. Only the blocking run belongs in the lambda.
     #
-    # @param jobs [Array<Hash>] each { label: String, run: #call }
+    # Pass :subagent alongside :run (and a tool_call_id) to have each job's
+    # message trail persisted onto the tool result, so the WebUI can replay the
+    # whole batch after a reload instead of just the collapsed return values.
+    #
+    # @param jobs [Array<Hash>] each { label: String, run: #call, subagent: Agent (optional) }
     # @param max_concurrency [Integer] jobs allowed to run at once
     # @param timeout [Numeric, nil] wall-clock budget for the whole batch
+    # @param tool_call_id [String, nil] anchors persisted transcripts to this tool call
     # @return [Array<Fanout::Result>] aligned to the input order
-    def fan_out_labeled(jobs, max_concurrency: Fanout::DEFAULT_MAX_CONCURRENCY, timeout: nil)
+    def fan_out_labeled(jobs, max_concurrency: Fanout::DEFAULT_MAX_CONCURRENCY, timeout: nil, tool_call_id: nil)
       return [] if jobs.empty?
 
       # Fanout workers are fresh threads, so the epoch that lets the web
@@ -1733,21 +1840,44 @@ module Clacky
       wrapped = jobs.each_with_index.map do |job, index|
         label = job[:label] || job["label"] || "Subagent #{index + 1}/#{jobs.size}"
         run = job[:run] || job["run"]
+        subagent = job[:subagent] || job["subagent"]
         raise ArgumentError, "job #{index} must provide a callable :run" unless run.respond_to?(:call)
 
         lambda do
           Thread.current[:task_epoch] = epoch
-          within_phase(label, kind: "fanout_subagent", concurrent: true) { run.call }
+          begin
+            within_phase(label, kind: "fanout_subagent", concurrent: true) { run.call }
+          ensure
+            # Runs in ensure so a job that raised still leaves a trail — a failed
+            # subagent is exactly the one worth inspecting afterwards.
+            record_subagent_transcript(tool_call_id, subagent, label, index: index) if subagent
+          end
         end
       end
 
-      Fanout.new(max_concurrency: max_concurrency, timeout: timeout).run(wrapped)
+      Fanout.new(max_concurrency: max_concurrency, timeout: timeout)
+        .run(wrapped, on_cancel: -> { @cancel_flag&.cancel! })
     end
 
     private def within_phase(label, kind:, concurrent:, &block)
       return yield unless @ui.respond_to?(:with_phase)
 
       @ui.with_phase(kind: kind, label: label, concurrent: concurrent, &block)
+    end
+
+    # Called from fan-out worker threads, hence the mutex. Slots are keyed by
+    # job index so the persisted order matches the caller's job order rather
+    # than completion order.
+    def record_subagent_transcript(tool_call_id, subagent, label, index: 0)
+      return unless tool_call_id
+
+      transcript = extract_subagent_transcript(subagent, label)
+      transcript[:index] = index
+      @subagent_transcripts_mutex.synchronize do
+        (@pending_subagent_transcripts[tool_call_id] ||= []) << transcript
+      end
+    rescue StandardError => e
+      Clacky::Logger.warn("agent.subagent_transcript_failed", error: e.message, label: label)
     end
 
     # The subagent's last non-empty assistant message — its actual answer.
@@ -1828,12 +1958,15 @@ module Clacky
       end
 
       # Create new client for subagent
+      subagent_entry = subagent_config.current_model
       subagent_client = Clacky::Client.new(
         subagent_config.api_key,
         base_url: subagent_config.base_url,
         model: subagent_config.model_name,
         anthropic_format: subagent_config.anthropic_format?,
-        api_format: subagent_config.api_format
+        api_format: subagent_config.api_format,
+        provider_id: subagent_config.provider_id_for(subagent_entry),
+        capabilities: subagent_entry && subagent_entry["capabilities"]
       )
 
       # Create subagent (reuses all tools from parent, inherits agent profile from parent)
@@ -1848,6 +1981,10 @@ module Clacky
         source: @source
       )
       subagent.instance_variable_set(:@is_subagent, true)
+
+      # Share the parent's cancel flag so a fan-out interrupt reaches this
+      # subagent on its worker thread — its own check_stale! polls the same flag.
+      subagent.instance_variable_set(:@cancel_flag, @cancel_flag)
 
       # Inherit previous_total_tokens so the first iteration delta is calculated correctly
       subagent.instance_variable_set(:@previous_total_tokens, @previous_total_tokens)
@@ -1875,11 +2012,11 @@ module Clacky
 
         # Build forbidden tools notice if any tools are forbidden
         forbidden_notice = if forbidden_tools.any?
-          tool_list = forbidden_tools.map { |t| "`#{t}`" }.join(", ")
-          "\n\n[System Notice] The following tools are disabled in this subagent and will be rejected if called: #{tool_list}"
-        else
-          ""
-        end
+                             tool_list = forbidden_tools.map { |t| "`#{t}`" }.join(", ")
+                             "\n\n[System Notice] The following tools are disabled in this subagent and will be rejected if called: #{tool_list}"
+                           else
+                             ""
+                           end
 
         subagent_history.append({
           role: "user",
@@ -1982,8 +2119,32 @@ module Clacky
         skill: skill_identifier,
         iterations: subagent.iterations,
         cost_usd: subagent.total_cost.round(4),
-        events: events
+        events: cap_transcript_events(events)
       }
+    end
+
+    # session.json is rewritten in full on every save, so a transcript has to
+    # stay bounded — a fan-out of chatty subagents would otherwise multiply an
+    # unbounded trail by the batch size. Oldest events are dropped first: the
+    # tail is what explains how the subagent ended up where it did.
+    private def cap_transcript_events(events)
+      kept = events.last(MAX_TRANSCRIPT_EVENTS)
+      dropped = events.size - kept.size
+
+      budget = MAX_TRANSCRIPT_BYTES
+      kept = kept.reverse.take_while do |entry|
+        budget -= transcript_entry_bytes(entry)
+        budget.positive?
+      end.reverse
+      dropped = events.size - kept.size
+
+      return kept if dropped.zero?
+
+      [{ role: "system", content: "[#{dropped} earlier event(s) omitted]" }] + kept
+    end
+
+    private def transcript_entry_bytes(entry)
+      entry[:content].to_s.bytesize + Array(entry[:tool_calls]).sum { |tc| tc[:arguments].to_s.bytesize }
     end
 
     # Deep clone helper for messages using Marshal
@@ -2115,7 +2276,10 @@ module Clacky
       begin
         Clacky::Vision::Resolver.new(ocr_entry).describe(image)
       ensure
-        @ui&.show_progress(phase: "done")
+        # Must pass progress_type: "vision" — the UI's legacy shim pairs
+        # active/done by type, so a bare done would leave the OCR spinner
+        # frozen forever (same trap as the old retrying-slot bug).
+        @ui&.show_progress(progress_type: "vision", phase: "done")
       end
     end
 
@@ -2197,10 +2361,10 @@ module Clacky
 
     # Build user message content for LLM.
     # Returns plain String when no vision images; Array of content parts otherwise.
-    # Build user message content for LLM.
-    # vision_images: Array of String (plain url) OR Hash { url:, path: }
-    # path is stored in the block so history replay can reconstruct the image
-    # from the tmp file when the base64 data_url is no longer available.
+    # vision_images: Array of String (plain url) OR Hash { url:, path:, name: }
+    # path is stored so normal history replay can reconstruct the image; name is
+    # lightweight metadata used for an archived badge after compression. Both
+    # fields are stripped by MessageHistory before the content reaches the API.
     private def format_user_content(text, vision_images)
       vision_images ||= []
 
@@ -2212,6 +2376,7 @@ module Clacky
         if img.is_a?(Hash)
           block = { type: "image_url", image_url: { url: img[:url] } }
           block[:image_path] = img[:path] if img[:path]
+          block[:image_name] = img[:name] if img[:name]
           content << block
         else
           content << { type: "image_url", image_url: { url: img } }
@@ -2323,7 +2488,7 @@ module Clacky
     # and cannot load file:// directly) and must stay scoped to the Web UI
     # controller. IM channel subscribers need the original file:// markdown so
     # parse_file_links can extract paths and deliver images as native attachments.
-    private def emit_assistant_message(content, reasoning_content: nil)
+    private def emit_assistant_message(content, reasoning_content: nil, interim: false, created_at: nil)
       # Prepend reasoning/thinking content (from thinking-mode providers like
       # DeepSeek V4, Kimi K2) wrapped in <think> tags so the Web UI renders it
       # as a collapsible thinking block (see sessions.js _renderMarkdown).
@@ -2336,7 +2501,7 @@ module Clacky
       return if full_content.nil? || full_content.to_s.strip.empty?
 
       parsed = parse_file_links(content)
-      @ui&.show_assistant_message(full_content, files: parsed[:files])
+      @ui&.show_assistant_message(full_content, files: parsed[:files], interim: interim, created_at: created_at)
     end
 
     # Record BEFORE-change snapshots for any file a tool is about to mutate,

@@ -15,7 +15,10 @@ module Clacky
       subagent_instructions subagent_result subagent_transcript token_usage
       compressed_summary chunk_path truncated transient
       chunk_index chunk_count ext_events skill_command skill_command_display
+      display_files display_references
     ].freeze
+
+    INTERNAL_CONTENT_BLOCK_FIELDS = %i[image_path image_name].freeze
 
     # Cap on persisted ext_events per message. These are milestone events
     # (progress chatter is transient), so a handful per message is the norm —
@@ -93,6 +96,43 @@ module Clacky
             m[:content].any? { |b| b.is_a?(Hash) && b[:type] == "tool_result" && b[:tool_use_id] == tool_call_id })
       end
       msg[key] = value if msg
+      self
+    end
+
+    # Settle an interrupted fan-out whose assistant.tool_calls turn is dangling
+    # because the batch was cancelled before any tool result was written. Mirrors
+    # repair_tool_call_pairing (same helpers, same scan) but PERSISTS the result:
+    # for each unanswered tool_call_id it appends a real tool result into
+    # @messages marking it interrupted, riding any captured subagent trails on
+    # the matching one — the same anchor the normal completion path uses. This
+    # keeps the turn protocol-valid so drop_dangling_tool_calls! leaves it alone,
+    # and lets replay render the transcripts. transcripts_by_id maps
+    # tool_call_id => [trail, ...]. No-op unless the last message is a dangling
+    # assistant.tool_calls turn.
+    def settle_interrupted_tool_calls(transcripts_by_id = {})
+      return self unless pending_tool_calls?
+
+      assistant = @messages.last
+      expected_ids = Array(assistant[:tool_calls]).map { |tc| tc[:id] }.compact
+      answered = []
+      @messages.reverse_each do |m|
+        break if m.equal?(assistant)
+
+        answered.concat(tool_result_ids(m)) if tool_result_message?(m)
+      end
+
+      (expected_ids - answered).each do |id|
+        result = {
+          role: "tool",
+          tool_call_id: id,
+          content: '{"interrupted":true,"message":"Interrupted by user before completion"}',
+          task_id: assistant[:task_id],
+          created_at: Time.now.to_f
+        }
+        trails = transcripts_by_id[id]
+        result[:subagent_transcript] = Array(trails) if trails && !trails.empty?
+        @messages << deep_sanitize_utf8(result)
+      end
       self
     end
 
@@ -320,7 +360,9 @@ module Clacky
           next nil
         end
 
-        block.key?(:image_path) ? block.reject { |k, _| k == :image_path } : block
+        next block if (block.keys & INTERNAL_CONTENT_BLOCK_FIELDS).empty?
+
+        block.reject { |key, _| INTERNAL_CONTENT_BLOCK_FIELDS.include?(key) }
       end
 
       return msg if cleaned == content

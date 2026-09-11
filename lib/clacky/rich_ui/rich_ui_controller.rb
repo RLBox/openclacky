@@ -201,7 +201,7 @@ module Clacky
       end
     end
 
-    def show_assistant_message(content, files:)
+    def show_assistant_message(content, files:, interim: false, created_at: nil)
       thinking_text, clean_text = extract_thinking_and_content(content)
       unless thinking_text.to_s.strip.empty?
         # Show live thinking with spinner + timer in fixed area
@@ -312,7 +312,7 @@ module Clacky
       @shell.sidebar.update_context(token_data) if @shell.sidebar
     end
 
-    def show_complete(iterations:, cost:, duration: nil, cache_stats: nil, awaiting_user_feedback: false, cost_source: nil)
+    def show_complete(iterations:, cost:, duration: nil, cache_stats: nil, awaiting_user_feedback: false, cost_source: nil, task_id: nil)
       set_idle_status
       return if awaiting_user_feedback || iterations <= 5
 
@@ -496,7 +496,7 @@ module Clacky
         when :add
           new_model = show_model_edit_form(nil, test_callback: test_callback)
           if new_model
-            anthropic_format = new_model[:provider] == "anthropic"
+            anthropic_format = new_model[:provider] == Clacky::Providers::ANTHROPIC_ID
             current_config.add_model(
               model: new_model[:model],
               api_key: new_model[:api_key],
@@ -567,7 +567,7 @@ module Clacky
       id = @shell.add_markdown("", streaming: true)
       return @shell.add_markdown(markdown) unless id
 
-      thread = Thread.new do
+      thread = Clacky::ThreadRegistry.spawn(name: "richui-stream-markdown") do
         Thread.current.report_on_exception = false
         begin
           markdown.each_char.each_slice(STREAMING_MARKDOWN_CHUNK_SIZE) do |chars|
@@ -596,7 +596,7 @@ module Clacky
     def add_file_summary_after(stream_thread, files)
       return if Array(files).empty?
 
-      thread = Thread.new do
+      thread = Clacky::ThreadRegistry.spawn(name: "richui-file-summary") do
         Thread.current.report_on_exception = false
         begin
           stream_thread.join
@@ -651,7 +651,7 @@ module Clacky
       @shell.callbacks[:clear_ctrlc] = -> { @ctrl_c_warning = nil }
 
       @shell.callbacks[:model_switch] = -> {
-        Thread.new do
+        Clacky::ThreadRegistry.spawn(name: "richui-model-switch") do
           result = show_model_switch_dialog
           if result
             @config[:model] = result[:model]
@@ -706,7 +706,7 @@ module Clacky
 
     def run_callback_async(&block)
       @callback_threads.reject! { |thread| !thread.alive? }
-      @callback_threads << Thread.new do
+      @callback_threads << Clacky::ThreadRegistry.spawn(name: "richui-callback") do
         block.call
       rescue StandardError => e
         show_error(e.message)

@@ -10,15 +10,27 @@ module Clacky
 
     attr_reader :provider_id
 
-    def initialize(api_key, base_url:, model:, anthropic_format: false, api_format: nil, read_timeout: nil)
+    # @param provider_id [String, nil] explicit provider preset id from the
+    #   model card. When it names a known preset it wins over base_url/api_key
+    #   heuristics, so a custom base_url still inherits the preset's capability
+    #   table (e.g. vision support). nil falls back to base_url inference.
+    # @param capabilities [Hash, nil] explicit capability declarations from the
+    #   model card (e.g. { "vision" => false }). These win over both provider_id
+    #   and base_url inference, so a custom gateway can declare "text-only"
+    #   without matching any preset.
+    def initialize(api_key, base_url:, model:, anthropic_format: false, api_format: nil, read_timeout: nil, provider_id: nil, capabilities: nil)
       @api_key = api_key
       @base_url = base_url
       @model = model
+      @capabilities = capabilities.is_a?(Hash) ? capabilities : nil
       # Detect Bedrock: ABSK key prefix (native AWS) or abs- model prefix (Clacky AI proxy)
       @use_bedrock = MessageFormat::Bedrock.bedrock_api_key?(api_key, model)
 
       # Resolve provider once — reused for capability + api-type lookups.
-      provider_id = Providers.resolve_provider(base_url: @base_url, api_key: @api_key)
+      # An explicit provider_id naming a known preset wins over base_url
+      # inference (mirrors AgentConfig#provider_id_for); unknown/blank values
+      # fall through to the historical base_url/api_key heuristics.
+      provider_id = Providers.preset?(provider_id) ? provider_id : Providers.resolve_provider(base_url: @base_url, api_key: @api_key)
 
       # Decide the transport format: an explicit user-selected api_format wins
       # over provider preset resolution; the legacy anthropic_format boolean is
@@ -32,6 +44,7 @@ module Clacky
       effective_api_format ||= "anthropic-messages" if anthropic_format
       resolved_type = Providers.api_type_for_model(provider_id, @model, user_override: effective_api_format)
       @use_anthropic_format = resolved_type == "anthropic-messages"
+      @use_responses_format = resolved_type == "openai-responses"
 
       # Remember the provider id so we can tune connection headers below
       # (OpenRouter's /v1/messages accepts either Bearer or x-api-key, but
@@ -54,6 +67,12 @@ module Clacky
       @use_anthropic_format && !@use_bedrock
     end
 
+    # Returns true when the client talks to the OpenAI Responses API
+    # (/v1/responses) instead of Chat Completions.
+    def responses_format?(model = nil)
+      @use_responses_format && !@use_bedrock
+    end
+
     # ── Connection test ───────────────────────────────────────────────────────
 
     # Test API connection by sending a minimal request.
@@ -69,6 +88,11 @@ module Clacky
         minimal_body = { model: api_model, max_tokens: 16,
                          messages: [{ role: "user", content: "hi" }] }.to_json
         response = anthropic_connection.post(anthropic_messages_path) { |r| r.body = minimal_body }
+      elsif responses_format?
+        minimal_body = MessageFormat::OpenAIResponses.build_request_body(
+          [{ role: "user", content: "hi" }], api_model, [], 16, false
+        ).to_json
+        response = openai_connection.post("responses") { |r| r.body = minimal_body }
       else
         minimal_body = { model: api_model, max_tokens: 16,
                          messages: [{ role: "user", content: "hi" }] }.to_json
@@ -91,7 +115,7 @@ module Clacky
     end
 
     # Send a messages array and return the reply text.
-    def send_messages(messages, model:, max_tokens:)
+    def send_messages(messages, model:, max_tokens:, reasoning_effort: nil)
       api_model = Providers.resolve_api_model(base_url: @base_url, api_key: @api_key, model: model)
       if bedrock?
         body     = MessageFormat::Bedrock.build_request_body(messages, api_model, [], max_tokens)
@@ -101,8 +125,12 @@ module Clacky
         body     = MessageFormat::Anthropic.build_request_body(messages, api_model, [], max_tokens, false)
         response = anthropic_connection.post(anthropic_messages_path) { |r| r.body = body.to_json }
         parse_simple_anthropic_response(response)
+      elsif responses_format?
+        body     = MessageFormat::OpenAIResponses.build_request_body(messages, api_model, [], max_tokens, false)
+        response = openai_connection.post("responses") { |r| r.body = body.to_json }
+        parse_simple_openai_responses_response(response)
       else
-        body     = { model: api_model, max_tokens: max_tokens, messages: messages }
+        body     = MessageFormat::OpenAI.build_request_body(messages, api_model, [], max_tokens, false, reasoning_effort: reasoning_effort)
         response = openai_connection.post("chat/completions") { |r| r.body = body.to_json }
         parse_simple_openai_response(response)
       end
@@ -152,6 +180,9 @@ module Clacky
         elsif anthropic_format?
           streaming_used = !on_chunk.nil?
           send_anthropic_request(cloned, api_model, tools, max_tokens, caching_enabled, reasoning_effort: reasoning_effort, on_chunk: wrapped_on_chunk)
+        elsif responses_format?
+          streaming_used = !on_chunk.nil?
+          send_openai_responses_request(cloned, api_model, tools, max_tokens, caching_enabled, reasoning_effort: reasoning_effort, on_chunk: wrapped_on_chunk, capability_model: model)
         else
           streaming_used = !on_chunk.nil?
           send_openai_request(cloned, api_model, tools, max_tokens, caching_enabled, reasoning_effort: reasoning_effort, on_chunk: wrapped_on_chunk, capability_model: model)
@@ -194,6 +225,8 @@ module Clacky
         MessageFormat::Bedrock.format_tool_results(response, tool_results)
       elsif anthropic_format?
         MessageFormat::Anthropic.format_tool_results(response, tool_results)
+      elsif responses_format?
+        MessageFormat::OpenAIResponses.format_tool_results(response, tool_results)
       else
         MessageFormat::OpenAI.format_tool_results(response, tool_results)
       end
@@ -251,6 +284,7 @@ module Clacky
       response = bedrock_connection.post(bedrock_stream_endpoint(model)) do |req|
         req.body = stream_body.to_json
         req.options.on_data = proc do |chunk, _bytes_received, _env|
+          Clacky::Shutdown.checkpoint!
           sse_buf << chunk
           drain_sse_frames(sse_buf) { |event, data| aggregator.handle(event, data) }
         end
@@ -308,6 +342,7 @@ module Clacky
         req.headers["Accept"] = "text/event-stream"
         req.body = stream_body.to_json
         req.options.on_data = proc do |chunk, _bytes_received, _env|
+          Clacky::Shutdown.checkpoint!
           sse_buf << chunk
           drain_sse_frames(sse_buf) { |event, data| aggregator.handle(event, data) }
         end
@@ -358,9 +393,10 @@ module Clacky
       # table can't match — so the caller passes the display name separately
       # via capability_model to keep the vision judgement accurate.
       cap_model = capability_model || model
+      vision_supported = capability_supported?(:vision, cap_model)
       body = MessageFormat::OpenAI.build_request_body(
         messages, model, tools, max_tokens, caching_enabled,
-        vision_supported: Providers.supports?(@provider_id, :vision, model_name: cap_model),
+        vision_supported: vision_supported,
         reasoning_effort: reasoning_effort
       )
       return send_openai_stream_request(body, on_chunk) if on_chunk
@@ -372,6 +408,24 @@ module Clacky
 
       parsed_body = safe_json_parse(response.body, context: "LLM response")
       MessageFormat::OpenAI.parse_response(parsed_body)
+    end
+
+    # Whether the target model supports a capability. Resolution order mirrors
+    # AgentConfig#current_model_supports? so the client and agent agree:
+    #   1. explicit `capabilities` declared on the model card win
+    #      (e.g. { "vision" => false } on a custom text-only gateway)
+    #   2. provider preset capability table (via provider_id / base_url inference)
+    #   3. conservative default true (unknown provider assumed capable)
+    #
+    # @param capability [Symbol] capability name (e.g. :vision)
+    # @param cap_model [String, nil] display model name for preset lookups
+    # @return [Boolean]
+    private def capability_supported?(capability, cap_model)
+      if @capabilities
+        key = capability.to_s
+        return @capabilities[key] != false if @capabilities.key?(key)
+      end
+      Providers.supports?(@provider_id, capability, model_name: cap_model)
     end
 
     # Streaming variant for OpenAI-compatible chat completions (DeepSeek/OpenRouter
@@ -386,6 +440,7 @@ module Clacky
       response = openai_connection.post("chat/completions") do |req|
         req.body = stream_body.to_json
         req.options.on_data = proc do |chunk, _bytes_received, _env|
+          Clacky::Shutdown.checkpoint!
           sse_buf << chunk
           drain_sse_frames(sse_buf) { |_event, data| aggregator.handle(data) }
         end
@@ -421,6 +476,92 @@ module Clacky
         end
         raise RetryableError,
           "Upstream OpenAI-compatible response missing choices[0].message.content. " \
+          "Body snippet: #{snippet}"
+      end
+      content
+    end
+
+    # ── OpenAI Responses API request / response ───────────────────────────────
+
+    def send_openai_responses_request(messages, model, tools, max_tokens, caching_enabled,
+                                      reasoning_effort: nil, on_chunk: nil, capability_model: nil)
+      # Override max_tokens when the model declares a higher output ceiling
+      model_for_limit = capability_model || model
+      model_limit = Providers.max_output_for(model_for_limit)
+      max_tokens = model_limit if model_limit
+
+      # Deliberately no apply_message_caching here: the Responses API does
+      # not recognize Anthropic-style cache_control markers, and OpenAI's
+      # Responses prompt caching is automatic server-side. Injecting
+      # cache_control would be silently ignored (or rejected by stricter
+      # endpoints).
+
+      cap_model = capability_model || model
+      body = MessageFormat::OpenAIResponses.build_request_body(
+        messages, model, tools, max_tokens, caching_enabled,
+        vision_supported: Providers.supports?(@provider_id, :vision, model_name: cap_model),
+        reasoning_effort: reasoning_effort
+      )
+      return send_openai_responses_stream_request(body, on_chunk) if on_chunk
+
+      response = openai_connection.post("responses") { |r| r.body = body.to_json }
+
+      raise_error(response) unless response.status == 200
+      check_html_response(response)
+
+      parsed_body = safe_json_parse(response.body, context: "LLM response")
+      MessageFormat::OpenAIResponses.parse_response(parsed_body)
+    end
+
+    # Streaming variant for the OpenAI Responses API.
+    # Posts to the "responses" endpoint with stream:true; the upstream returns
+    # typed SSE events (response.output_text.delta,
+    # response.function_call_arguments.delta, response.completed, etc.) that
+    # the aggregator reassembles into the non-streaming response shape.
+    private def send_openai_responses_stream_request(body, on_chunk)
+      stream_body = body.merge(stream: true)
+      aggregator = OpenAIResponsesStreamAggregator.new(on_chunk: on_chunk)
+      sse_buf = +""
+
+      response = openai_connection.post("responses") do |req|
+        req.headers["Accept"] = "text/event-stream"
+        req.body = stream_body.to_json
+        req.options.on_data = proc do |chunk, _bytes_received, _env|
+          sse_buf << chunk
+          drain_sse_frames(sse_buf) { |_event, data| aggregator.handle(data) }
+        end
+      end
+
+      unless response.status == 200
+        response.env.body = sse_buf if response.body.to_s.empty?
+        raise_error(response)
+      end
+
+      result = aggregator.to_h
+      log_stream_summary("openai-responses", aggregator, aggregator.saw_done? ? "completed" : nil)
+      # A complete Responses API stream always terminates with a
+      # response.completed / response.done (or response.incomplete) event.
+      # Its absence means the upstream cut the stream mid-response; retry
+      # rather than accept a silently truncated answer.
+      unless aggregator.saw_done?
+        raise Clacky::UpstreamTruncatedError,
+          "[LLM] Streaming response ended without response.completed (upstream cut the stream). Retrying..."
+      end
+      MessageFormat::OpenAIResponses.parse_response(result)
+    end
+
+    def parse_simple_openai_responses_response(response)
+      raise_error(response) unless response.status == 200
+      parsed_body = safe_json_parse(response.body, context: "LLM response")
+      result = MessageFormat::OpenAIResponses.parse_response(parsed_body)
+      content = result[:content]
+      if content.nil?
+        snippet = response.body.to_s[0, 1200]
+        if defined?(Clacky::Logger)
+          Clacky::Logger.warn("[parse_simple_openai_responses_response] no content. status=#{response.status} body=#{snippet}")
+        end
+        raise RetryableError,
+          "Upstream Responses API response missing text content. " \
           "Body snippet: #{snippet}"
       end
       content
@@ -579,12 +720,12 @@ module Clacky
           conn.headers["x-api-key"]      = @api_key
           conn.headers["anthropic-version"] = "2023-06-01"
           conn.headers["anthropic-dangerous-direct-browser-access"] = "true"
-          if @provider_id == "openrouter"
+          if @provider_id == Clacky::Providers::OPENROUTER_ID
             conn.headers["Authorization"] = "Bearer #{@api_key}"
           end
           # Moonshot's Kimi Code (Coding Plan) endpoint enforces a User-Agent
           # prefix whitelist limited to first-party coding agents.
-          if @provider_id == "kimi-coding"
+          if @provider_id == Clacky::Providers::KIMI_CODING_ID
             conn.headers["User-Agent"] = "claude-cli/1.0.51 (external, cli)"
           end
           conn.options.timeout      = @read_timeout || 300

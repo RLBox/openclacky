@@ -62,6 +62,7 @@ module Clacky
             working_dir: nil,
             mode: nil,
             model: nil,
+            reasoning_effort: nil,  # nil = provider default; appended to model name when set
             tasks: 0,
             cost: 0.0,
             cost_source: nil,  # nil / :api / :price / :default — :default means pricing unknown, show N/A
@@ -145,15 +146,18 @@ module Clacky
         # @param working_dir [String] Working directory
         # @param mode [String] Permission mode
         # @param model [String] AI model name
+        # @param reasoning_effort [String, nil] Thinking level; nil (explicit) appends nothing,
+        #   :_unset (default) leaves the previous value untouched
         # @param tasks [Integer] Number of completed tasks
         # @param cost [Float] Total cost
         # @param cost_source [Symbol, nil] :api / :price / :default — :default renders as N/A
         # @param status [String] Workspace status ('idle' or 'working')
-        def update_sessionbar(session_id: nil, working_dir: nil, mode: nil, model: nil, tasks: nil, cost: nil, cost_source: nil, status: nil)
+        def update_sessionbar(session_id: nil, working_dir: nil, mode: nil, model: nil, reasoning_effort: :_unset, tasks: nil, cost: nil, cost_source: nil, status: nil)
           @sessionbar_info[:session_id] = session_id if session_id
           @sessionbar_info[:working_dir] = working_dir if working_dir
           @sessionbar_info[:mode] = mode if mode
           @sessionbar_info[:model] = model if model
+          @sessionbar_info[:reasoning_effort] = reasoning_effort unless reasoning_effort == :_unset
           @sessionbar_info[:tasks] = tasks if tasks
           @sessionbar_info[:cost] = cost if cost
           @sessionbar_info[:cost_source] = cost_source if cost_source
@@ -184,10 +188,23 @@ module Clacky
               @command_suggestions.select_next
               return { action: nil }
             when :enter
-              # Accept selected command and submit immediately
+              # Accept selected command; submit immediately — unless the
+              # command takes arguments (argument_hint), in which case only
+              # complete the name so the user can type the arguments first
+              # (same behavior as Tab).
               if @command_suggestions.has_suggestions?
                 selected = @command_suggestions.selected_command_text
                 if selected
+                  hint = @command_suggestions.selected_argument_hint
+                  if hint && !hint.empty?
+                    completed = "#{selected} "
+                    @lines = [completed]
+                    @line_index = 0
+                    @cursor_position = completed.length
+                    @command_suggestions.hide
+                    set_tips("Usage: #{selected} #{hint}", type: :info)
+                    return { action: nil }
+                  end
                   # Replace current input with selected command
                   @lines = [selected]
                   @line_index = 0
@@ -415,7 +432,7 @@ module Clacky
           @tips_type = type
 
           # Auto-clear tips after 2 seconds
-          @tips_timer = Thread.new do
+          @tips_timer = Clacky::ThreadRegistry.spawn(name: "input-tips-timer") do
             sleep 2
             # Clear tips from state and screen
             @tips_message = nil
@@ -451,7 +468,7 @@ module Clacky
           @user_tip = USER_TIPS.sample
           
           # Start rotation timer (will show max_tips total)
-          @user_tip_timer = Thread.new do
+          @user_tip_timer = Clacky::ThreadRegistry.spawn(name: "input-user-tip-timer") do
             while @user_tip_count < max_tips
               sleep rotation_interval
               @user_tip_count += 1
@@ -1186,6 +1203,9 @@ module Clacky
           if @sessionbar_info[:model]
             parts << theme.format_text(@sessionbar_info[:model], :statusbar_secondary)
           end
+
+          # Thinking level (nil renders as off = provider default)
+          parts << theme.format_text((@sessionbar_info[:reasoning_effort] || 'off').to_s, :statusbar_secondary)
 
           # Tasks count
           parts << theme.format_text("#{@sessionbar_info[:tasks]} tasks", :statusbar_secondary)

@@ -101,6 +101,28 @@ module Clacky
         end
       end
 
+      # Install from raw zip bytes (e.g. a multipart upload). Validates the
+      # filename/size, writes the bytes to a temp file inside a mktmpdir, then
+      # delegates to install(). The temp file lives for the whole install
+      # (extract reads it) and is cleaned up on return.
+      def install_bytes(data, filename: nil, **opts)
+        unless data.is_a?(String) && !data.empty?
+          raise Error, "empty upload"
+        end
+        unless filename.to_s.downcase.end_with?(".zip")
+          raise Error, "please upload a .zip file"
+        end
+        if data.bytesize > MAX_ZIP_SIZE
+          raise Error, "upload exceeds #{MAX_ZIP_SIZE / 1024 / 1024}MB limit"
+        end
+
+        Dir.mktmpdir("clacky-ext-import") do |dir|
+          zip_path = File.join(dir, "upload.zip")
+          File.binwrite(zip_path, data)
+          install(zip_path, **opts)
+        end
+      end
+
       # Verify only the target container in isolation: symlink it into a temp
       # root so sibling containers in the real local dir don't pollute the run.
       private def verify_container!(slug, container_dir)
@@ -227,17 +249,30 @@ module Clacky
         end
       end
 
-      # Download url → dest file.
-      # IMPORTANT: OpenURI's block form (`URI.open(url) { |io| ... }`) buffers
-      # the *entire* response into a StringIO/Tempfile via Net::HTTP's
-      # read_body before ever yielding `io` — so reading `io` in chunks after
-      # the fact reports progress only after the download has already
-      # finished. To get progress callbacks that fire while bytes are still
-      # arriving on the socket, we hook OpenURI's own `progress_proc` /
-      # `content_length_proc`, which run inside read_body as each chunk lands.
-      # Respects whatever proxy env vars the user has configured (some CDN
-      # domains are only reachable at usable speed through a proxy).
+      # Download url → dest file, retrying once on the secondary CDN host when
+      # the primary fails (same path/query). Both hosts serve the same backend,
+      # so ActiveStorage signed_ids resolve identically on either.
       private def download(url, dest, on_progress: nil)
+        download_once(url, dest, on_progress: on_progress)
+      rescue Error
+        fallback = secondary_url(url)
+        raise unless fallback
+        download_once(fallback, dest, on_progress: on_progress)
+      end
+
+      private def secondary_url(url)
+        return nil unless url.start_with?(PlatformHttpClient::PRIMARY_HOST)
+
+        url.sub(PlatformHttpClient::PRIMARY_HOST, PlatformHttpClient::SECONDARY_HOST)
+      end
+
+      # OpenURI's block form (`URI.open(url) { |io| ... }`) buffers the entire
+      # response before yielding `io`, so reading `io` afterwards reports
+      # progress only after the download has finished. We hook OpenURI's own
+      # `progress_proc` / `content_length_proc` instead, which run inside
+      # read_body as each chunk lands. Respects whatever proxy env vars the
+      # user has configured.
+      private def download_once(url, dest, on_progress: nil)
         content_length = nil
 
         content_length_proc = lambda do |len|
@@ -265,10 +300,12 @@ module Clacky
         ) do |io| # rubocop:disable Security/Open
           File.open(dest, "wb") { |out| out.write(io.read) }
         end
-      rescue OpenURI::HTTPError, SocketError => e
-        raise Error, "failed to download #{url}: #{e.message}"
       rescue Net::OpenTimeout, Net::ReadTimeout => e
         raise Error, "download timed out: #{e.message}"
+      # Catch-all so any transport-layer failure triggers download()'s
+      # secondary-host fallback instead of surfacing a raw error.
+      rescue StandardError => e
+        raise Error, "failed to download #{url}: #{e.message}"
       end
 
       private def extract_zip(zip_path, dest_root)

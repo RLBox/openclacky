@@ -24,7 +24,7 @@ Branded clients continue to hide the public OpenClacky AI Keys promotion. They r
 - Personal device authorization and manual API key setup do not change.
 - Opening or cancelling enterprise login does not modify local configuration.
 - Invalid enterprise addresses and failed authorization leave the current platform source, identity, brand, license, and model configuration unchanged.
-- Successful authorization continues to save the enterprise platform source, device identity, Gateway endpoint, default model, and enterprise-managed model catalog as one atomic onboarding outcome.
+- Successful authorization validates the full response before saving the enterprise platform source, device identity, Gateway endpoint, default model, and enterprise-managed model catalog as one coordinated onboarding outcome.
 - The client does not invent additional models when the upstream OpenClacky device grant exposes only one model.
 - Chinese and English copy remain aligned.
 

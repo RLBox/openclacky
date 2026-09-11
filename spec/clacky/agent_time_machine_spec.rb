@@ -308,6 +308,7 @@ RSpec.describe "Clacky::Agent TimeMachine" do
       expect(history[0][:task_id]).to eq(1)
       expect(history[2][:task_id]).to eq(3)
       expect(history[2][:status]).to eq(:current)
+      expect(history.map { |task| task[:parent_task_id] }).to eq([0, 1, 2])
     end
 
     it "marks undone (off-chain) tasks correctly after undo" do
@@ -329,8 +330,10 @@ RSpec.describe "Clacky::Agent TimeMachine" do
       
       history = agent.get_task_history(limit: 10)
       task_2 = history.find { |t| t[:task_id] == 2 }
+      task_5 = history.find { |t| t[:task_id] == 5 }
       
       expect(task_2[:has_branches]).to be true
+      expect(task_5[:parent_task_id]).to eq(2)
     end
 
     it "respects limit parameter" do
@@ -430,6 +433,36 @@ RSpec.describe "Clacky::Agent TimeMachine" do
   describe "file tracking" do
     it "exposes the BEFORE-change recording mechanism" do
       expect(agent).to respond_to(:record_file_before_change)
+    end
+  end
+
+  describe "#looks_binary?" do
+    it "does not misclassify text when the 8000-byte window cuts a multibyte char" do
+      # 7998 ASCII bytes + a 3-byte box-drawing char (─ U+2500 = E2 94 80).
+      # binread(path, 8000) then reads the first two bytes of ─, leaving a
+      # dangling E2 94 tail that the old code misjudged as invalid UTF-8.
+      path = File.join(working_dir, "edge.txt")
+      File.binwrite(path, ("a" * 7998) + "\u2500")
+
+      expect(agent.send(:looks_binary?, path)).to be false
+    end
+
+    it "detects true binary content via a NUL byte" do
+      path = File.join(working_dir, "bin.dat")
+      File.binwrite(path, "abc\x00def")
+
+      expect(agent.send(:looks_binary?, path)).to be true
+    end
+
+    it "returns false for plain ASCII text" do
+      path = File.join(working_dir, "plain.txt")
+      File.write(path, "hello world\n")
+
+      expect(agent.send(:looks_binary?, path)).to be false
+    end
+
+    it "returns false for a nonexistent path" do
+      expect(agent.send(:looks_binary?, File.join(working_dir, "missing.txt"))).to be false
     end
   end
 
