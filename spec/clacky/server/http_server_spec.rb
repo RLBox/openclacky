@@ -33,6 +33,22 @@ RSpec.describe Clacky::Server::HttpServer do
     cfg
   end
 
+  let(:codex_provider_registry) do
+    presets = Clacky::Providers::PRESETS.merge(
+      "codex" => {
+        "name"              => "Codex (ChatGPT)",
+        "name_key"          => "provider.name.codex",
+        "runtime_id"        => "codex",
+        "auth_mode"         => "runtime",
+        "credential_fields" => [],
+        "dynamic_models"    => "session",
+        "display_model"     => "Codex default",
+        "capabilities"       => { "vision" => true }
+      }
+    )
+    Clacky::ProviderRegistry.new(presets: presets, extension_units: [])
+  end
+
   after { FileUtils.rm_rf(tmpdir) }
 
   # ── Initialization ────────────────────────────────────────────────────────
@@ -691,6 +707,37 @@ RSpec.describe Clacky::Server::HttpServer do
         expect(m["api_format"]).to eq("openai-completions")
       end
     end
+
+    it "exposes runtime identity and display fields without credential fields" do
+      agent_config.models << {
+        "id"             => "codex-card",
+        "provider_id"    => "codex",
+        "runtime_id"     => "codex",
+        "display_model"  => "Codex default",
+        "remark"         => "Shared login",
+        "_runtime_model" => true,
+        "api_key"          => "must-not-leak",
+        "token"            => "must-not-leak"
+      }
+
+      with_server(agent_config: agent_config) do |server|
+        req = fake_req(method: "GET", path: "/api/config")
+        res = fake_res
+        dispatch(server, req, res)
+
+        expect(res.status).to eq(200)
+        runtime_card = parsed_body(res)["models"].find { |model| model["id"] == "codex-card" }
+        expect(runtime_card).to include(
+          "provider_id" => "codex",
+          "runtime_id" => "codex",
+          "display_model" => "Codex default",
+          "remark" => "Shared login"
+        )
+        expect(runtime_card.keys).not_to include(
+          "api_key", "api_key_masked", "token", "auth", "_runtime_model"
+        )
+      end
+    end
   end
 
   # ── Single-item model CRUD APIs ───────────────────────────────────────────
@@ -711,9 +758,105 @@ RSpec.describe Clacky::Server::HttpServer do
         providers.each { |p| expect(p).to have_key("api") }
       end
     end
+
+    it "lists runtime providers through the registry while preserving legacy fields" do
+      with_server(agent_config: agent_config, provider_registry: codex_provider_registry) do |server|
+        req = fake_req(method: "GET", path: "/api/providers")
+        res = fake_res
+        dispatch(server, req, res)
+
+        expect(res.status).to eq(200)
+        providers = parsed_body(res)["providers"]
+        codex = providers.find { |provider| provider["id"] == "codex" }
+
+        expect(codex).to include(
+          "name" => "Codex (ChatGPT)",
+          "name_key" => "provider.name.codex",
+          "runtime_id" => "codex",
+          "auth_mode" => "runtime",
+          "credential_fields" => [],
+          "dynamic_models" => "session",
+          "display_model" => "Codex default",
+          "capabilities" => { "vision" => true }
+        )
+        expect(codex.keys).to include(
+          "base_url", "default_model", "api", "models", "endpoint_variants", "website_url"
+        )
+        expect(codex["models"]).to eq([])
+
+        openai = providers.find { |provider| provider["id"] == "openai" }
+        expect(openai.keys).to include(
+          "name", "name_key", "base_url", "default_model", "api", "models",
+          "endpoint_variants", "website_url"
+        )
+      end
+    end
   end
 
   describe "POST /api/config/models" do
+    it "creates a credentialless runtime card and derives its runtime id" do
+      with_server(agent_config: agent_config, provider_registry: codex_provider_registry) do |server|
+        payload = { provider_id: "codex", type: "default", remark: "Shared login" }
+        req = fake_req(method: "POST", path: "/api/config/models", body: payload)
+        res = fake_res
+        dispatch(server, req, res)
+
+        expect(res.status).to eq(200)
+        created = agent_config.models.find { |model| model["id"] == parsed_body(res)["id"] }
+        expect(created).to include(
+          "provider_id" => "codex",
+          "runtime_id" => "codex",
+          "display_model" => "Codex default",
+          "remark" => "Shared login",
+          "type" => "default"
+        )
+        expect(created.keys).not_to include("model", "base_url", "api_key")
+        expect(agent_config.models.first).not_to have_key("type")
+        expect(agent_config.current_model_id).to eq(created["id"])
+      end
+    end
+
+    it "rejects a spoofed runtime id instead of trusting the browser" do
+      with_server(agent_config: agent_config, provider_registry: codex_provider_registry) do |server|
+        payload = { provider_id: "codex", runtime_id: "arbitrary-ruby-runtime" }
+        req = fake_req(method: "POST", path: "/api/config/models", body: payload)
+        res = fake_res
+        dispatch(server, req, res)
+
+        expect(res.status).to eq(422)
+        expect(agent_config.models.none? { |model| model["provider_id"] == "codex" }).to be true
+      end
+    end
+
+    it "rejects API credential fields on a runtime provider card" do
+      with_server(agent_config: agent_config, provider_registry: codex_provider_registry) do |server|
+        payload = {
+          provider_id: "codex",
+          api_key: "must-not-be-stored",
+          base_url: "https://example.invalid",
+          model: "fake-codex-model"
+        }
+        req = fake_req(method: "POST", path: "/api/config/models", body: payload)
+        res = fake_res
+        dispatch(server, req, res)
+
+        expect(res.status).to eq(422)
+        expect(agent_config.models.none? { |model| model["provider_id"] == "codex" }).to be true
+      end
+    end
+
+    it "rejects an unknown credentialless provider as a runtime card" do
+      with_server(agent_config: agent_config, provider_registry: codex_provider_registry) do |server|
+        payload = { provider_id: "unknown-runtime" }
+        req = fake_req(method: "POST", path: "/api/config/models", body: payload)
+        res = fake_res
+        dispatch(server, req, res)
+
+        expect(res.status).to eq(422)
+        expect(parsed_body(res)["error"]).to match(/provider|runtime/i)
+      end
+    end
+
     it "creates a new model and returns its id" do
       with_server(agent_config: agent_config) do |server|
         payload = {
@@ -872,6 +1015,48 @@ RSpec.describe Clacky::Server::HttpServer do
   end
 
   describe "PATCH /api/config/models/:id" do
+    it "updates only remark and type on a runtime card" do
+      agent_config.models << {
+        "id" => "codex-card", "provider_id" => "codex",
+        "runtime_id" => "codex", "display_model" => "Codex default",
+        "remark" => "Old label", "_runtime_model" => true
+      }
+
+      with_server(agent_config: agent_config) do |server|
+        payload = { remark: "New label", type: "default" }
+        req = fake_req(method: "PATCH", path: "/api/config/models/codex-card", body: payload)
+        res = fake_res
+        dispatch(server, req, res)
+
+        expect(res.status).to eq(200)
+        runtime_card = agent_config.models.find { |model| model["id"] == "codex-card" }
+        expect(runtime_card["remark"]).to eq("New label")
+        expect(runtime_card["type"]).to eq("default")
+        expect(agent_config.models.first).not_to have_key("type")
+        expect(agent_config.current_model_id).to eq("codex-card")
+      end
+    end
+
+    it "rejects immutable fields on a runtime card without partial writes" do
+      agent_config.models << {
+        "id" => "codex-card", "provider_id" => "codex",
+        "runtime_id" => "codex", "display_model" => "Codex default",
+        "remark" => "Original", "_runtime_model" => true
+      }
+
+      with_server(agent_config: agent_config) do |server|
+        payload = { remark: "Must not persist", runtime_id: "arbitrary-ruby-runtime" }
+        req = fake_req(method: "PATCH", path: "/api/config/models/codex-card", body: payload)
+        res = fake_res
+        dispatch(server, req, res)
+
+        expect(res.status).to eq(422)
+        runtime_card = agent_config.models.find { |model| model["id"] == "codex-card" }
+        expect(runtime_card["remark"]).to eq("Original")
+        expect(runtime_card["runtime_id"]).to eq("codex")
+      end
+    end
+
     it "updates only the specified fields" do
       with_server(agent_config: agent_config) do |server|
         id = agent_config.models[0]["id"]
@@ -1108,6 +1293,39 @@ RSpec.describe Clacky::Server::HttpServer do
   # ── POST /api/config/test ─────────────────────────────────────────────────
 
   describe "POST /api/config/test" do
+    it "uses the runtime health probe without constructing an API client" do
+      calls = []
+      runtime = double("runtime", health: { ok: true, status: "connected", authenticated: true })
+      runtime_registry = Clacky::AgentRuntimeRegistry.new(
+        extension_units: [],
+        factories: {
+          "codex" => lambda do |**options|
+            calls << options
+            runtime
+          end
+        }
+      )
+
+      expect(Clacky::Client).not_to receive(:new)
+      with_server(
+        agent_config: agent_config,
+        provider_registry: codex_provider_registry,
+        runtime_registry: runtime_registry
+      ) do |server|
+        req = fake_req(
+          method: "POST", path: "/api/config/test", body: { provider_id: "codex" }
+        )
+        res = fake_res
+        dispatch(server, req, res)
+
+        expect(res.status).to eq(200)
+        expect(parsed_body(res)).to include(
+          "ok" => true, "status" => "connected", "authenticated" => true
+        )
+        expect(calls).to eq([{ purpose: :health }])
+      end
+    end
+
     it "returns ok: true when connection succeeds" do
       test_client = double("client")
       allow(test_client).to receive(:test_connection).and_return({ success: true })

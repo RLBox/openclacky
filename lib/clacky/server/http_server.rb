@@ -224,11 +224,13 @@ module Clacky
         - 将大目标拆解为可执行的小步骤
       MD
 
-      def initialize(host: "127.0.0.1", port: 7070, agent_config:, client_factory:, brand_test: false, sessions_dir: nil, projects_file: nil, socket: nil, master_pid: nil)
+      def initialize(host: "127.0.0.1", port: 7070, agent_config:, client_factory:, brand_test: false, sessions_dir: nil, projects_file: nil, socket: nil, master_pid: nil, provider_registry: nil, runtime_registry: nil)
         @host           = host
         @port           = port
         @agent_config   = agent_config
         @client_factory = client_factory  # callable: -> { Clacky::Client.new(...) }
+        @provider_registry = provider_registry || Clacky::ProviderRegistry.new
+        @runtime_registry  = runtime_registry || Clacky::AgentRuntimeRegistry.new
         @brand_test     = brand_test      # when true, skip remote API calls for license activation
         @inherited_socket  = socket        # TCPServer socket passed from Master (nil = standalone mode)
         @master_pid        = master_pid    # Master PID so we can send USR1 on upgrade/restart
@@ -6272,19 +6274,28 @@ module Clacky
       # GET /api/config — return current model configurations
       def api_get_config(req, res)
         models = @agent_config.models.map.with_index do |m, i|
-          {
-            id:               m["id"],   # Stable runtime id — use this for switching
-            index:            i,
-            model:            m["model"],
-            base_url:         m["base_url"],
-            api_key_masked:   mask_api_key(m["api_key"]),
-            anthropic_format: m["anthropic_format"] || false,
-            api_format:       m["api_format"],
-            provider_id:      m["provider_id"],
-            capabilities:     m["capabilities"],
-            remark:           m["remark"],
-            type:             m["type"]
+          common = {
+            id:          m["id"],   # Stable runtime id — use this for switching
+            index:       i,
+            provider_id: m["provider_id"],
+            remark:      m["remark"],
+            type:        m["type"]
           }
+          if runtime_model_entry?(m)
+            common.merge(
+              runtime_id:    m["runtime_id"],
+              display_model: m["display_model"]
+            )
+          else
+            common.merge(
+              model:             m["model"],
+              base_url:          m["base_url"],
+              api_key_masked:    mask_api_key(m["api_key"]),
+              anthropic_format:  m["anthropic_format"] || false,
+              api_format:        m["api_format"],
+              capabilities:      m["capabilities"]
+            )
+          end
         end
         # Filter out auto-injected models (lite, derived media) AND media
         # entries (image/video/audio/ocr) — those are managed via the dedicated
@@ -6545,6 +6556,15 @@ module Clacky
         :invalid
       end
 
+      private def runtime_model_entry?(entry)
+        entry.is_a?(Hash) && !entry["runtime_id"].to_s.strip.empty?
+      end
+
+      private def runtime_only_request?(body)
+        allowed = %w[provider_id runtime_id type remark]
+        !body["provider_id"].to_s.strip.empty? && (body.keys - allowed).empty?
+      end
+
       # POST /api/config/models
       # Body: { model, base_url, api_key, anthropic_format, api_format?, type? }
       # Creates a new model entry, returns { ok:true, id, index } so the
@@ -6552,6 +6572,26 @@ module Clacky
       def api_add_model(req, res)
         body = parse_json_body(req)
         return json_response(res, 400, { error: "Invalid JSON" }) unless body
+
+        provider_id = body["provider_id"].to_s.strip
+        runtime_id = @provider_registry.runtime_id_for(provider_id)
+        if runtime_id
+          unless runtime_only_request?(body)
+            return json_response(res, 422, {
+              error: "runtime models only allow provider_id, runtime_id, type, and remark"
+            })
+          end
+          if body.key?("runtime_id") && body["runtime_id"].to_s.strip != runtime_id.to_s
+            return json_response(res, 422, { error: "runtime_id must be derived from provider_id" })
+          end
+          return api_add_runtime_model(body, res, provider_id, runtime_id.to_s)
+        end
+        if body.key?("runtime_id") && !body["runtime_id"].to_s.strip.empty?
+          return json_response(res, 422, { error: "unknown runtime provider" })
+        end
+        if runtime_only_request?(body) && @provider_registry[provider_id].nil?
+          return json_response(res, 422, { error: "unknown runtime provider" })
+        end
 
         api_format = normalize_api_format(body["api_format"])
         return json_response(res, 422, { error: "invalid api_format" }) if api_format == :invalid
@@ -6578,7 +6618,7 @@ module Clacky
           "base_url"         => base_url,
           "api_key"          => api_key,
           "anthropic_format" => body["anthropic_format"] || false,
-          "provider_id"      => body["provider_id"].to_s.strip.then { |v| v.empty? ? nil : v }
+          "provider_id"      => provider_id.empty? ? nil : provider_id
         }
         caps = body["capabilities"]
         if caps.is_a?(Hash) && !caps.empty?
@@ -6619,6 +6659,47 @@ module Clacky
         json_response(res, 422, { error: e.message })
       end
 
+      private def api_add_runtime_model(body, res, provider_id, runtime_id)
+        descriptor = @provider_registry.fetch(provider_id)
+        display_model = descriptor["display_model"].to_s.strip
+        display_model = descriptor["name"].to_s.strip if display_model.empty?
+        display_model = provider_id if display_model.empty?
+        entry = {
+          "id" => SecureRandom.uuid,
+          Clacky::AgentConfig::RUNTIME_MODEL_MARKER => true,
+          "provider_id" => provider_id,
+          "runtime_id" => runtime_id,
+          "display_model" => display_model
+        }
+
+        remark = body["remark"].to_s.strip
+        entry["remark"] = remark unless remark.empty?
+        type = body["type"].to_s
+        unless type.empty?
+          if type == "default"
+            @agent_config.models.each { |model| model.delete("type") if model["type"] == "default" }
+          end
+          entry["type"] = type
+        end
+
+        @agent_config.models << entry
+        if @agent_config.models.none? { |model| model["type"] == "default" }
+          entry["type"] = "default"
+          @agent_config.current_model_id = entry["id"]
+          @agent_config.current_model_index = @agent_config.models.length - 1
+        elsif type == "default"
+          @agent_config.current_model_id = entry["id"]
+          @agent_config.current_model_index = @agent_config.models.length - 1
+        end
+
+        @agent_config.save
+        json_response(res, 200, {
+          ok: true,
+          id: entry["id"],
+          index: @agent_config.models.length - 1
+        })
+      end
+
       # PATCH /api/config/models/:id
       # Body: any subset of { model, base_url, api_key, anthropic_format, type }
       #                       provider_id, capabilities, remark }
@@ -6638,6 +6719,7 @@ module Clacky
 
         target = @agent_config.models.find { |m| m["id"] == id }
         return json_response(res, 404, { error: "model not found" }) unless target
+        return api_update_runtime_model(target, body, res) if runtime_model_entry?(target)
 
         # Validate before any mutation: target is a live reference inside
         # @agent_config.models, so an early 422 return after partial writes
@@ -6723,6 +6805,46 @@ module Clacky
         json_response(res, 422, { error: e.message })
       end
 
+      private def api_update_runtime_model(target, body, res)
+        invalid_fields = body.keys - %w[remark type]
+        unless invalid_fields.empty?
+          return json_response(res, 422, {
+            error: "runtime models only allow remark and type updates"
+          })
+        end
+
+        if body.key?("remark")
+          remark = body["remark"].to_s.strip
+          if remark.empty?
+            target.delete("remark")
+          else
+            target["remark"] = remark
+          end
+        end
+
+        if body.key?("type")
+          type = body["type"]
+          type = nil if type.is_a?(String) && type.strip.empty?
+          if type == "default"
+            @agent_config.models.each do |model|
+              next if model["id"] == target["id"]
+              model.delete("type") if model["type"] == "default"
+            end
+            target["type"] = "default"
+            @agent_config.current_model_id = target["id"]
+            @agent_config.current_model_index =
+              @agent_config.models.find_index { |model| model["id"] == target["id"] } || 0
+          elsif type.nil?
+            target.delete("type")
+          else
+            target["type"] = type
+          end
+        end
+
+        @agent_config.save
+        json_response(res, 200, { ok: true })
+      end
+
       # DELETE /api/config/models/:id
       def api_delete_model(id, res)
         models = @agent_config.models
@@ -6773,6 +6895,17 @@ module Clacky
         body = parse_json_body(req)
         return json_response(res, 400, { error: "Invalid JSON" }) unless body
 
+        runtime_probe = resolve_runtime_probe(body)
+        if runtime_probe[:error]
+          return json_response(res, 422, { error: runtime_probe[:error] })
+        end
+        if runtime_probe[:runtime_id]
+          runtime = @runtime_registry.build(runtime_probe[:runtime_id], purpose: :health)
+          health = runtime.health
+          payload = health.is_a?(Hash) ? health.dup : { ok: !!health }
+          return json_response(res, 200, payload)
+        end
+
         api_key = body["api_key"].to_s
         if api_key.include?("****")
           model_id = body["id"].to_s
@@ -6810,6 +6943,39 @@ module Clacky
         json_response(res, 200, { ok: false, message: e.message })
       end
 
+      private def resolve_runtime_probe(body)
+        entry = nil
+        model_id = body["id"].to_s
+        entry = @agent_config.models.find { |model| model["id"] == model_id } unless model_id.empty?
+        if entry.nil? && body.key?("index")
+          entry = @agent_config.models[body["index"].to_i]
+        end
+
+        runtime_id = nil
+        if entry
+          if runtime_model_entry?(entry)
+            provider_id = entry["provider_id"].to_s
+            runtime_id = @provider_registry.runtime_id_for(provider_id)
+            return { error: "unknown runtime provider" } unless runtime_id
+            if entry["runtime_id"].to_s != runtime_id.to_s
+              return { error: "configured runtime_id does not match provider_id" }
+            end
+            if body.key?("provider_id") && body["provider_id"].to_s.strip != provider_id
+              return { error: "provider_id does not match configured runtime model" }
+            end
+          end
+        else
+          provider_id = body["provider_id"].to_s.strip
+          runtime_id = @provider_registry.runtime_id_for(provider_id) unless provider_id.empty?
+        end
+
+        if body.key?("runtime_id") && body["runtime_id"].to_s.strip != runtime_id.to_s
+          return { error: "runtime_id must be derived from provider_id" }
+        end
+
+        { runtime_id: runtime_id && runtime_id.to_s }
+      end
+
       private def try_test_with_base_url(api_key, base_url, model, anthropic_format, api_format)
         result = run_test_connection(api_key, base_url, model, anthropic_format, api_format)
         return [result, base_url] if result[:success]
@@ -6832,9 +6998,9 @@ module Clacky
         client.test_connection(model: model)
       end
 
-      # GET /api/providers — return built-in provider presets for quick setup
+      # GET /api/providers — return registered providers for quick setup
       def api_list_providers(res)
-        providers = Clacky::Providers::PRESETS.map do |id, preset|
+        providers = @provider_registry.all.map do |id, preset|
           {
             id:                id,
             name:              preset["name"],
@@ -6851,7 +7017,13 @@ module Clacky
             # billing-plan variants) when present. Absent for single-endpoint
             # providers — UI renders a plain text input in that case.
             endpoint_variants: preset["endpoint_variants"],
-            website_url:       preset["website_url"]
+            website_url:       preset["website_url"],
+            runtime_id:        preset["runtime_id"],
+            auth_mode:         preset["auth_mode"],
+            credential_fields: preset["credential_fields"],
+            dynamic_models:    preset["dynamic_models"],
+            display_model:     preset["display_model"],
+            capabilities:      preset["capabilities"]
           }
         end
         json_response(res, 200, { providers: providers })
