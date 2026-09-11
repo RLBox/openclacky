@@ -116,6 +116,33 @@ RSpec.describe "Clacky::AgentConfig#reload!" do
     end
   end
 
+  it "keeps duplicate legacy runtime cards on distinct ids during reload" do
+    runtime_models = [
+      {
+        "provider_id" => "codex",
+        "runtime_id" => "codex",
+        "display_model" => "Codex default",
+        "type" => "default",
+        "remark" => "first"
+      },
+      {
+        "provider_id" => "codex",
+        "runtime_id" => "codex",
+        "display_model" => "Codex default",
+        "remark" => "second"
+      }
+    ]
+    write_config([], {}, runtime_models)
+    config = Clacky::AgentConfig.load(config_file)
+    original_ids = config.models.map { |model| model["id"] }
+
+    write_config([], {}, runtime_models)
+
+    expect(config.reload!(config_file)).to be true
+    expect(config.models.map { |model| model["id"] }).to eq(original_ids)
+    expect(config.models.map { |model| model["id"] }.uniq.length).to eq(2)
+  end
+
   it "falls back to the default model when the pinned model was deleted" do
     write_config(initial_models)
     config = Clacky::AgentConfig.load(config_file)

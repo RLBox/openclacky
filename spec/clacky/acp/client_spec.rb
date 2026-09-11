@@ -100,6 +100,55 @@ RSpec.describe Clacky::Acp::Client do
     expect(client.alive?).to be(false) if client
   end
 
+  it "brackets the transport write with request visibility callbacks" do
+    client = initialized_client
+    order = []
+    transport.on_send do |message|
+      next unless message[:method] == "session/prompt"
+
+      order << :written
+      transport.emit(
+        "jsonrpc" => "2.0",
+        "id" => message[:id],
+        "result" => { "stopReason" => "end_turn" }
+      )
+    end
+
+    client.request(
+      "session/prompt",
+      { "sessionId" => "session-1", "prompt" => [] },
+      timeout: 1,
+      before_send: -> { order << :visible },
+      on_sent: -> { order << :callback }
+    )
+
+    expect(order).to eq(%i[visible written callback])
+  ensure
+    client&.stop
+  end
+
+  it "rolls back request visibility when the transport write fails" do
+    client = initialized_client
+    events = []
+    transport.on_send do |message|
+      raise IOError, "broken pipe" if message[:method] == "session/prompt"
+    end
+
+    expect do
+      client.request(
+        "session/prompt",
+        {},
+        timeout: 1,
+        before_send: -> { events << :visible },
+        on_send_error: -> { events << :rolled_back }
+      )
+    end.to raise_error(Clacky::Acp::Client::TransportError)
+
+    expect(events).to eq(%i[visible rolled_back])
+  ensure
+    client&.stop
+  end
+
   it "matches concurrent responses by monotonically increasing request id" do
     client = initialized_client
     transport.on_send { |_message| }
@@ -205,6 +254,41 @@ RSpec.describe Clacky::Acp::Client do
     client&.stop
   end
 
+  it "bounds concurrent reverse requests" do
+    stub_const("#{described_class}::MAX_REVERSE_REQUESTS", 1)
+    client = initialized_client
+    transport.on_send { |_message| }
+    started = Queue.new
+    release = Queue.new
+    calls = 0
+    lock = Mutex.new
+    client.on_request("session/request_permission") do |_params|
+      index = lock.synchronize { calls += 1 }
+      started << index
+      release.pop if index == 1
+      { "outcome" => { "outcome" => "cancelled" } }
+    end
+
+    transport.emit(
+      "jsonrpc" => "2.0", "id" => 90,
+      "method" => "session/request_permission", "params" => {}
+    )
+    expect(started.pop).to eq(1)
+    transport.emit(
+      "jsonrpc" => "2.0", "id" => 91,
+      "method" => "session/request_permission", "params" => {}
+    )
+
+    deadline = Time.now + 1
+    sleep 0.005 until transport.sent.any? { |message| message[:id] == 91 } || Time.now >= deadline
+    response = transport.sent.find { |message| message[:id] == 91 }
+    expect(response[:error]).to include(code: -32_603)
+    expect(calls).to eq(1)
+  ensure
+    release << true if release && release.empty?
+    client&.stop
+  end
+
   it "returns method-not-found for an unhandled reverse request" do
     client = initialized_client
 
@@ -237,7 +321,66 @@ RSpec.describe Clacky::Acp::Client do
 
     expect do
       client.request("session/new", {}, timeout: 1)
-    end.to raise_error(Clacky::Acp::Client::ProtocolError, /session\/new.*not authenticated/)
+    end.to raise_error(Clacky::Acp::Client::ProtocolError) do |error|
+      expect(error.message).to include("session/new", "-32000")
+      expect(error.message).not_to include("not authenticated", "private")
+      expect(error.code).to eq(-32_000)
+      expect(error.method).to eq("session/new")
+    end
+  ensure
+    client&.stop
+  end
+
+  it "rejects a matching response without result or error" do
+    client = initialized_client
+    transport.on_send do |message|
+      next unless message[:method] == "session/new"
+
+      transport.emit("jsonrpc" => "2.0", "id" => message[:id])
+    end
+
+    expect do
+      client.request("session/new", {}, timeout: 1)
+    end.to raise_error(Clacky::Acp::Client::ProtocolError, /invalid ACP response/i)
+    expect(client.pending_request_count).to eq(0)
+  ensure
+    client&.stop
+  end
+
+  it "fails pending requests on a non-object protocol message" do
+    client = initialized_client
+    transport.on_send { |_message| }
+    pending = Thread.new do
+      client.request("session/prompt", {}, timeout: nil)
+    rescue StandardError => e
+      e
+    end
+    deadline = Time.now + 1
+    sleep 0.005 until client.pending_request_count == 1 || Time.now >= deadline
+
+    transport.emit(["not", "an", "object"])
+
+    expect(pending.value).to be_a(Clacky::Acp::Client::ProtocolError)
+    expect(client.alive?).to be(false)
+  ensure
+    client&.stop
+  end
+
+  it "fails pending requests on an unknown response id" do
+    client = initialized_client
+    transport.on_send { |_message| }
+    pending = Thread.new do
+      client.request("session/prompt", {}, timeout: nil)
+    rescue StandardError => e
+      e
+    end
+    deadline = Time.now + 1
+    sleep 0.005 until client.pending_request_count == 1 || Time.now >= deadline
+
+    transport.emit("jsonrpc" => "2.0", "id" => 999_999, "result" => {})
+
+    expect(pending.value).to be_a(Clacky::Acp::Client::ProtocolError)
+    expect(client.alive?).to be(false)
   ensure
     client&.stop
   end
@@ -251,6 +394,21 @@ RSpec.describe Clacky::Acp::Client do
     end.to raise_error(Clacky::Acp::Client::RequestTimeout, /session\/set_config_option/)
 
     expect(client.pending_request_count).to eq(0)
+  ensure
+    client&.stop
+  end
+
+  it "ignores a late response for a request that already timed out" do
+    client = initialized_client
+    transport.on_send { |_message| }
+
+    expect do
+      client.request("session/set_config_option", {}, timeout: 0.01)
+    end.to raise_error(Clacky::Acp::Client::RequestTimeout)
+    timed_out_id = transport.sent.last[:id]
+    transport.emit("jsonrpc" => "2.0", "id" => timed_out_id, "result" => {})
+
+    expect(client.alive?).to be(true)
   ensure
     client&.stop
   end
@@ -274,6 +432,10 @@ RSpec.describe Clacky::Acp::Client do
     expect(error).to be_a(Clacky::Acp::Client::TransportError)
     expect(error.message).to include("adapter exited")
     expect(client.pending_request_count).to eq(0)
+    expect(client.alive?).to be(false)
+    expect do
+      client.request("session/prompt", {}, timeout: nil)
+    end.to raise_error(Clacky::Acp::Client::TransportError, /not initialized/)
   ensure
     client&.stop
   end

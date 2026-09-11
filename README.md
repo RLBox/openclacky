@@ -196,6 +196,21 @@ Set your **API Key**, **Model**, and **Base URL** (any OpenAI-compatible provide
 
 Supported out of the box: **Claude (Anthropic) · GPT (OpenAI) · DeepSeek · Kimi (Moonshot) · MiniMax · OpenRouter · OrcaRouter** — or any custom endpoint.
 
+### Codex (ChatGPT) — Web UI prototype
+
+Codex support ships with the client as a bundled, default-enabled extension; no marketplace installation is required. The local Web UI can run it as an agent runtime. During onboarding, choose **Choose another provider (API or Codex)**, or later open **Settings → Models → Add Model**, then select **Codex (ChatGPT)** from the same provider dropdown. Model, Base URL, API Key, and API Format are replaced by connection status and **Connect with ChatGPT**. The saved runtime card contains no API credential. The effective Codex model and reasoning effort are discovered after the first message establishes the ACP session.
+
+OpenClacky connects through ACP using the version-locked pair `@agentclientprotocol/codex-acp@1.11.0` + `@openai/codex@0.153.4`. This prototype requires one of:
+
+- Node.js 20+ with `npx`; the fallback pins both exact packages, relies on npm's package-integrity verification, downloads them on first use, and then uses the npm cache. The platform package is currently over 100 MB, so a slow first connection can take up to five minutes.
+- For development or controlled packaging only, a trusted adapter entry point selected with `CLACKY_CODEX_ACP_PATH`; `CLACKY_CODEX_PATH` is an explicit operator-trusted override and must report Codex 0.153.4. An implicitly discovered global `codex-acp` is never executed.
+
+Every adapter path, including `CLACKY_CODEX_ACP_PATH`, verifies the published adapter source by SHA-256, requires the exact Codex package version, and applies a narrow compatibility patch that marks session roots untrusted. Repository-local `.codex` config, hooks, and exec policies therefore stay disabled. Exact-version checks are not full artifact attestation; a production bundle must additionally lock and attest the complete dependency tree and platform binary.
+
+OpenClacky uses an independent managed home — `~/Library/Application Support/OpenClacky/codex` on macOS, or `${XDG_DATA_HOME:-~/.local/share}/openclacky/codex` on other POSIX systems — instead of sharing the whole source Codex home. It may link only a regular, current-user, private-permission `auth.json` from `$CODEX_HOME` (or `~/.codex` when that variable is unset); it never imports Codex config, MCP servers, plugins, skills, hooks, history, or databases. A forced permission profile blocks the source and managed credential paths plus common local secret locations and disables login-shell initialization. If the login cannot be reused safely, use the browser login. Removing the model card does not log out ChatGPT or modify the source auth file. The bundled extension is part of the client; the current prototype does not yet bundle its Node/codex-acp runtime artifacts.
+
+Current limits: setup is Web-UI-only; API-backed and agent-runtime cards cannot be hot-switched inside one session; create a new session instead. The repository's current Docker image does not bundle Node/npm/npx or the adapter, and remote/headless login plus Windows process-tree packaging still need release work. `missing_dependencies`, `incompatible_node`, `incompatible_codex_acp`, and `untrusted_installed_codex_acp` in the connection panel identify the common launcher failures.
+
 ## Coding use case
 
 OpenClacky works as a general AI coding assistant — scaffold full-stack apps, add features, or explore unfamiliar codebases:

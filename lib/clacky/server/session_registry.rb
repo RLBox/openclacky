@@ -169,6 +169,33 @@ module Clacky
         end
       end
 
+      # Atomically enforce the global task limit, optionally reject an
+      # already-running session, claim its next epoch, and mark it running.
+      # The optional block runs under the registry mutex only for the
+      # already-running case; callers may use it for a short in-memory queue
+      # operation so the active worker cannot transition to idle in between.
+      def claim_task(session_id, require_idle: false)
+        @mutex.synchronize do
+          session = @sessions[session_id]
+          return { status: :missing, epoch: nil } unless session
+
+          if require_idle && session[:status] == :running
+            yield session if block_given?
+            return { status: :already_running, epoch: nil }
+          end
+
+          running = @sessions.count { |_id, value| value[:status] == :running }
+          if running >= max_running_agents
+            return { status: :full, epoch: nil }
+          end
+
+          session[:epoch] = session[:epoch].to_i + 1
+          session[:status] = :running
+          session[:updated_at] = Time.now
+          { status: :claimed, epoch: session[:epoch] }
+        end
+      end
+
       # Current task epoch for a session (0 if none / unknown).
       def current_epoch(session_id)
         @mutex.synchronize { @sessions[session_id]&.fetch(:epoch, 0).to_i }
@@ -224,6 +251,7 @@ module Clacky
           { status: s[:status], error: s[:error], error_code: s[:error_code], top_up_url: s[:top_up_url], raw_message: s[:raw_message],
             updated_at: s[:updated_at]&.iso8601,
             model: model_info&.dig(:model), model_id: model_info&.dig(:id), name: live_name,
+            runtime_id: model_info&.dig(:runtime_id),
             total_tasks: s[:agent]&.total_tasks, total_cost: s[:agent]&.total_cost,
             cost_source: live_cost_source,
             reasoning_effort: s[:agent]&.reasoning_effort,
@@ -338,6 +366,7 @@ module Clacky
           { status: s[:status], error: s[:error], error_code: s[:error_code], top_up_url: s[:top_up_url], raw_message: s[:raw_message],
             updated_at: s[:updated_at]&.iso8601,
             model: model_info&.dig(:model), model_id: model_info&.dig(:id),
+            runtime_id: model_info&.dig(:runtime_id),
             name: live_name, total_tasks: s[:agent]&.total_tasks,
             total_cost: s[:agent]&.total_cost, cost_source: s[:agent]&.cost_source,
             reasoning_effort: s[:agent]&.reasoning_effort,
@@ -370,6 +399,7 @@ module Clacky
           raw_message:   ls&.dig(:raw_message),
           model:         ls&.dig(:model),
           model_id:      ls&.dig(:model_id),
+          runtime_id:    ls&.dig(:runtime_id) || s.dig(:runtime, :id),
           card_model:    ls&.dig(:card_model),
           sub_model:     ls&.dig(:sub_model),
           sub_model_options: ls&.dig(:sub_model_options) || [],
@@ -524,6 +554,21 @@ module Clacky
         snapshot.each { |id, agent, thread| yield id, agent, thread }
       end
 
+      # True when an in-memory session is currently anchored to a model card.
+      # Model arrays are shared across live sessions, so deleting such a card
+      # would make the session silently fall back to another provider.
+      def model_in_use?(model_id)
+        target = model_id.to_s
+        agents = @mutex.synchronize do
+          @sessions.values.map { |session| session[:agent] }.compact
+        end
+        agents.any? do |agent|
+          agent.current_model_info&.dig(:id).to_s == target
+        rescue StandardError
+          false
+        end
+      end
+
       # Shut down every session's idle-compression timer, waiting for any
       # in-flight compression to roll back cleanly. Called on worker shutdown
       # so a hot restart's SIGKILL cannot tear a compression apart between
@@ -607,6 +652,8 @@ module Clacky
           cost_source:     agent.cost_source.to_s,
           error:           session[:error],
           model:           model_info&.dig(:model),
+          model_id:        model_info&.dig(:id),
+          runtime_id:      model_info&.dig(:runtime_id),
           permission_mode: agent.permission_mode,
           source:          agent.source.to_s,
           agent_profile:   agent.agent_profile.name,

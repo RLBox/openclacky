@@ -43,7 +43,8 @@ RSpec.describe Clacky::ProviderRegistry do
     )
     expect(registry["zeta"]).to eq(
       "name" => "Zeta",
-      "runtime_id" => "zeta-runtime"
+      "runtime_id" => "zeta-runtime",
+      "extension_id" => "test-extension"
     )
   end
 
@@ -74,8 +75,24 @@ RSpec.describe Clacky::ProviderRegistry do
     expect(registry["runtime"]).to eq(
       "name" => "Runtime",
       "runtime_id" => "runtime",
-      "capabilities" => { "vision" => true }
+      "capabilities" => { "vision" => true },
+      "extension_id" => "test-extension"
     )
+  end
+
+  it "derives the extension route owner instead of trusting provider metadata" do
+    registry = described_class.new(
+      presets: {},
+      extension_units: [
+        provider_unit(
+          "runtime-provider",
+          "runtime_id" => "runtime-adapter",
+          "extension_id" => "spoofed-extension"
+        )
+      ]
+    )
+
+    expect(registry["runtime-provider"]["extension_id"]).to eq("test-extension")
   end
 
   it "rejects an extension provider that collides with a built-in ID" do

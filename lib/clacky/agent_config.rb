@@ -417,14 +417,14 @@ module Clacky
     # in-memory config is left untouched rather than wiped.
     def reload!(config_file = CONFIG_FILE)
       fresh = self.class.load(config_file)
+      reused_ids = {}
 
       fresh.models.each do |m|
-        previous = if runtime_model_entry?(m)
-                     find_runtime_model_by_identity(m["runtime_id"], m["provider_id"])
-                   else
-                     find_model_by_name_and_url(m["model"], m["base_url"])
-                   end
-        m["id"] = previous["id"] if previous
+        previous = find_reload_model(m, reused_ids)
+        next unless previous
+
+        m["id"] = previous["id"]
+        reused_ids[previous["id"]] = true
       end
 
       @models.replace(fresh.models)
@@ -1439,13 +1439,19 @@ module Clacky
         (entry[RUNTIME_MODEL_MARKER] == true || !entry["runtime_id"].to_s.empty?)
     end
 
-    private def find_runtime_model_by_identity(runtime_id, provider_id)
-      return nil if runtime_id.to_s.empty? || provider_id.to_s.empty?
-
+    private def find_reload_model(entry, reused_ids)
       @models.find do |model|
-        runtime_model_entry?(model) &&
-          model["runtime_id"] == runtime_id &&
-          model["provider_id"] == provider_id
+        next false if reused_ids[model["id"]]
+
+        if runtime_model_entry?(entry)
+          runtime_model_entry?(model) &&
+            model["runtime_id"] == entry["runtime_id"] &&
+            model["provider_id"] == entry["provider_id"]
+        else
+          !runtime_model_entry?(model) &&
+            model["model"] == entry["model"] &&
+            model["base_url"] == entry["base_url"]
+        end
       end
     end
 

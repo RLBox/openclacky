@@ -6,18 +6,44 @@ RSpec.describe Clacky::RuntimeSession do
   FakeProfile = Struct.new(:name)
 
   class RuntimeSessionSpecUI
-    attr_reader :assistant_messages, :tool_calls, :tool_results, :queues, :events
+    attr_reader :assistant_messages, :assistant_deltas, :assistant_finishes,
+      :tool_calls, :tool_results, :keyed_tool_calls, :keyed_tool_results,
+      :queues, :events, :progress, :todo_updates, :token_usages,
+      :user_messages
 
     def initialize
       @assistant_messages = []
+      @assistant_deltas = []
+      @assistant_finishes = []
       @tool_calls = []
       @tool_results = []
+      @keyed_tool_calls = []
+      @keyed_tool_results = []
       @queues = []
       @events = []
+      @progress = []
+      @todo_updates = []
+      @token_usages = []
+      @user_messages = []
     end
 
     def show_assistant_message(content, files:, interim: false, created_at: nil)
       @assistant_messages << { content: content, files: files, interim: interim, created_at: created_at }
+    end
+
+    def show_assistant_delta(message_id, content)
+      @assistant_deltas << { message_id: message_id, content: content }
+    end
+
+    def finish_assistant_stream(message_id, content, files:, created_at: nil,
+                                message_ids: nil)
+      @assistant_finishes << {
+        message_id: message_id,
+        message_ids: message_ids,
+        content: content,
+        files: files,
+        created_at: created_at
+      }
     end
 
     def show_tool_call(name, args)
@@ -28,14 +54,36 @@ RSpec.describe Clacky::RuntimeSession do
       @tool_results << result
     end
 
+    def show_keyed_tool_call(name, args, tool_call_id:)
+      @keyed_tool_calls << [tool_call_id, name, args]
+    end
+
+    def show_keyed_tool_result(result, tool_call_id:, status: nil, exit_code: nil)
+      @keyed_tool_results << [tool_call_id, result, status, exit_code]
+    end
+
     def show_input_queue(entries)
       @queues << entries
     end
 
-    def show_user_message(*); end
+    def show_user_message(content, **options)
+      @user_messages << { content: content }.merge(options)
+    end
 
     def emit(type, **data)
       @events << [type, data]
+    end
+
+    def show_progress(content, progress_type: nil)
+      @progress << [progress_type, content]
+    end
+
+    def update_todos(entries)
+      @todo_updates << entries
+    end
+
+    def show_token_usage(token_data)
+      @token_usages << token_data
     end
   end
 
@@ -78,7 +126,7 @@ RSpec.describe Clacky::RuntimeSession do
       @context[:event_sink].call(
         generation,
         type: :assistant_delta,
-        message_id: "assistant-1",
+        message_id: "assistant-2",
         content: "world"
       )
       { stop_reason: "end_turn" }
@@ -181,11 +229,41 @@ RSpec.describe Clacky::RuntimeSession do
     expect(runtime_input.files.first["name"]).to eq("photo.png")
     expect(runtime_input.reference_contexts).to eq(["Reference context"])
     expect(result).to include(stop_reason: "end_turn", awaiting_user_feedback: false)
-    expect(session.history.to_a.map { |message| message[:role] }).to eq(%w[user assistant])
-    expect(session.history.to_a.last[:content]).to eq("Hello world")
-    expect(ui.assistant_messages.last[:content]).to eq("Hello world")
-    expect(ui.tool_calls).to eq([["terminal", { "command" => "pwd" }]])
-    expect(ui.tool_results).to eq(["/workspace"])
+    expect(session.history.to_a.map { |message| message[:role] })
+      .to eq(%w[user assistant assistant tool assistant])
+    expect(session.history.to_a[1][:content]).to eq("Hello ")
+    expect(session.history.to_a.last[:content]).to eq("world")
+    expect(ui.assistant_deltas).to eq([
+      { message_id: "assistant-1", content: "Hello " },
+      { message_id: "assistant-2", content: "world" }
+    ])
+    expect(ui.assistant_finishes).to include(
+      hash_including(
+        message_id: "assistant-1",
+        message_ids: ["assistant-1"],
+        content: "Hello ",
+        files: []
+      ),
+      hash_including(
+        message_id: "assistant-2",
+        message_ids: ["assistant-2"],
+        content: "world",
+        files: []
+      )
+    )
+    expect(ui.assistant_messages).to be_empty
+    expect(ui.keyed_tool_calls).to eq([
+      ["tool-1", "terminal", { "command" => "pwd" }]
+    ])
+    expect(ui.keyed_tool_results).to eq([["tool-1", "/workspace", nil, nil]])
+    tool_call = session.history.to_a[2][:tool_calls].first
+    expect(tool_call).to include(id: "tool-1", type: "function")
+    expect(tool_call.dig(:function, :name)).to eq("terminal")
+    expect(JSON.parse(tool_call.dig(:function, :arguments)))
+      .to eq("command" => "pwd")
+    expect(session.history.to_a[3]).to include(
+      role: "tool", tool_call_id: "tool-1", content: "/workspace"
+    )
     expect(session.total_tasks).to eq(1)
   ensure
     Thread.current[:task_epoch] = nil
@@ -206,6 +284,219 @@ RSpec.describe Clacky::RuntimeSession do
     expect(accepted).to be(false)
     expect(session.history).to be_empty
     expect(ui.assistant_messages).to be_empty
+  ensure
+    session&.close
+  end
+
+  it "persists and forwards failed tool-result metadata" do
+    session = build_session
+    session.begin_generation(44)
+    runtime = built_runtimes.fetch(0)
+    runtime.context[:event_sink].call(
+      44,
+      type: :tool_call,
+      tool_call_id: "failed-tool",
+      name: "terminal",
+      input: { "command" => "false" }
+    )
+    runtime.context[:event_sink].call(
+      44,
+      type: :tool_result,
+      tool_call_id: "failed-tool",
+      result: "command failed",
+      status: "failed",
+      exit_code: 1
+    )
+
+    expect(ui.keyed_tool_results.last).to eq([
+      "failed-tool", "command failed", "failed", 1
+    ])
+    expect(session.history.to_a.last).to include(
+      role: "tool",
+      content: "command failed",
+      runtime_tool_status: "failed",
+      runtime_exit_code: 1
+    )
+  ensure
+    session&.close
+  end
+
+  it "rejects provider events that arrive after a successful turn returns" do
+    session = build_session
+    session.run("hello")
+    runtime = built_runtimes.fetch(0)
+
+    accepted = runtime.context[:event_sink].call(
+      1,
+      type: :assistant_delta,
+      message_id: "late",
+      content: "must not appear"
+    )
+
+    expect(accepted).to be(false)
+    expect(session.history.to_a.map { |message| message[:content] })
+      .not_to include("must not appear")
+  end
+
+  it "rejects provider events that arrive after a failed turn returns" do
+    session = build_session
+    runtime = built_runtimes.fetch(0)
+    allow(runtime).to receive(:run).and_raise("provider failed")
+
+    expect { session.run("hello") }.to raise_error("provider failed")
+    accepted = runtime.context[:event_sink].call(
+      1,
+      type: :assistant_delta,
+      message_id: "late",
+      content: "must not appear"
+    )
+
+    expect(accepted).to be(false)
+  end
+
+  it "persists assistant text streamed before a runtime failure" do
+    session = build_session
+    runtime = built_runtimes.fetch(0)
+    allow(runtime).to receive(:run) do |_input, generation:|
+      runtime.context[:event_sink].call(
+        generation,
+        type: :assistant_delta,
+        message_id: "partial-answer",
+        content: "Visible before failure"
+      )
+      raise "provider failed"
+    end
+
+    expect { session.run("hello") }.to raise_error("provider failed")
+
+    expect(ui.assistant_deltas).to eq([
+      { message_id: "partial-answer", content: "Visible before failure" }
+    ])
+    expect(ui.assistant_finishes).to include(
+      hash_including(
+        message_id: "partial-answer",
+        content: "Visible before failure"
+      )
+    )
+    expect(session.history.to_a.map { |message| message[:role] })
+      .to eq(%w[user assistant])
+    expect(session.history.to_a.last[:content]).to eq("Visible before failure")
+  ensure
+    session&.close
+  end
+
+  it "rechecks the generation after decoding an event before mutating state" do
+    session = build_session
+    session.begin_generation(4)
+    event = {
+      type: :assistant_delta,
+      message_id: "late",
+      content: "must not appear"
+    }
+    switched = false
+    event.define_singleton_method(:[]) do |key|
+      value = super(key)
+      unless switched || key != :type
+        switched = true
+        session.begin_generation(5)
+      end
+      value
+    end
+
+    accepted = session.accept_runtime_event(4, event)
+
+    expect(accepted).to be(false)
+    expect(ui.assistant_deltas).to be_empty
+  ensure
+    session&.close
+  end
+
+  it "accepts provider titles only while the session name is autogenerated" do
+    session = build_session
+    session.rename("First prompt", automatic: true)
+    session.begin_generation(4)
+
+    expect(session.accept_runtime_event(
+      4, type: :session_info, title: "Codex title"
+    )).to be(true)
+    expect(session.name).to eq("Codex title")
+    expect(ui.events.last).to eq([
+      "session_renamed", { session_id: "session-1", name: "Codex title" }
+    ])
+
+    session.rename("My explicit title")
+    session.accept_runtime_event(4, type: :session_info, title: "Late provider title")
+
+    expect(session.name).to eq("My explicit title")
+    expect(ui.events.length).to eq(1)
+
+    session.rename("Session 99")
+    session.accept_runtime_event(4, type: :session_info, title: "Another provider title")
+
+    expect(session.name).to eq("Session 99")
+    expect(ui.events.length).to eq(1)
+  ensure
+    session&.close
+  end
+
+  it "renders markdown plan updates without replacing structured todos" do
+    session = build_session
+    session.begin_generation(4)
+    session.accept_runtime_event(
+      4,
+      type: :plan,
+      content: "1. Inspect\n2. Test",
+      plan_id: "plan-1"
+    )
+
+    expect(ui.progress).to eq([["plan", "1. Inspect\n2. Test"]])
+    expect(ui.todo_updates).to be_empty
+    expect(session.todos).to be_empty
+  ensure
+    session&.close
+  end
+
+
+  it "accepts structured ACP cost without leaking the runtime event type to the UI" do
+    session = build_session
+    session.begin_generation(4)
+
+    expect do
+      session.accept_runtime_event(
+        4,
+        type: :usage,
+        used: 10,
+        size: 100,
+        cost: { "amount" => 0.25, "currency" => "USD" }
+      )
+    end.not_to raise_error
+
+    expect(session.total_cost).to eq(0.25)
+    expect(ui.token_usages).to eq([
+      {
+        used: 10,
+        size: 100,
+        cost: 0.25,
+        cost_currency: "USD",
+        cost_source: "provider"
+      }
+    ])
+  ensure
+    session&.close
+  end
+
+  it "ignores unknown provider events instead of forwarding their payload to the UI" do
+    session = build_session
+    session.begin_generation(4)
+
+    expect(session.accept_runtime_event(
+      4,
+      type: :unknown,
+      session_update: "future_update",
+      secret_payload: "must not reach the browser"
+    )).to be(true)
+
+    expect(ui.events).to be_empty
   ensure
     session&.close
   end
@@ -321,14 +612,44 @@ RSpec.describe Clacky::RuntimeSession do
 
   it "replays its normalized local transcript without consulting the provider" do
     session = build_session
-    session.history.append(role: "user", content: "Question", created_at: 1.0)
+    session.history.append(
+      role: "user",
+      content: "Question",
+      created_at: 1.0,
+      display_references: [{ "kind" => "session", "id" => "session-2" }]
+    )
+    session.history.append(
+      role: "assistant",
+      content: nil,
+      tool_calls: [{
+        id: "tool-replay",
+        type: "function",
+        function: { name: "terminal", arguments: '{"command":"pwd"}' }
+      }]
+    )
+    session.history.append(
+      role: "tool", tool_call_id: "tool-replay", content: "/workspace"
+    )
     session.history.append(role: "assistant", content: "Answer", created_at: 2.0)
     replay_ui = RuntimeSessionSpecUI.new
 
     result = session.replay_history(replay_ui, limit: 20)
 
     expect(result).to eq(has_more: false)
+    expect(replay_ui.user_messages).to include(
+      content: "Question",
+      created_at: 1.0,
+      files: [],
+      references: [{ "kind" => "session", "id" => "session-2" }],
+      source: :history
+    )
     expect(replay_ui.assistant_messages.last[:content]).to eq("Answer")
+    expect(replay_ui.keyed_tool_calls).to eq([
+      ["tool-replay", "terminal", { "command" => "pwd" }]
+    ])
+    expect(replay_ui.keyed_tool_results).to eq([
+      ["tool-replay", "/workspace", nil, nil]
+    ])
   ensure
     session&.close
   end

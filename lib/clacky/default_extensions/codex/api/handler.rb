@@ -22,11 +22,15 @@ class CodexExt < Clacky::ApiExtension
     end
   end
 
-  get "/status" do
+  get "/status", timeout: 10, same_origin: true do
+    json(Clacky::DefaultExtensions::Codex::Runtime.passive_status)
+  end
+
+  post "/connect", timeout: 310, same_origin: true do
     json(Clacky::DefaultExtensions::Codex::Runtime.status)
   end
 
-  post "/authenticate" do
+  post "/authenticate", timeout: 310, same_origin: true do
     result = Clacky::DefaultExtensions::Codex::Runtime.authenticate_async
     json(result, status: result[:started] ? 202 : 200)
   end

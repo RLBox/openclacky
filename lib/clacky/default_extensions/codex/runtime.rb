@@ -1,6 +1,8 @@
 # frozen_string_literal: true
 
 require "json"
+require "uri"
+require_relative "../../thread_registry"
 require_relative "codex_home"
 require_relative "launcher"
 
@@ -21,7 +23,10 @@ module Clacky
 
         CONTROL_TIMEOUT = 5
         INITIALIZE_TIMEOUT = 15
-        NPX_INITIALIZE_TIMEOUT = 180
+        # The first npx launch may need to fetch the platform-specific Codex
+        # package (currently over 100 MB) before ACP initialization can begin.
+        NPX_INITIALIZE_TIMEOUT = 300
+        AUTHENTICATION_TIMEOUT = 300
         AUTH_STATUS_WAIT = 0.25
         MAX_MESSAGE_BYTES = 8 * 1024 * 1024
         STDERR_BYTES = 16 * 1024
@@ -34,13 +39,18 @@ module Clacky
           @thread_spawner = thread_spawner
 
           @lifecycle_mutex = Mutex.new
+          @callback_mutex = Mutex.new
           @state_mutex = Mutex.new
           @state_condition = ConditionVariable.new
           @auth_mutex = Mutex.new
           @sessions_mutex = Mutex.new
+          @turns_mutex = Mutex.new
           @sessions = {}
+          @active_turns = {}
           @client = nil
+          @callback_identity = nil
           @generation = 0
+          @closed = false
           @home_result = nil
           @launcher_result = nil
           @auth_state = nil
@@ -51,9 +61,19 @@ module Clacky
         end
 
         def client_with_generation
-          client = ensure_client
-          generation = @lifecycle_mutex.synchronize { @generation }
-          [client, generation]
+          @lifecycle_mutex.synchronize do
+            [ensure_client_locked, @generation]
+          end
+        end
+
+        def client_for_generation(generation)
+          @lifecycle_mutex.synchronize do
+            next nil unless generation && @generation.to_i == generation.to_i
+            next nil unless @client && @client.initialized?
+            next nil if @client.respond_to?(:alive?) && !@client.alive?
+
+            @client
+          end
         end
 
         def status
@@ -69,6 +89,42 @@ module Clacky
           )
         end
 
+        # Readiness view for GET endpoints. It never prepares a home, resolves
+        # npx, or starts a process; those side effects require an explicit POST
+        # to connect/authenticate or a real runtime health check.
+        def passive_status
+          client, closed = @lifecycle_mutex.synchronize { [@client, @closed] }
+          return unavailable_status("connection_closed", "The Codex ACP connection is closed.") if closed
+
+          if client && client.initialized? &&
+             (!client.respond_to?(:alive?) || client.alive?)
+            return status_snapshot
+          end
+
+          launch = @launcher_result
+          if launch && !launch.available?
+            return unavailable_status(
+              launch.error_code || "launcher_unavailable",
+              launch.message || "Codex ACP launch dependencies are unavailable."
+            )
+          end
+
+          home = @home_result
+          {
+            available: nil,
+            status: "not_connected",
+            authenticated: false,
+            auth_reused: home && home.auth_reused == true,
+            auth_reason: home && home.auth_reason,
+            can_authenticate: true
+          }
+        rescue StandardError
+          unavailable_status(
+            "acp_unavailable",
+            "OpenClacky could not inspect the Codex ACP runtime."
+          )
+        end
+
         def health
           snapshot = status
           snapshot.merge(
@@ -77,8 +133,19 @@ module Clacky
           )
         end
 
+        def workspace_allowed?(working_dir)
+          candidate = canonical_path(working_dir)
+          protected_paths = @home_result&.respond_to?(:protected_paths) ?
+            Array(@home_result.protected_paths) : []
+          protected_paths.none? do |protected_path|
+            protected_candidate = canonical_path(protected_path)
+            inside_path?(candidate, protected_candidate) ||
+              inside_path?(protected_candidate, candidate)
+          end
+        end
+
         def authenticate_async
-          client = ensure_client
+          client, generation = client_with_generation
           unless client.auth_methods.any? { |method| method["id"].to_s == "chat-gpt" }
             return {
               ok: false,
@@ -90,7 +157,7 @@ module Clacky
           end
 
           @auth_mutex.synchronize do
-            if @auth_thread&.alive?
+            if @auth_thread&.alive? && @auth_thread_generation == generation
               return { ok: true, started: false, status: "authenticating" }
             end
 
@@ -99,8 +166,9 @@ module Clacky
               @auth_error = nil
               @state_condition.broadcast
             end
+            @auth_thread_generation = generation
             @auth_thread = spawn_thread("codex-acp-authenticate") do
-              run_authentication(client)
+              run_authentication(client, generation)
             end
           end
           { ok: true, started: true, status: "authenticating" }
@@ -124,11 +192,20 @@ module Clacky
 
         def bind_session(runtime, session_id, previous_session_id: nil)
           @sessions_mutex.synchronize do
+            existing = @sessions[session_id.to_s]
+            return false if existing && !existing.equal?(runtime)
+
             if previous_session_id && previous_session_id.to_s != session_id.to_s
-              @sessions.delete(previous_session_id.to_s)
+              previous = @sessions[previous_session_id.to_s]
+              @sessions.delete(previous_session_id.to_s) if previous.equal?(runtime)
             end
             @sessions[session_id.to_s] = runtime
+            true
           end
+        end
+
+        def reserve_session(runtime, session_id)
+          bind_session(runtime, session_id)
         end
 
         def unbind_session(runtime, session_id: nil)
@@ -139,17 +216,67 @@ module Clacky
           end
         end
 
+        def begin_turn(runtime)
+          @turns_mutex.synchronize do
+            @lifecycle_mutex.synchronize do
+              raise UnavailableError.new(
+                "connection_closed", "The Codex ACP connection is closed."
+              ) if @closed
+            end
+            @active_turns[runtime.object_id] = runtime
+          end
+          true
+        end
+
+        def end_turn(runtime)
+          @turns_mutex.synchronize { @active_turns.delete(runtime.object_id) }
+          true
+        end
+
+        # Stop a wedged ACP process only if it is still the exact connection
+        # generation observed by the cancelled request. A stale watchdog must
+        # never tear down a replacement process started by a later turn.
+        def restart_if_generation(client, generation, requester: nil)
+          @turns_mutex.synchronize do
+            other_turn_active = @active_turns.values.any? do |runtime|
+              requester.nil? || !runtime.equal?(requester)
+            end
+            return false if other_turn_active
+
+            @lifecycle_mutex.synchronize do
+              return false if @closed
+              return false unless @client.equal?(client)
+              return false unless @generation.to_i == generation.to_i
+
+              @client = nil
+              @auth_push_supported = false
+              deactivate_client_callbacks(client)
+              client.stop
+              reset_connection_auth_state
+              true
+            end
+          end
+        rescue StandardError
+          false
+        end
+
         def close
-          client = @lifecycle_mutex.synchronize do
+          closed_now = @lifecycle_mutex.synchronize do
+            return nil if @closed
+
+            @closed = true
             existing = @client
             @client = nil
-            existing
+            deactivate_client_callbacks(existing)
+            existing&.stop
+            true
           end
-          client&.stop
+          return nil unless closed_now
 
           thread = @auth_mutex.synchronize { @auth_thread }
           thread&.join(1) unless thread == Thread.current
           @sessions_mutex.synchronize { @sessions.clear }
+          @turns_mutex.synchronize { @active_turns.clear }
           @state_mutex.synchronize do
             @authenticating = false
             @auth_state = nil
@@ -162,22 +289,34 @@ module Clacky
 
         private def ensure_client
           @lifecycle_mutex.synchronize do
-            if @client && @client.initialized? &&
-               (!@client.respond_to?(:alive?) || @client.alive?)
-              return @client
-            end
-
-            old_client = @client
-            @client = nil
-            old_client&.stop
-            start_client
+            ensure_client_locked
           end
+        end
+
+        private def ensure_client_locked
+          if @closed
+            raise UnavailableError.new(
+              "connection_closed", "The Codex ACP connection is closed."
+            )
+          end
+          if @client && @client.initialized? &&
+             (!@client.respond_to?(:alive?) || @client.alive?)
+            return @client
+          end
+
+          old_client = @client
+          @client = nil
+          deactivate_client_callbacks(old_client)
+          old_client&.stop
+          start_client
         end
 
         private def start_client
           home_result = @home_manager.prepare
-          launcher = @launcher_factory.call(home_result.managed_home)
+          launcher = @launcher_factory.call(home_result)
           launch = launcher.resolve
+          @home_result = home_result
+          @launcher_result = launch
           unless launch.available?
             raise UnavailableError.new(
               launch.error_code || "launcher_unavailable",
@@ -186,9 +325,8 @@ module Clacky
           end
 
           client = @client_factory.call(launch)
-          @home_result = home_result
-          @launcher_result = launch
-          install_handlers(client)
+          callback_token = activate_client_callbacks(client)
+          install_handlers(client, callback_token)
           reset_connection_auth_state
           client.start(
             client_info: {
@@ -206,19 +344,52 @@ module Clacky
           @generation += 1
           @client = client
         rescue StandardError
+          deactivate_client_callbacks(client)
           client&.stop rescue nil
           raise
         end
 
-        private def install_handlers(client)
+        private def install_handlers(client, callback_token)
           client.on_notification("_auth/status_update") do |params|
+            next unless current_client_callback?(client, callback_token)
+
             apply_auth_status(params["authStatus"])
           end
           client.on_notification("session/update") do |params|
+            next unless current_client_callback?(client, callback_token)
+
             dispatch_session_update(params)
           end
           client.on_request("session/request_permission") do |params|
-            dispatch_permission_request(params)
+            if current_client_callback?(client, callback_token)
+              dispatch_permission_request(params)
+            else
+              Runtime.rejected_permission_response(params)
+            end
+          end
+        end
+
+        private def activate_client_callbacks(client)
+          token = Object.new
+          @callback_mutex.synchronize do
+            @callback_identity = [client, token]
+          end
+          token
+        end
+
+        private def deactivate_client_callbacks(client)
+          return unless client
+
+          @callback_mutex.synchronize do
+            identity = @callback_identity
+            @callback_identity = nil if identity && identity[0].equal?(client)
+          end
+        end
+
+        private def current_client_callback?(client, token)
+          @callback_mutex.synchronize do
+            identity = @callback_identity
+            identity && identity[0].equal?(client) && identity[1].equal?(token)
           end
         end
 
@@ -232,11 +403,15 @@ module Clacky
           }
         end
 
-        private def build_launcher(managed_home)
+        private def build_launcher(home_result)
           Launcher.new(
-            codex_home: managed_home,
+            codex_home: home_result.managed_home,
             explicit_path: ENV["CLACKY_CODEX_ACP_PATH"],
-            codex_path: ENV["CLACKY_CODEX_PATH"]
+            codex_path: ENV["CLACKY_CODEX_PATH"],
+            protected_auth_paths: home_result.respond_to?(:protected_auth_paths) ?
+              home_result.protected_auth_paths : [],
+            protected_paths: home_result.respond_to?(:protected_paths) ?
+              home_result.protected_paths : []
           )
         end
 
@@ -245,6 +420,7 @@ module Clacky
             name: "codex-acp",
             argv: launch.argv,
             env: launch.env,
+            cwd: launch.cwd,
             max_message_bytes: MAX_MESSAGE_BYTES,
             stderr_bytes: STDERR_BYTES
           )
@@ -376,24 +552,62 @@ module Clacky
           "Waiting for Codex authentication status."
         end
 
-        private def run_authentication(client)
+        private def canonical_path(path)
+          expanded = File.expand_path(path.to_s)
+          File.exist?(expanded) ? File.realpath(expanded) : expanded
+        rescue SystemCallError
+          expanded || File.expand_path(path.to_s)
+        end
+
+        private def inside_path?(candidate, parent)
+          candidate == parent ||
+            candidate.start_with?(parent.chomp(File::SEPARATOR) + File::SEPARATOR)
+        end
+
+        private def run_authentication(client, generation)
           client.request(
-            "authenticate", { "methodId" => "chat-gpt" }, timeout: nil
+            "authenticate", { "methodId" => "chat-gpt" },
+            timeout: AUTHENTICATION_TIMEOUT
           )
-          @state_mutex.synchronize do
-            @auth_state ||= {
-              authenticated: true,
-              kind: "account",
-              label: "ChatGPT"
-            }
-            @auth_error = nil
+          if current_client_generation?(client, generation)
+            @state_mutex.synchronize do
+              @auth_state ||= {
+                authenticated: true,
+                kind: "account",
+                label: "ChatGPT"
+              }
+              @auth_error = nil
+            end
+          end
+        rescue Clacky::Acp::Client::RequestTimeout
+          restarted = restart_if_generation(client, generation)
+          unless restarted
+            if current_client_generation?(client, generation)
+              @state_mutex.synchronize { @auth_error = true }
+            end
           end
         rescue StandardError
-          @state_mutex.synchronize { @auth_error = true }
+          if current_client_generation?(client, generation)
+            @state_mutex.synchronize { @auth_error = true }
+          end
         ensure
-          @state_mutex.synchronize do
-            @authenticating = false
-            @state_condition.broadcast
+          if current_client_generation?(client, generation)
+            @state_mutex.synchronize do
+              @authenticating = false
+              @state_condition.broadcast
+            end
+          end
+          @auth_mutex.synchronize do
+            if @auth_thread == Thread.current
+              @auth_thread = nil
+              @auth_thread_generation = nil
+            end
+          end
+        end
+
+        private def current_client_generation?(client, generation)
+          @lifecycle_mutex.synchronize do
+            @client.equal?(client) && @generation.to_i == generation.to_i
           end
         end
 
@@ -416,11 +630,7 @@ module Clacky
         private def spawn_thread(name, &block)
           return @thread_spawner.call(name, &block) if @thread_spawner
 
-          if defined?(Clacky::ThreadRegistry)
-            Clacky::ThreadRegistry.spawn(name: name, daemon: true, &block)
-          else
-            Thread.new(&block)
-          end
+          Clacky::ThreadRegistry.spawn(name: name, daemon: true, &block)
         end
       end
 
@@ -430,8 +640,10 @@ module Clacky
         class Error < StandardError; end
         class BusyError < Error; end
         class UnsupportedInput < Error; end
+        class TurnCancelled < Error; end
 
         CONTROL_TIMEOUT = 5
+        CANCEL_GRACE = 1.0
         MAX_THOUGHT_BYTES = 8 * 1024
 
         class << self
@@ -449,6 +661,10 @@ module Clacky
             connection.status
           end
 
+          def passive_status
+            connection.passive_status
+          end
+
           def authenticate_async
             connection.authenticate_async
           end
@@ -464,8 +680,7 @@ module Clacky
 
           def rejected_permission_response(params)
             options = Array(params && params["options"])
-            rejection = options.find { |option| option["kind"].to_s == "reject_once" } ||
-                        options.find { |option| option["kind"].to_s.start_with?("reject") }
+            rejection = options.find { |option| option["kind"].to_s == "reject_once" }
             if rejection
               {
                 "outcome" => {
@@ -495,10 +710,21 @@ module Clacky
           @external_session_id = nil if @external_session_id.empty?
           @config_options = []
           @client_generation = nil
+          @session_ready = false
           @active_generation = nil
           @state_mutex = Mutex.new
           @run_mutex = Mutex.new
+          @run_condition = ConditionVariable.new
           @in_flight = false
+          @turn_sequence = 0
+          @active_turn_token = nil
+          @active_client = nil
+          @active_client_generation = nil
+          @cancel_watchdog_token = nil
+          @cancel_requested = false
+          @prompt_visible = false
+          @prompt_sent = false
+          @cancel_notified = false
           @closed = false
           @tools = {}
         end
@@ -520,60 +746,131 @@ module Clacky
 
         def run(input, generation:)
           reserved = false
-          reserve_turn!
+          connection_turn = false
+          prompt_sent = false
+          client = nil
+          turn_token = reserve_turn!
           reserved = true
+          if @connection.respond_to?(:begin_turn)
+            @connection.begin_turn(self)
+            connection_turn = true
+          end
           @state_mutex.synchronize { @active_generation = generation.to_i }
-          client = ensure_external_session
+          client = ensure_external_session(turn_token)
+          raise TurnCancelled if turn_cancelled?
+
           prompt = build_prompt(input, client)
-          result = client.request(
-            "session/prompt",
-            { "sessionId" => external_session_id, "prompt" => prompt },
-            timeout: nil
-          )
+          session_id = external_session_id
+          begin
+            result = client.request(
+              "session/prompt",
+              { "sessionId" => session_id, "prompt" => prompt },
+              timeout: nil,
+              before_send: lambda do
+                mark_prompt_visible(turn_token)
+              end,
+              on_sent: lambda do
+                prompt_sent = true
+                mark_prompt_sent(client, session_id, turn_token)
+              end,
+              on_send_error: lambda do
+                mark_prompt_send_failed(turn_token)
+              end
+            )
+          ensure
+            mark_prompt_finished(turn_token)
+          end
+          usage_event = normalize_prompt_usage(result["usage"])
+          emit_event(generation, usage_event) if usage_event
+          raise TurnCancelled if turn_cancelled?
+
           {
             stop_reason: result["stopReason"],
             awaiting_user_feedback: false
           }
+        rescue TurnCancelled
+          discard_cancelled_external_session(client) unless prompt_sent
+          { stop_reason: "cancelled", awaiting_user_feedback: false }
+        rescue Clacky::Acp::Client::TransportError
+          raise unless turn_cancelled?
+
+          discard_cancelled_external_session(client)
+          { stop_reason: "cancelled", awaiting_user_feedback: false }
         ensure
           if reserved
+            close_external_session(client) if client && closed?
             @state_mutex.synchronize { @active_generation = nil }
-            @run_mutex.synchronize { @in_flight = false }
+            @run_mutex.synchronize do
+              if @active_turn_token == turn_token
+                @in_flight = false
+                @active_turn_token = nil
+                @active_client = nil
+                @active_client_generation = nil
+                @cancel_requested = false
+                @prompt_visible = false
+                @prompt_sent = false
+                @prompt_waiting = false
+                @cancel_notified = false
+                @run_condition.broadcast
+              end
+            end
           end
+          @connection.end_turn(self) if connection_turn &&
+                                        @connection.respond_to?(:end_turn)
         end
 
         def cancel(reason:)
-          session_id = external_session_id
-          return false unless session_id
+          turn_token = @run_mutex.synchronize do
+            next false unless @in_flight
 
-          client, = @connection.client_with_generation
-          client.notify("session/cancel", "sessionId" => session_id)
-          ui = @context[:ui]
-          if ui&.respond_to?(:cancel_pending_confirmations)
-            ui.cancel_pending_confirmations(result: false)
+            @cancel_requested = true
+            @run_condition.broadcast
+            @active_turn_token
           end
+          return false unless turn_token
+
+          cancel_pending_confirmations
+          session_id = external_session_id
+          if session_id
+            client = connected_client
+            notify_cancel_if_ready(client, session_id)
+          end
+          schedule_cancel_watchdog(turn_token)
           true
         rescue StandardError
-          false
+          !turn_token.nil? && turn_token != false
         end
 
         def close
-          return if @closed
+          state = @run_mutex.synchronize do
+            next nil if @closed
 
-          busy = @run_mutex.synchronize { @in_flight }
-          cancel(reason: :close) if busy
+            @closed = true
+            @cancel_requested = true if @in_flight
+            @run_condition.broadcast
+            { busy: @in_flight, turn_token: @active_turn_token }
+          end
+          return unless state
+
+          cancel_pending_confirmations
           session_id = external_session_id
           @connection.unbind_session(self, session_id: session_id)
-          unless busy || session_id.nil?
+          connected_session_id = connected_external_session_id
+          unless connected_session_id.nil?
             begin
-              client, = @connection.client_with_generation
-              client.request(
-                "session/close", { "sessionId" => session_id }, timeout: CONTROL_TIMEOUT
-              )
+              client = connected_client
+              if !client
+                clear_external_session(connected_session_id)
+              elsif state[:busy]
+                notify_cancel_if_ready(client, connected_session_id)
+              else
+                close_external_session(client, connected_session_id)
+              end
             rescue StandardError
               nil
             end
           end
-          @closed = true
+          schedule_cancel_watchdog(state[:turn_token]) if state[:busy]
           nil
         end
 
@@ -582,8 +879,12 @@ module Clacky
           return {} unless session_id
 
           state = { "session_id" => session_id }
-          model = current_config_value("model")
-          effort = current_config_value("reasoning_effort")
+          saved_model, saved_effort = @state_mutex.synchronize do
+            [@saved_model, @saved_reasoning_effort]
+          end
+          model = current_config_value("model") || present_string(saved_model)
+          effort = current_config_value("reasoning_effort") ||
+                   present_string(saved_effort)
           state["model"] = model if model
           state["reasoning_effort"] = effort if effort
           state
@@ -595,28 +896,36 @@ module Clacky
 
           update_type = update["sessionUpdate"].to_s
           replace_config_options(update["configOptions"]) if update_type == "config_option_update"
-          event = normalize_update(update_type, update)
-          return unless event
+          event_or_events = normalize_update(update_type, update)
+          return unless event_or_events
 
           generation = @state_mutex.synchronize do
             @closed ? nil : @active_generation
           end
-          emit_event(generation, event) if generation
+          events = event_or_events.is_a?(Array) ? event_or_events : [event_or_events]
+          events.each { |event| emit_event(generation, event) } if generation
         end
 
         def handle_permission_request(params)
+          return cancelled_permission_response unless permission_request_allowed?
+
           options = Array(params && params["options"])
           allow = options.find { |option| option["kind"].to_s == "allow_once" }
           reject = options.find { |option| option["kind"].to_s == "reject_once" }
-          title = params.dig("toolCall", "title").to_s.strip
-          title = "Allow this Codex action?" if title.empty?
           ui = @context[:ui]
-          approved = if ui&.respond_to?(:request_confirmation)
-                       ui.request_confirmation(title, default: false) == true
-                     else
-                       false
-                     end
-          selected = approved ? allow : reject
+          answer = if @context[:permission_mode].to_s == "auto_approve"
+                     true
+                   elsif ui&.respond_to?(:request_confirmation)
+                     ui.request_confirmation(permission_prompt(params), default: false)
+                   else
+                     false
+                   end
+          unless permission_request_allowed?
+            return cancelled_permission_response
+          end
+          return cancelled_permission_response if answer.to_s == "cancelled"
+
+          selected = answer == true ? allow : reject
           if selected
             {
               "outcome" => {
@@ -625,10 +934,14 @@ module Clacky
               }
             }
           else
-            self.class.rejected_permission_response(params)
+            cancelled_permission_response
           end
         rescue StandardError
-          self.class.rejected_permission_response(params)
+          if permission_request_allowed?
+            self.class.rejected_permission_response(params)
+          else
+            cancelled_permission_response
+          end
         end
 
         private def reserve_turn!
@@ -637,14 +950,303 @@ module Clacky
             raise BusyError, "Codex session already has an in-flight prompt" if @in_flight
 
             @in_flight = true
+            @turn_sequence += 1
+            @active_turn_token = @turn_sequence
+            @active_client = nil
+            @active_client_generation = nil
+            @cancel_requested = false
+            @prompt_visible = false
+            @prompt_sent = false
+            @prompt_waiting = false
+            @cancel_notified = false
+            @run_condition.broadcast
+            @active_turn_token
           end
         end
 
-        private def ensure_external_session
+        private def turn_cancelled?
+          @run_mutex.synchronize { @cancel_requested || @closed }
+        end
+
+        private def permission_request_allowed?
+          @run_mutex.synchronize do
+            @in_flight && @prompt_visible && !@cancel_requested && !@closed
+          end
+        end
+
+        private def closed?
+          @run_mutex.synchronize { @closed }
+        end
+
+        private def mark_prompt_visible(turn_token)
+          @run_mutex.synchronize do
+            return unless @active_turn_token == turn_token
+
+            @prompt_visible = true
+            @run_condition.broadcast
+          end
+        end
+
+        private def mark_prompt_sent(client, session_id, turn_token)
+          cancelled = @run_mutex.synchronize do
+            next false unless @active_turn_token == turn_token
+
+            @prompt_visible = true
+            @prompt_sent = true
+            @prompt_waiting = true
+            @run_condition.broadcast
+            @cancel_requested || @closed
+          end
+          notify_cancel_if_ready(client, session_id)
+          schedule_cancel_watchdog(turn_token) if cancelled
+        end
+
+        private def mark_prompt_send_failed(turn_token)
+          @run_mutex.synchronize do
+            return unless @active_turn_token == turn_token
+
+            @prompt_visible = false
+            @prompt_sent = false
+            @prompt_waiting = false
+            @run_condition.broadcast
+          end
+        end
+
+        private def mark_prompt_finished(turn_token)
+          @run_mutex.synchronize do
+            next unless @active_turn_token == turn_token
+
+            @prompt_visible = false
+            @prompt_waiting = false
+            @run_condition.broadcast
+          end
+        end
+
+        private def notify_cancel_if_ready(client, session_id)
+          should_notify = @run_mutex.synchronize do
+            next false unless @in_flight && @prompt_sent
+            next false unless @cancel_requested || @closed
+            next false if @cancel_notified
+
+            @cancel_notified = true
+            true
+          end
+          return false unless should_notify
+
+          client.notify("session/cancel", "sessionId" => session_id)
+          true
+        rescue StandardError
+          @run_mutex.synchronize { @cancel_notified = false }
+          false
+        end
+
+        private def schedule_cancel_watchdog(turn_token)
+          return unless turn_token
+
+          spawn = @run_mutex.synchronize do
+            next false unless cancelled_turn_locked?(turn_token)
+            next false if @cancel_watchdog_token == turn_token
+
+            @cancel_watchdog_token = turn_token
+            true
+          end
+          return false unless spawn
+
+          spawn_thread("codex-acp-cancel-watchdog") do
+            watch_cancelled_turn(turn_token)
+          end
+          true
+        end
+
+        private def watch_cancelled_turn(turn_token)
+          deadline = monotonic_now + CANCEL_GRACE
+          target = nil
+          loop do
+            cancel_pending_confirmations
+            state = @run_mutex.synchronize do
+              unless cancelled_turn_locked?(turn_token)
+                next [:done]
+              end
+
+              remaining = deadline - monotonic_now
+              if remaining.positive?
+                @run_condition.wait(@run_mutex, remaining)
+                next [:wait]
+              end
+              if @active_client && @active_client_generation
+                next [:restart, @active_client, @active_client_generation]
+              end
+
+              # Client startup is itself bounded, but may still be crossing its
+              # initialize request when cancellation arrives. Wait for the exact
+              # client/generation pair rather than restarting an unrelated one.
+              @run_condition.wait(@run_mutex, CONTROL_TIMEOUT)
+              [:wait]
+            end
+            break if state.first == :done
+            if state.first == :restart
+              target = state.drop(1)
+              break
+            end
+          end
+
+          while target && @connection.respond_to?(:restart_if_generation)
+            restarted = @connection.restart_if_generation(
+              target[0], target[1], requester: self
+            )
+            if restarted
+              cancel_pending_confirmations
+              break
+            end
+
+            target = @run_mutex.synchronize do
+              next nil unless cancelled_turn_locked?(turn_token)
+
+              @run_condition.wait(@run_mutex, CANCEL_GRACE)
+              next nil unless cancelled_turn_locked?(turn_token)
+
+              [@active_client, @active_client_generation]
+            end
+          end
+        ensure
+          @run_mutex.synchronize do
+            @cancel_watchdog_token = nil if @cancel_watchdog_token == turn_token
+          end
+        end
+
+        private def cancelled_turn_locked?(turn_token)
+          @in_flight && @active_turn_token == turn_token &&
+            (@cancel_requested || @closed)
+        end
+
+        private def remember_turn_client(client, generation, turn_token)
+          @run_mutex.synchronize do
+            return unless @in_flight && @active_turn_token == turn_token
+
+            @active_client = client
+            @active_client_generation = generation
+            @run_condition.broadcast
+          end
+        end
+
+        private def spawn_thread(name, &block)
+          Clacky::ThreadRegistry.spawn(name: name, daemon: true, &block)
+        end
+
+        private def monotonic_now
+          Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        end
+
+        private def cancel_pending_confirmations
+          ui = @context[:ui]
+          return unless ui&.respond_to?(:cancel_pending_confirmations)
+
+          ui.cancel_pending_confirmations(result: "cancelled")
+        end
+
+        private def discard_opened_session_if_closed!(client, session_id)
+          return unless closed?
+
+          close_external_session(client, session_id)
+          raise TurnCancelled
+        end
+
+        private def discard_cancelled_external_session(client)
+          session_id = external_session_id
+          return unless session_id
+
+          @connection.unbind_session(self, session_id: session_id)
+          begin
+            if client
+              client.request(
+                "session/close",
+                { "sessionId" => session_id },
+                timeout: CONTROL_TIMEOUT
+              )
+            end
+          rescue StandardError
+            nil
+          ensure
+            clear_external_session(session_id)
+          end
+        end
+
+        private def close_external_session(client, session_id = nil)
+          target = session_id || external_session_id
+          return unless target
+
+          @connection.unbind_session(self, session_id: target)
+          client.request(
+            "session/close", { "sessionId" => target }, timeout: CONTROL_TIMEOUT
+          )
+        rescue StandardError
+          nil
+        ensure
+          @state_mutex.synchronize do
+            if @external_session_id.to_s == target.to_s
+              @external_session_id = nil
+              @client_generation = nil
+              @session_ready = false
+            end
+          end if target
+        end
+
+        private def cancelled_permission_response
+          { "outcome" => { "outcome" => "cancelled" } }
+        end
+
+        private def permission_prompt(params)
+          request = params.is_a?(Hash) ? params : {}
+          tool_call = request["toolCall"].is_a?(Hash) ? request["toolCall"] : {}
+          raw_input = tool_call["rawInput"].is_a?(Hash) ? tool_call["rawInput"] : {}
+          title = tool_call["title"].to_s.strip
+          title = "Allow this Codex action?" if title.empty?
+          lines = [title]
+          append_permission_detail(lines, "Command", raw_input["command"])
+          append_permission_detail(lines, "Working directory", raw_input["cwd"])
+          %w[path paths url host network].each do |key|
+            append_permission_detail(lines, key.tr("_", " ").capitalize, raw_input[key])
+          end
+          locations = tool_call["locations"] || request["locations"]
+          append_permission_detail(lines, "Locations", locations)
+          description = request.dig("_meta", "permission", "description")
+          append_permission_detail(lines, "Reason", description)
+          lines.join("\n").byteslice(0, 4096).to_s.force_encoding(Encoding::UTF_8).scrub
+        end
+
+        private def append_permission_detail(lines, label, value)
+          return if value.nil? || (value.respond_to?(:empty?) && value.empty?)
+
+          rendered = value.is_a?(String) ? value : JSON.generate(value)
+          rendered = rendered.to_s.gsub(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/, " ")
+          rendered = rendered.byteslice(0, 2048).to_s.force_encoding(Encoding::UTF_8).scrub
+          lines << "#{label}: #{rendered}"
+        rescue JSON::GeneratorError
+          nil
+        end
+
+        private def ensure_external_session(turn_token)
           client, generation = @connection.client_with_generation
-          return client if @client_generation == generation && external_session_id
+          if @connection.respond_to?(:workspace_allowed?) &&
+             !@connection.workspace_allowed?(@context[:working_dir] || Dir.pwd)
+            raise Error, "Codex workspace overlaps a protected credential path"
+          end
+          remember_turn_client(client, generation, turn_token)
+          if connected_to_generation?(generation)
+            configure_open_session(client, generation) unless session_ready?
+            return client
+          end
 
           old_session_id = external_session_id
+          if old_session_id && !reserve_external_session(old_session_id)
+            emit_event(active_generation, type: :warning, code: "resume_conflict")
+            @state_mutex.synchronize do
+              @external_session_id = nil
+              @client_generation = nil
+              @session_ready = false
+            end
+            old_session_id = nil
+          end
           if old_session_id
             begin
               response = client.request(
@@ -652,13 +1254,15 @@ module Clacky
                 session_open_params(old_session_id),
                 timeout: CONTROL_TIMEOUT
               )
+              discard_opened_session_if_closed!(client, old_session_id)
               accept_opened_session(client, generation, old_session_id, response)
-              restore_effective_configuration(client)
+              configure_open_session(client, generation)
               return client
-            rescue Clacky::Acp::Client::ProtocolError
+            rescue Clacky::Acp::Client::ProtocolError => e
+              raise unless e.code.to_i == -32_002
+
               emit_event(active_generation, type: :warning, code: "resume_failed")
-              @connection.unbind_session(self, session_id: old_session_id)
-              @state_mutex.synchronize { @external_session_id = nil }
+              clear_external_session(old_session_id)
             end
           end
 
@@ -668,9 +1272,36 @@ module Clacky
           session_id = response["sessionId"].to_s
           raise Error, "Codex ACP did not return a session id" if session_id.empty?
 
+          discard_opened_session_if_closed!(client, session_id)
           accept_opened_session(client, generation, session_id, response,
                                 previous_session_id: old_session_id)
+          configure_open_session(client, generation)
           client
+        end
+
+        private def connected_to_generation?(generation)
+          @state_mutex.synchronize do
+            @client_generation.to_i == generation.to_i && !@external_session_id.nil?
+          end
+        end
+
+        private def session_ready?
+          @state_mutex.synchronize { @session_ready }
+        end
+
+        private def configure_open_session(client, generation)
+          return false if turn_cancelled?
+
+          apply_permission_mode(client)
+          return false if turn_cancelled?
+
+          restore_effective_configuration(client)
+          @state_mutex.synchronize do
+            if @client_generation.to_i == generation.to_i && @external_session_id
+              @session_ready = true
+            end
+          end
+          true
         end
 
         private def session_open_params(session_id = nil)
@@ -684,24 +1315,70 @@ module Clacky
 
         private def accept_opened_session(client, generation, session_id, response,
                                           previous_session_id: nil)
+          bound = @connection.bind_session(
+            self, session_id, previous_session_id: previous_session_id
+          )
+          raise Error, "Codex ACP session is already owned locally" unless bound
+
           @state_mutex.synchronize do
             @external_session_id = session_id
             @client_generation = generation
+            @session_ready = false
           end
-          @connection.bind_session(
-            self, session_id, previous_session_id: previous_session_id
-          )
+
           replace_config_options(response["configOptions"])
-          apply_permission_mode(client)
+        end
+
+        private def reserve_external_session(session_id)
+          if @connection.respond_to?(:reserve_session)
+            @connection.reserve_session(self, session_id)
+          else
+            @connection.bind_session(self, session_id)
+          end
+        end
+
+        private def connected_external_session_id
+          @state_mutex.synchronize do
+            @client_generation ? @external_session_id : nil
+          end
+        end
+
+        private def connected_client
+          generation = @state_mutex.synchronize { @client_generation }
+          return nil unless generation
+          if @connection.respond_to?(:client_for_generation)
+            return @connection.client_for_generation(generation)
+          end
+
+          client, current_generation = @connection.client_with_generation
+          current_generation.to_i == generation.to_i ? client : nil
+        end
+
+        private def clear_external_session(session_id)
+          @connection.unbind_session(self, session_id: session_id)
+          @state_mutex.synchronize do
+            if @external_session_id.to_s == session_id.to_s
+              @external_session_id = nil
+              @client_generation = nil
+              @session_ready = false
+            end
+          end
         end
 
         private def restore_effective_configuration(client)
-          apply_saved_config_value(client, "model", @saved_model)
+          saved_model, saved_effort = @state_mutex.synchronize do
+            [@saved_model, @saved_reasoning_effort]
+          end
+          apply_saved_config_value(client, "model", saved_model)
           apply_saved_config_value(
-            client, "reasoning_effort", @saved_reasoning_effort
+            client, "reasoning_effort", saved_effort
           )
-          @saved_model = nil
-          @saved_reasoning_effort = nil
+          @state_mutex.synchronize do
+            @saved_model = nil if @saved_model == saved_model
+            if @saved_reasoning_effort == saved_effort
+              @saved_reasoning_effort = nil
+            end
+          end
         end
 
         private def apply_saved_config_value(client, config_id, saved_value)
@@ -784,6 +1461,11 @@ module Clacky
           string.empty? ? nil : string
         end
 
+        private def present_string(value)
+          string = value.to_s.strip
+          string.empty? ? nil : string
+        end
+
         private def build_prompt(input, client)
           blocks = []
           content = input.content.to_s
@@ -805,7 +1487,12 @@ module Clacky
 
                 blocks << image
               else
-                raise UnsupportedInput, "Codex ACP cannot represent this attachment"
+                resource_link = resource_link_block(file)
+                unless resource_link
+                  raise UnsupportedInput, "Codex ACP cannot represent this attachment"
+                end
+
+                blocks << resource_link
               end
             end
           end
@@ -828,6 +1515,31 @@ module Clacky
           }
         end
 
+        private def resource_link_block(file)
+          return nil unless file.is_a?(Hash)
+
+          path = value(file, "path").to_s
+          return nil if path.empty?
+
+          absolute_path = File.expand_path(path, @context[:working_dir] || Dir.pwd)
+          return nil unless File.exist?(absolute_path)
+
+          escaped_path = URI::DEFAULT_PARSER.escape(absolute_path)
+          block = {
+            "type" => "resource_link",
+            "name" => value(file, "name").to_s,
+            "uri" => URI::Generic.build(scheme: "file", path: escaped_path).to_s
+          }
+          block["name"] = File.basename(absolute_path) if block["name"].empty?
+          mime_type = value(file, "mime_type").to_s
+          mime_type = value(file, "type").to_s if mime_type.empty?
+          block["mimeType"] = mime_type if mime_type.include?("/")
+          block["size"] = File.size(absolute_path) if File.file?(absolute_path)
+          block
+        rescue ArgumentError, URI::InvalidURIError
+          nil
+        end
+
         private def normalize_update(update_type, update)
           case update_type
           when "agent_message_chunk"
@@ -839,15 +1551,20 @@ module Clacky
           when "agent_thought_chunk"
             { type: :thought, content: bounded_text(content_text(update["content"])) }
           when "tool_call"
-            @tools[update["toolCallId"].to_s] = deep_copy(update)
-            tool_call_event(update)
+            normalize_tool_call(update)
           when "tool_call_update"
             normalize_tool_update(update)
           when "plan"
-            { type: :plan, entries: deep_copy(Array(update["entries"])) }
+            { type: :plan, entries: normalize_plan_entries(update["entries"]) }
           when "plan_update"
             plan = update["plan"].is_a?(Hash) ? update["plan"] : {}
-            { type: :plan, entries: deep_copy(Array(plan["entries"])), plan: deep_copy(plan) }
+            {
+              type: :plan,
+              entries: normalize_plan_entries(plan["entries"]),
+              plan_id: plan["planId"],
+              content: bounded_text(plan["content"]),
+              plan: deep_copy(plan)
+            }
           when "usage_update"
             {
               type: :usage,
@@ -873,16 +1590,65 @@ module Clacky
           current = @tools[id] || {}
           merged = current.merge(deep_copy(update))
           @tools[id] = merged
-          if %w[completed failed].include?(merged["status"].to_s)
-            {
-              type: :tool_result,
-              tool_call_id: id,
-              result: merged.key?("rawOutput") ? deep_copy(merged["rawOutput"]) : deep_copy(merged["content"]),
-              status: merged["status"]
-            }
+          if terminal_tool_status?(merged)
+            @tools.delete(id)
+            tool_result_event(merged)
           else
             tool_call_event(merged)
           end
+        end
+
+        private def normalize_tool_call(update)
+          id = update["toolCallId"].to_s
+          @tools[id] = deep_copy(update)
+          call = tool_call_event(update)
+          return call unless terminal_tool_status?(update)
+
+          @tools.delete(id)
+          [call, tool_result_event(update)]
+        end
+
+        private def terminal_tool_status?(update)
+          %w[completed failed].include?(update["status"].to_s)
+        end
+
+        private def tool_result_event(update)
+          raw_result = if update.key?("rawOutput")
+                         update["rawOutput"]
+                       else
+                         update["content"]
+                       end
+          result, exit_code = normalize_tool_output(raw_result)
+          status = update["status"].to_s
+          status = "failed" if exit_code && exit_code != 0
+          status = nil if status.empty?
+          {
+            type: :tool_result,
+            tool_call_id: update["toolCallId"].to_s,
+            result: result,
+            status: status,
+            exit_code: exit_code
+          }
+        end
+
+        private def normalize_tool_output(raw_result)
+          exit_code = nil
+          rendered = raw_result
+          if raw_result.is_a?(Hash)
+            rendered = value(raw_result, "formatted_output") ||
+                       value(raw_result, "formattedOutput") ||
+                       value(raw_result, "output") ||
+                       value(raw_result, "content")
+            raw_exit_code = value(raw_result, "exit_code") ||
+                            value(raw_result, "exitCode")
+            exit_code = Integer(raw_exit_code) unless raw_exit_code.nil?
+            rendered = JSON.generate(raw_result) if rendered.nil?
+          elsif !raw_result.nil? && !raw_result.is_a?(String)
+            rendered = JSON.generate(raw_result)
+          end
+          [rendered.to_s, exit_code]
+        rescue ArgumentError, TypeError, JSON::GeneratorError
+          [raw_result.to_s, nil]
         end
 
         private def tool_call_event(update)
@@ -892,6 +1658,50 @@ module Clacky
             name: update["name"] || update["title"] || update["kind"] || "tool",
             input: deep_copy(update["rawInput"] || {})
           }
+        end
+
+        private def normalize_plan_entries(entries)
+          Array(entries).each_with_object([]) do |entry, result|
+            next unless entry.is_a?(Hash)
+
+            result << {
+              "task" => value(entry, "content") || value(entry, "task"),
+              "priority" => value(entry, "priority"),
+              "status" => value(entry, "status")
+            }
+          end
+        end
+
+        private def normalize_prompt_usage(usage)
+          return nil unless usage.is_a?(Hash)
+
+          prompt_tokens = usage_value(usage, "inputTokens", "input_tokens")
+          completion_tokens = usage_value(usage, "outputTokens", "output_tokens")
+          cache_read = usage_value(usage, "cachedReadTokens", "cached_read_tokens")
+          cache_write = usage_value(usage, "cachedWriteTokens", "cached_write_tokens")
+          total_tokens = usage_value(usage, "totalTokens", "total_tokens")
+          if total_tokens.nil? && (!prompt_tokens.nil? || !completion_tokens.nil?)
+            total_tokens = prompt_tokens.to_i + completion_tokens.to_i
+          end
+          return nil if total_tokens.nil? && prompt_tokens.nil? && completion_tokens.nil?
+
+          {
+            type: :usage,
+            prompt_tokens: prompt_tokens.to_i,
+            completion_tokens: completion_tokens.to_i,
+            cache_read: cache_read.to_i,
+            cache_write: cache_write.to_i,
+            total_tokens: total_tokens.to_i,
+            delta_tokens: total_tokens.to_i
+          }
+        end
+
+        private def usage_value(usage, *keys)
+          keys.each do |key|
+            return usage[key] if usage.key?(key)
+            return usage[key.to_sym] if usage.key?(key.to_sym)
+          end
+          nil
         end
 
         private def content_text(content)

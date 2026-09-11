@@ -2,6 +2,7 @@
 
 require "json"
 require "open3"
+require_relative "../thread_registry"
 
 module Clacky
   module Acp
@@ -9,7 +10,7 @@ module Clacky
     class ProcessTransport
       class Error < StandardError; end
 
-      STDIN_CLOSE_GRACE = 0.15
+      STDIN_CLOSE_GRACE = 2.25
       TERM_GRACE = 0.5
       KILL_GRACE = 0.5
       THREAD_JOIN_GRACE = 0.5
@@ -39,7 +40,8 @@ module Clacky
         @stdin = @stdout = @stderr = @wait_thread = nil
         @reader_thread = @stderr_thread = nil
         @pgid = nil
-        @closed_emitted = false
+        @generation = 0
+        @closed_generation = nil
       end
 
       def on_message(&block)
@@ -50,30 +52,40 @@ module Clacky
       end
 
       def start
-        @state_mutex.synchronize do
-          raise Error, "ACP process '#{@name}' is already running" if process_alive_unlocked?
+        @stop_mutex.synchronize do
+          @state_mutex.synchronize do
+            raise Error, "ACP process '#{@name}' is already running" if process_alive_unlocked?
 
-          environment = @env.dup
-          options = { pgroup: true, close_others: true, unsetenv_others: false }
-          options[:chdir] = @cwd if @cwd
+            environment = @env.dup
+            options = { pgroup: true, close_others: true, unsetenv_others: true }
+            options[:chdir] = @cwd if @cwd
 
-          # The [path, argv0] form forces direct execution even when argv text
-          # contains shell metacharacters.
-          executable = [@argv.first, @argv.first]
-          @stdin, @stdout, @stderr, @wait_thread = Open3.popen3(
-            environment,
-            executable,
-            *@argv.drop(1),
-            options
-          )
-          @pgid = @wait_thread.pid
-          @closed_emitted = false
-          @stderr_mutex.synchronize { @stderr_buffer.clear }
-          @stdin.sync = true
-          @stdout.binmode
-          @stderr.binmode
-          @reader_thread = spawn_thread("acp-reader:#{@name}") { read_stdout }
-          @stderr_thread = spawn_thread("acp-stderr:#{@name}") { read_stderr }
+            # The [path, argv0] form forces direct execution even when argv text
+            # contains shell metacharacters.
+            executable = [@argv.first, @argv.first]
+            @stdin, @stdout, @stderr, @wait_thread = Open3.popen3(
+              environment,
+              executable,
+              *@argv.drop(1),
+              options
+            )
+            @pgid = @wait_thread.pid
+            @generation += 1
+            generation = @generation
+            @stderr_mutex.synchronize { @stderr_buffer.clear }
+            @stdin.sync = true
+            @stdout.binmode
+            @stderr.binmode
+            stdout = @stdout
+            stderr = @stderr
+            wait_thread = @wait_thread
+            @reader_thread = spawn_thread("acp-reader:#{@name}") do
+              read_stdout(stdout, wait_thread, generation)
+            end
+            @stderr_thread = spawn_thread("acp-stderr:#{@name}") do
+              read_stderr(stderr, generation)
+            end
+          end
         end
         self
       rescue Error
@@ -122,10 +134,15 @@ module Clacky
 
       def stop
         @stop_mutex.synchronize do
-          stdin, stdout, stderr, wait_thread, reader_thread, stderr_thread, pgid =
+          stdin, stdout, stderr, wait_thread, reader_thread, stderr_thread, pgid,
+            generation =
             @state_mutex.synchronize do
-              [@stdin, @stdout, @stderr, @wait_thread,
-               @reader_thread, @stderr_thread, @pgid]
+              snapshot = [@stdin, @stdout, @stderr, @wait_thread,
+                          @reader_thread, @stderr_thread, @pgid, @generation]
+              @stdin = @stdout = @stderr = @wait_thread = nil
+              @reader_thread = @stderr_thread = nil
+              @pgid = nil
+              snapshot
             end
 
           return self unless wait_thread || stdin || stdout || stderr
@@ -152,7 +169,7 @@ module Clacky
           stderr_thread&.join(THREAD_JOIN_GRACE)
           reader_thread&.kill if reader_thread&.alive?
           stderr_thread&.kill if stderr_thread&.alive?
-          emit_closed
+          emit_closed(wait_thread, generation)
         end
         self
       end
@@ -168,90 +185,98 @@ module Clacky
       end
 
       private def spawn_thread(name, &block)
-        if defined?(Clacky::ThreadRegistry)
-          Clacky::ThreadRegistry.spawn(name: name, daemon: true, &block)
-        else
-          Thread.new do
-            Thread.current.name = name if Thread.current.respond_to?(:name=)
-            block.call
-          end
-        end
+        Clacky::ThreadRegistry.spawn(name: name, daemon: true, &block)
       end
 
-      private def read_stdout
+      private def read_stdout(stream, wait_thread, generation)
         loop do
-          line = @stdout.gets(@max_message_bytes + 2)
+          line = stream.gets(@max_message_bytes + 2)
           break unless line
 
           if line.end_with?("\n")
             payload = line.byteslice(0, line.bytesize - 1)
             payload = payload.byteslice(0, payload.bytesize - 1) if payload.end_with?("\r")
             if payload.bytesize > @max_message_bytes
-              emit_message_too_large
+              emit_message_too_large(generation)
             else
-              parse_line(payload)
+              parse_line(payload, generation)
             end
           elsif line.bytesize > @max_message_bytes
-            emit_message_too_large
-            discard_until_newline
+            emit_message_too_large(generation)
+            discard_until_newline(stream)
           else
-            parse_line(line)
+            parse_line(line, generation)
           end
         end
       rescue IOError, Errno::EBADF
         nil
       ensure
-        emit_closed
+        emit_closed(wait_thread, generation)
       end
 
-      private def discard_until_newline
+      private def discard_until_newline(stream)
         loop do
-          fragment = @stdout.gets(@max_message_bytes + 2)
+          fragment = stream.gets(@max_message_bytes + 2)
           break unless fragment
           break if fragment.end_with?("\n")
         end
       end
 
-      private def parse_line(line)
+      private def parse_line(line, generation)
         message = JSON.parse(line.force_encoding(Encoding::UTF_8))
-        emit(message)
+        emit(message, generation: generation)
       rescue JSON::ParserError, EncodingError
         emit_transport_error(
           "malformed_json",
-          "invalid JSON received from ACP process '#{@name}'"
+          "invalid JSON received from ACP process '#{@name}'",
+          {},
+          generation
         )
       end
 
-      private def emit_message_too_large
+      private def emit_message_too_large(generation)
         emit_transport_error(
           "message_too_large",
           "ACP process '#{@name}' emitted a message larger than #{@max_message_bytes} bytes",
-          "max_bytes" => @max_message_bytes
+          { "max_bytes" => @max_message_bytes },
+          generation
         )
       end
 
-      private def emit_transport_error(code, message, details = {})
+      private def emit_transport_error(code, message, details = {}, generation = nil)
         error = { "code" => code, "message" => message }.merge(details)
-        emit("__transport_error__" => error, "error" => message)
+        emit(
+          { "__transport_error__" => error, "error" => message },
+          generation: generation
+        )
       end
 
-      private def emit(message)
+      private def emit(message, generation: nil)
+        if generation
+          current = @state_mutex.synchronize { @generation == generation }
+          return unless current
+        end
+
         callback = @callback_mutex.synchronize { @on_message }
         callback&.call(message)
       rescue StandardError
         nil
       end
 
-      private def read_stderr
+      private def read_stderr(stream, generation)
         loop do
-          chunk = @stderr.readpartial(4096)
-          @stderr_mutex.synchronize do
-            @stderr_buffer << chunk
-            raw_limit = @stderr_bytes + STDERR_REDACTION_CONTEXT_BYTES
-            if @stderr_buffer.bytesize > raw_limit
-              @stderr_buffer.replace(
-                @stderr_buffer.byteslice(-raw_limit, raw_limit) || @stderr_buffer
-              )
+          chunk = stream.readpartial(4096)
+          @state_mutex.synchronize do
+            break unless @generation == generation
+
+            @stderr_mutex.synchronize do
+              @stderr_buffer << chunk
+              raw_limit = @stderr_bytes + STDERR_REDACTION_CONTEXT_BYTES
+              if @stderr_buffer.bytesize > raw_limit
+                @stderr_buffer.replace(
+                  @stderr_buffer.byteslice(-raw_limit, raw_limit) || @stderr_buffer
+                )
+              end
             end
           end
         end
@@ -273,13 +298,14 @@ module Clacky
         text
       end
 
-      private def emit_closed
-        wait_thread = nil
+      private def emit_closed(wait_thread = nil, generation = nil)
         should_emit = @state_mutex.synchronize do
-          next false if @closed_emitted
+          generation ||= @generation
+          next false unless generation == @generation
+          next false if @closed_generation == generation
 
-          @closed_emitted = true
-          wait_thread = @wait_thread
+          @closed_generation = generation
+          wait_thread ||= @wait_thread
           true
         end
         return unless should_emit
@@ -296,10 +322,13 @@ module Clacky
                   "ACP process '#{@name}' closed"
                 end
         emit(
-          "__transport_closed__" => true,
-          "error" => error,
-          "exit_status" => exit_status,
-          "term_signal" => term_signal
+          {
+            "__transport_closed__" => true,
+            "error" => error,
+            "exit_status" => exit_status,
+            "term_signal" => term_signal
+          },
+          generation: generation
         )
       end
 

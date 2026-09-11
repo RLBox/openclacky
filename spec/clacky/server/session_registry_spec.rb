@@ -430,6 +430,20 @@ RSpec.describe Clacky::Server::SessionRegistry do
       expect(registry.update_if_epoch("s1", old_epoch, status: :idle)).to be(false)
       expect(registry.get("s1")[:status]).to eq(:running)
     end
+
+    it "atomically claims an idle task and reports an already-running session" do
+      registry.create(session_id: "s1")
+      first = registry.claim_task("s1", require_idle: true)
+      yielded = nil
+      second = registry.claim_task("s1", require_idle: true) do |session|
+        yielded = session[:id]
+      end
+
+      expect(first).to eq(status: :claimed, epoch: 1)
+      expect(second).to eq(status: :already_running, epoch: nil)
+      expect(yielded).to eq("s1")
+      expect(registry.get("s1")).to include(status: :running, epoch: 1)
+    end
   end
 
   describe "#shutdown_all_idle_timers" do

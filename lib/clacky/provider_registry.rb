@@ -16,7 +16,7 @@ module Clacky
 
       units = extension_units.nil? ? default_extension_units : Array(extension_units)
       units.each do |unit|
-        add(unit.id, unit.spec)
+        add(unit.id, unit.spec, extension_id: unit.ext_id)
       end
     end
 
@@ -42,13 +42,18 @@ module Clacky
       runtime_id && deep_copy(runtime_id)
     end
 
-    private def add(id, descriptor)
+    private def add(id, descriptor, extension_id: nil)
       provider_id = id.to_s
       if @providers.key?(provider_id)
         raise DuplicateProviderError, "duplicate provider id: #{provider_id}"
       end
 
-      @providers[provider_id] = normalize_descriptor(descriptor)
+      normalized = normalize_descriptor(descriptor)
+      # Extension HTTP routes are namespaced by the contributing extension,
+      # which is not required to match the provider or runtime id. Derive this
+      # server-side instead of trusting a manifest-supplied routing field.
+      normalized["extension_id"] = extension_id.to_s unless extension_id.nil?
+      @providers[provider_id] = normalized
     end
 
     private def normalize_descriptor(descriptor)

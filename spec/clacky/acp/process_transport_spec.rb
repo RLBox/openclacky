@@ -82,7 +82,7 @@ RSpec.describe Clacky::Acp::ProcessTransport do
       expect(File.realpath(result["cwd"])).to eq(File.realpath(tmpdir))
       expect(result["env"]).to eq(
         "ACP_PARENT_SECRET" => nil,
-        "ACP_PARENT_VISIBLE" => "inherited",
+        "ACP_PARENT_VISIBLE" => nil,
         "ACP_CHILD_VALUE" => "configured"
       )
       expect(result["pgid"]).to eq(result["pid"])
@@ -184,6 +184,35 @@ RSpec.describe Clacky::Acp::ProcessTransport do
     sleep(0.01) while process_alive?(child_pid) && Time.now < deadline
     expect(process_alive?(child_pid)).to be(false)
     expect(@transport.alive?).to be(false)
+  end
+
+  it "clears process ownership so repeated stop cannot signal an old process group" do
+    start_transport
+    wait_thread = @transport.instance_variable_get(:@wait_thread)
+    expect(wait_thread).not_to be_nil
+
+    @transport.stop
+
+    expect(@transport.instance_variable_get(:@wait_thread)).to be_nil
+    expect(@transport.instance_variable_get(:@pgid)).to be_nil
+    expect { @transport.stop }.not_to raise_error
+  end
+
+  it "does not emit a stale close from an earlier process generation after restart" do
+    start_transport
+    old_wait_thread = @transport.instance_variable_get(:@wait_thread)
+    old_generation = @transport.instance_variable_get(:@generation)
+
+    @transport.stop
+    next_event { |event| event["__transport_closed__"] }
+    @transport.start
+
+    @transport.send(:emit_closed, old_wait_thread, old_generation)
+    expect(events).to be_empty
+
+    send_request(81, "initialize")
+    response = next_event { |event| event["id"] == 81 }
+    expect(response.dig("result", "protocolVersion")).to eq(1)
   end
 
   it "force-kills the process group when the child ignores TERM" do

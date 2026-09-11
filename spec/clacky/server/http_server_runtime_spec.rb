@@ -27,7 +27,7 @@ RSpec.describe Clacky::Server::HttpServer, "runtime session lifecycle" do
     end
 
     def capabilities
-      { cancel: true }
+      { cancel: true, image_input: true }
     end
 
     def run(input, generation:)
@@ -95,6 +95,18 @@ RSpec.describe Clacky::Server::HttpServer, "runtime session lifecycle" do
 
     def complete_first_prompt
       @first_response << true
+    end
+  end
+
+  class TitledRuntimeServerSpecAdapter < RuntimeServerSpecAdapter
+    def run(input, generation:)
+      @runs << [input, generation]
+      @context[:event_sink].call(
+        generation,
+        type: :session_info,
+        title: "Provider generated title"
+      )
+      { stop_reason: "end_turn", assistant_text: "Done" }
     end
   end
 
@@ -199,6 +211,142 @@ RSpec.describe Clacky::Server::HttpServer, "runtime session lifecycle" do
     end
   end
 
+  it "uses the live runtime capability and effective model for vision status" do
+    with_server(
+      agent_config: runtime_config,
+      provider_registry: provider_registry,
+      runtime_registry: runtime_registry
+    ) do |server|
+      session_id = server.send(
+        :build_session,
+        name: "Codex task",
+        working_dir: Dir.pwd,
+        model_id: "runtime-card-current"
+      )
+      res = fake_res
+      dispatch(
+        server,
+        fake_req(
+          method: "GET",
+          path: "/api/config",
+          query_string: URI.encode_www_form(session_id: session_id)
+        ),
+        res
+      )
+
+      expect(parsed_body(res).dig("media_capabilities", "vision")).to eq(
+        "configured" => true,
+        "primary" => true,
+        "model" => "codex-current"
+      )
+    end
+  end
+
+  it "restores an API session on its saved API card when Codex is now the default" do
+    config = Clacky::AgentConfig.new(models: [
+      {
+        "id" => "api-card",
+        "provider_id" => "custom",
+        "model" => "saved-api-model",
+        "base_url" => "https://api.example.test",
+        "api_key" => "saved-secret"
+      },
+      {
+        "id" => "runtime-card-current",
+        "provider_id" => "codex",
+        "runtime_id" => "codex",
+        "display_model" => "Codex default",
+        "type" => "default"
+      }
+    ])
+    data = {
+      session_id: "api-restored",
+      name: "Restored API",
+      created_at: "2026-09-10T00:00:00Z",
+      updated_at: "2026-09-10T00:00:01Z",
+      working_dir: Dir.pwd,
+      source: "manual",
+      agent_profile: "general",
+      config: {
+        model_name: "saved-api-model",
+        model_base_url: "https://api.example.test"
+      },
+      stats: {},
+      messages: []
+    }
+    fake_agent = double("restored API agent")
+
+    with_server(
+      agent_config: config,
+      client_factory: -> { raise "global runtime default must not build the restore client" },
+      provider_registry: provider_registry,
+      runtime_registry: runtime_registry
+    ) do |server|
+      allow(server).to receive(:build_idle_timer).and_return(:idle_timer)
+      expect(Clacky::Client).to receive(:new).with(
+        "saved-secret",
+        hash_including(
+          base_url: "https://api.example.test",
+          model: "saved-api-model",
+          provider_id: nil
+        )
+      ).and_return(double("api client"))
+      expect(Clacky::Agent).to receive(:from_session) do |_client, restored_config, *_args|
+        expect(restored_config.current_model["id"]).to eq("api-card")
+        fake_agent
+      end
+
+      session_id = server.send(:build_session_from_data, data)
+      restored = server.instance_variable_get(:@registry).get(session_id)
+      expect(restored[:agent]).to equal(fake_agent)
+      expect(restored[:idle_timer]).to eq(:idle_timer)
+    end
+  end
+
+  it "keeps a legacy API transcript readable when only runtime cards remain" do
+    data = persisted_runtime_session(session_id: "removed-api-restored")
+    data.delete(:runtime)
+    data[:config] = {
+      permission_mode: "confirm_all",
+      model_name: "removed-api-model",
+      model_base_url: "https://removed-api.example.test"
+    }
+
+    with_server(
+      agent_config: runtime_config,
+      provider_registry: provider_registry,
+      runtime_registry: runtime_registry
+    ) do |server|
+      expect(Clacky::Client).to receive(:new).with(
+        nil,
+        hash_including(
+          base_url: "https://removed-api.example.test",
+          model: "removed-api-model"
+        )
+      ).at_least(:once).and_call_original
+
+      session_id = server.send(:build_session_from_data, data)
+      restored = server.instance_variable_get(:@registry).get(session_id)[:agent]
+      expect(restored).to be_a(Clacky::Agent)
+      expect(restored.current_model_info).to include(
+        model: "removed-api-model",
+        base_url: "https://removed-api.example.test"
+      )
+      expect(restored.current_model_info).not_to include(runtime_id: "codex")
+
+      res = fake_res
+      server.send(
+        :api_session_messages,
+        session_id,
+        fake_req(method: "GET", path: ""),
+        res
+      )
+      expect(res.status).to eq(200)
+      expect(parsed_body(res)["events"].map { |event| event["content"] })
+        .to eq(["Earlier question", "Earlier answer"])
+    end
+  end
+
   it "restores by stable runtime and provider identity without provider-history replay" do
     config = Clacky::AgentConfig.new(models: [
       {
@@ -247,6 +395,96 @@ RSpec.describe Clacky::Server::HttpServer, "runtime session lifecycle" do
     end
   end
 
+  it "paginates runtime history after saving and restoring a session" do
+    saved = nil
+    with_server(
+      agent_config: runtime_config,
+      provider_registry: provider_registry,
+      runtime_registry: runtime_registry
+    ) do |server|
+      session_id = server.send(
+        :build_session,
+        name: "Runtime history",
+        working_dir: Dir.pwd,
+        model_id: "runtime-card-current"
+      )
+      agent = server.instance_variable_get(:@registry).get(session_id)[:agent]
+      agent.run("First question", created_at: 1.0)
+      agent.run("Second question", created_at: 3.0)
+      saved = agent.to_session_data(updated_at: Time.now)
+    end
+
+    with_server(
+      agent_config: runtime_config,
+      provider_registry: provider_registry,
+      runtime_registry: runtime_registry
+    ) do |server|
+      session_id = server.send(:build_session_from_data, saved)
+      req = fake_req(
+        method: "GET",
+        path: "/api/sessions/#{session_id}/messages",
+        query_string: "window=1&limit=1"
+      )
+      res = fake_res
+
+      server.send(:api_session_messages, session_id, req, res)
+
+      body = parsed_body(res)
+      expect(res.status).to eq(200)
+      expect(body["events"].map { |event| event["content"] })
+        .to eq(["Second question", "Runtime reply"])
+      expect(body).to include("has_more" => true, "has_after" => false)
+      expect(body["before_cursor"]).to eq(body["events"].first["round_id"])
+      expect(body["after_cursor"]).to eq(body["events"].first["round_id"])
+    end
+  end
+
+  it "preserves runtime tool ids when replaying the persisted transcript" do
+    with_server(
+      agent_config: runtime_config,
+      provider_registry: provider_registry,
+      runtime_registry: runtime_registry
+    ) do |server|
+      data = persisted_runtime_session
+      data[:messages] = [
+        { role: "user", content: "Run it", created_at: 1.0 },
+        {
+          role: "assistant",
+          content: nil,
+          tool_calls: [{
+            id: "tool-replay",
+            type: "function",
+            function: { name: "terminal", arguments: '{"command":"pwd"}' }
+          }]
+        },
+        {
+          role: "tool",
+          tool_call_id: "tool-replay",
+          content: "/workspace"
+        },
+        { role: "assistant", content: "Done", created_at: 2.0 }
+      ]
+      session_id = server.send(:build_session_from_data, data)
+      agent = server.instance_variable_get(:@registry).get(session_id)[:agent]
+      expect(agent.history.to_a.map { |message| message[:role] })
+        .to eq(%w[user assistant tool assistant])
+      res = fake_res
+
+      server.send(
+        :api_session_messages,
+        session_id,
+        fake_req(method: "GET", path: ""),
+        res
+      )
+
+      events = parsed_body(res)["events"]
+      expect(events.find { |event| event["type"] == "tool_call" })
+        .to include("tool_call_id" => "tool-replay")
+      expect(events.find { |event| event["type"] == "tool_result" })
+        .to include("tool_call_id" => "tool-replay")
+    end
+  end
+
   it "keeps a restored transcript readable when its runtime is unavailable" do
     unavailable_registry = Clacky::AgentRuntimeRegistry.new(
       extension_units: [],
@@ -274,6 +512,94 @@ RSpec.describe Clacky::Server::HttpServer, "runtime session lifecycle" do
       expect(agent.to_session_data[:runtime][:state]).to include(
         "session_id" => "external-restored"
       )
+    end
+  end
+
+  it "rejects a new session whose saved runtime provider is unavailable" do
+    unavailable_registry = Clacky::AgentRuntimeRegistry.new(
+      extension_units: [], factories: {}
+    )
+
+    with_server(
+      agent_config: runtime_config,
+      client_factory: lambda { raise "API client must not be built" },
+      provider_registry: provider_registry,
+      runtime_registry: unavailable_registry
+    ) do |server|
+      res = fake_res
+      server.send(
+        :api_create_session,
+        fake_req(
+          method: "POST",
+          path: "/api/sessions",
+          body: { name: "Unavailable", model_id: "runtime-card-current" }
+        ),
+        res
+      )
+
+      expect(res.status).to eq(422)
+      expect(parsed_body(res)["error"]).to match(/runtime.*unavailable/i)
+      expect(server.instance_variable_get(:@registry).exist?("Unavailable")).to be(false)
+    end
+  end
+
+  it "keeps startup alive with a readable placeholder for an unavailable default runtime" do
+    unavailable_registry = Clacky::AgentRuntimeRegistry.new(
+      extension_units: [], factories: {}
+    )
+
+    with_server(
+      agent_config: runtime_config,
+      client_factory: lambda { raise "API client must not be built" },
+      provider_registry: provider_registry,
+      runtime_registry: unavailable_registry
+    ) do |server|
+      expect { server.send(:create_default_session) }.not_to raise_error
+      live = []
+      server.instance_variable_get(:@registry).each_live_agent do |_id, agent, _thread|
+        live << agent
+      end
+      expect(live.length).to eq(1)
+      expect { live.first.run("hello") }.to raise_error(/unavailable/i)
+    end
+  end
+
+  %i[cron channel].each do |source|
+    it "rejects the runtime provider for #{source} sessions in v1" do
+      with_server(
+        agent_config: runtime_config,
+        provider_registry: provider_registry,
+        runtime_registry: runtime_registry
+      ) do |server|
+        expect do
+          server.send(
+            :build_session,
+            name: source.to_s,
+            working_dir: Dir.pwd,
+            source: source,
+            model_id: "runtime-card-current"
+          )
+        end.to raise_error(ArgumentError, /manual.*session/i)
+      end
+    end
+  end
+
+  it "marks run-now cron sessions as cron so the runtime guard cannot be bypassed" do
+    with_server(
+      agent_config: runtime_config,
+      provider_registry: provider_registry,
+      runtime_registry: runtime_registry
+    ) do |server|
+      scheduler = server.instance_variable_get(:@scheduler)
+      allow(scheduler).to receive(:list_tasks).and_return(["nightly"])
+      allow(scheduler).to receive(:read_task).with("nightly").and_return("do work")
+      res = fake_res
+
+      server.send(:api_run_cron_task, "nightly", res)
+
+      expect(res.status).to eq(422)
+      expect(parsed_body(res)["error"]).to match(/manual.*session/i)
+      expect(built_runtimes).to be_empty
     end
   end
 
@@ -340,6 +666,42 @@ RSpec.describe Clacky::Server::HttpServer, "runtime session lifecycle" do
     end
   end
 
+  it "lets a provider title replace only the first-message autogenerated name" do
+    titled_runtimes = []
+    titled_registry = Clacky::AgentRuntimeRegistry.new(
+      extension_units: [],
+      factories: {
+        "codex" => lambda do |**options|
+          TitledRuntimeServerSpecAdapter.new(**options).tap do |runtime|
+            titled_runtimes << runtime
+          end
+        end
+      }
+    )
+
+    with_server(
+      agent_config: runtime_config,
+      provider_registry: provider_registry,
+      runtime_registry: titled_registry
+    ) do |server|
+      session_id = server.send(
+        :build_session,
+        name: "Session 1",
+        working_dir: Dir.pwd,
+        model_id: "runtime-card-current"
+      )
+
+      worker = server.send(:handle_user_message, session_id, "First prompt")
+      expect(worker.join(2)).not_to be_nil
+
+      agent = server.instance_variable_get(:@registry).get(session_id)[:agent]
+      expect(titled_runtimes.fetch(0).runs.length).to eq(1)
+      expect(agent.name).to eq("Provider generated title")
+      expect(server.instance_variable_get(:@session_manager).load(session_id)[:name])
+        .to eq("Provider generated title")
+    end
+  end
+
   it "cancels a running ACP turn and drains its replacement only after the prompt response" do
     barrier_runtimes = []
     barrier_factory = lambda do |**options|
@@ -386,6 +748,128 @@ RSpec.describe Clacky::Server::HttpServer, "runtime session lifecycle" do
     ensure
       runtime&.complete_first_prompt if worker&.alive?
       worker&.join(1)
+    end
+  end
+
+  it "does not append the optimistic interrupt message again when the runtime drains it" do
+    barrier_runtimes = []
+    registry = Clacky::AgentRuntimeRegistry.new(
+      extension_units: [],
+      factories: {
+        "codex" => lambda do |**options|
+          BarrierRuntimeServerSpecAdapter.new(**options).tap do |runtime|
+            barrier_runtimes << runtime
+          end
+        end
+      }
+    )
+
+    with_server(
+      agent_config: runtime_config,
+      provider_registry: provider_registry,
+      runtime_registry: registry
+    ) do |server|
+      session_id = server.send(
+        :build_session,
+        name: "Runtime task",
+        working_dir: Dir.pwd,
+        model_id: "runtime-card-current"
+      )
+      session = server.instance_variable_get(:@registry).get(session_id)
+      agent = session[:agent]
+      web_ui = session[:ui]
+      runtime = barrier_runtimes.fetch(0)
+      allow(web_ui).to receive(:show_user_message)
+      worker = server.send(:run_agent_task, session_id, agent) { agent.run("first") }
+      runtime.wait_until_first_started
+
+      server.send(:handle_user_message, session_id, "second")
+      runtime.complete_first_prompt
+      expect(worker.join(2)).not_to be_nil
+
+      expect(web_ui).to have_received(:show_user_message).once.with(
+        "second",
+        hash_including(source: :web, steering: false)
+      )
+      expect(runtime.runs.map { |input, _generation| input.content })
+        .to eq(["first", "second"])
+    ensure
+      runtime&.complete_first_prompt if worker&.alive?
+      worker&.join(1)
+    end
+  end
+
+  it "atomically queues two runtime messages that both observed an idle session" do
+    barrier_runtimes = []
+    registry = Clacky::AgentRuntimeRegistry.new(
+      extension_units: [],
+      factories: {
+        "codex" => lambda do |**options|
+          BarrierRuntimeServerSpecAdapter.new(**options).tap do |runtime|
+            barrier_runtimes << runtime
+          end
+        end
+      }
+    )
+
+    with_server(
+      agent_config: runtime_config,
+      provider_registry: provider_registry,
+      runtime_registry: registry
+    ) do |server|
+      session_id = server.send(
+        :build_session,
+        name: "Session 1",
+        working_dir: Dir.pwd,
+        model_id: "runtime-card-current"
+      )
+      session_registry = server.instance_variable_get(:@registry)
+      runtime = barrier_runtimes.fetch(0)
+      arrivals = Queue.new
+      release = [Queue.new, Queue.new]
+      allow(session_registry).to receive(:get).and_wrap_original do |original, id|
+        snapshot = original.call(id)
+        index = Thread.current[:runtime_race_index]
+        if id == session_id && index && !Thread.current[:runtime_race_synced]
+          Thread.current[:runtime_race_synced] = true
+          arrivals << index
+          release.fetch(index).pop
+        end
+        snapshot
+      end
+
+      callers = ["first", "second"].each_with_index.map do |message, index|
+        Thread.new do
+          Thread.current[:runtime_race_index] = index
+          server.send(:handle_user_message, session_id, message)
+        end
+      end
+      expect(arrivals.pop).to eq(0)
+      expect(arrivals.pop).to eq(1)
+
+      release.fetch(0) << true
+      first_worker = callers.fetch(0).value
+      runtime.wait_until_first_started
+      release.fetch(1) << true
+      second_worker = callers.fetch(1).value
+      second_worker&.join(1)
+
+      expect(runtime.runs.map { |input, _generation| input.content }).to eq(["first"])
+
+      runtime.complete_first_prompt
+      expect(first_worker.join(2)).not_to be_nil
+      expect(runtime.runs.map { |input, _generation| input.content })
+        .to eq(["first", "second"])
+      agent = session_registry.get(session_id)[:agent]
+      expect(agent.history.to_a.select { |message| message[:role] == "user" }
+        .map { |message| message[:content] }).to eq(["first", "second"])
+      expect(session_registry.get(session_id)).to include(status: :idle, epoch: 1)
+    ensure
+      release&.each { |queue| queue << true }
+      runtime&.complete_first_prompt if first_worker&.alive?
+      callers&.each { |thread| thread.join(1) }
+      first_worker&.join(1)
+      second_worker&.join(1)
     end
   end
 
@@ -533,6 +1017,92 @@ RSpec.describe Clacky::Server::HttpServer, "runtime session lifecycle" do
       expect(res.status).to eq(409)
       expect(parsed_body(res)["error"]).to match(/new session|runtime/i)
       expect(agent.current_model_info[:id]).to eq("api-card")
+    end
+  end
+
+  it "rejects deleting a model card used by a live runtime session" do
+    runtime_config.models << {
+      "id" => "api-card",
+      "provider_id" => "custom",
+      "model" => "api-model",
+      "base_url" => "https://example.test",
+      "api_key" => "secret"
+    }
+
+    with_server(
+      agent_config: runtime_config,
+      provider_registry: provider_registry,
+      runtime_registry: runtime_registry
+    ) do |server|
+      session_id = server.send(
+        :build_session,
+        name: "Runtime task",
+        working_dir: Dir.pwd,
+        model_id: "runtime-card-current"
+      )
+      res = fake_res
+
+      server.send(:api_delete_model, "runtime-card-current", res)
+
+      expect(res.status).to eq(409)
+      expect(parsed_body(res)["error"]).to match(/session|in use/i)
+      expect(runtime_config.models.map { |model| model["id"] })
+        .to include("runtime-card-current")
+      expect(server.instance_variable_get(:@registry).get(session_id)[:agent]
+        .current_model_info[:id]).to eq("runtime-card-current")
+    end
+  end
+
+  it "rejects assigning a runtime provider identity to an API model card" do
+    runtime_config.models.unshift(
+      "id" => "api-card",
+      "provider_id" => "custom",
+      "model" => "api-model",
+      "base_url" => "https://example.test",
+      "api_key" => "secret"
+    )
+
+    with_server(
+      agent_config: runtime_config,
+      provider_registry: provider_registry,
+      runtime_registry: runtime_registry
+    ) do |server|
+      req = fake_req(
+        method: "PATCH",
+        path: "/api/config/models/api-card",
+        body: { provider_id: "codex" }
+      )
+      res = fake_res
+
+      server.send(:api_update_model, "api-card", req, res)
+
+      expect(res.status).to eq(422)
+      expect(parsed_body(res)["error"]).to match(/runtime/i)
+      expect(runtime_config.models.find { |model| model["id"] == "api-card" })
+        .to include("provider_id" => "custom", "model" => "api-model")
+    end
+  end
+
+  it "returns model and runtime identity in a newly-created session summary" do
+    with_server(
+      agent_config: runtime_config,
+      provider_registry: provider_registry,
+      runtime_registry: runtime_registry
+    ) do |server|
+      req = fake_req(
+        method: "POST",
+        path: "/api/sessions",
+        body: { name: "Runtime task", model_id: "runtime-card-current" }
+      )
+      res = fake_res
+
+      server.send(:api_create_session, req, res)
+
+      expect(res.status).to eq(201)
+      expect(parsed_body(res).fetch("session")).to include(
+        "model_id" => "runtime-card-current",
+        "runtime_id" => "codex"
+      )
     end
   end
 
