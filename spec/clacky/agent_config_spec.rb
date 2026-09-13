@@ -130,6 +130,11 @@ RSpec.describe Clacky::AgentConfig do
           expect(runtime["_runtime_model"]).to be true
           expect(runtime["id"]).to be_a(String)
           expect(runtime["id"]).not_to be_empty
+          expect(runtime).to include(
+            "provider_id" => "codex",
+            "runtime_id" => "codex",
+            "display_model" => "ChatGPT default"
+          )
           expect(config.current_model).to be(runtime)
           expect(config.models_configured?).to be true
         end
@@ -162,6 +167,33 @@ RSpec.describe Clacky::AgentConfig do
             "provider_id", "runtime_id", "display_model", "type", "remark",
             "_runtime_model", "id"
           )
+        end
+      end
+
+      it "does not rewrite non-Codex runtime cards or custom display labels" do
+        runtime_models = [
+          {
+            "provider_id" => "other",
+            "runtime_id" => "codex",
+            "display_model" => "Codex default",
+            "type" => "default"
+          },
+          {
+            "provider_id" => "codex",
+            "runtime_id" => "other",
+            "display_model" => "Codex default"
+          },
+          {
+            "provider_id" => "codex",
+            "runtime_id" => "codex",
+            "display_model" => "My runtime"
+          }
+        ]
+
+        with_temp_config("models" => [], "runtime_models" => runtime_models) do |config_file|
+          displays = described_class.load(config_file).models.map { |model| model["display_model"] }
+
+          expect(displays).to eq(["Codex default", "Codex default", "My runtime"])
         end
       end
     end
@@ -262,7 +294,7 @@ RSpec.describe Clacky::AgentConfig do
           {
             "provider_id" => "codex",
             "runtime_id" => "codex",
-            "display_model" => "Codex default",
+            "display_model" => "ChatGPT default",
             "type" => "default",
             "remark" => "local",
             "api_key" => "must-not-survive",
@@ -282,7 +314,7 @@ RSpec.describe Clacky::AgentConfig do
           {
             "provider_id" => "codex",
             "runtime_id" => "codex",
-            "display_model" => "Codex default",
+            "display_model" => "ChatGPT default",
             "type" => "default",
             "remark" => "local"
           }

@@ -33,13 +33,13 @@ RSpec.describe "bundled Codex extension" do
     expect(container[:disabled]).to be false
     expect(result.errors.select { |error| error.ext_id == "codex" }).to be_empty
     expect(provider.spec).to include(
-      "name" => "Codex",
+      "name" => "ChatGPT",
       "name_key" => "provider.name.codex",
       "runtime_id" => "codex",
       "auth_mode" => "runtime",
       "credential_fields" => [],
       "dynamic_models" => "session",
-      "display_model" => "Codex default"
+      "display_model" => "ChatGPT default"
     )
     expect(runtime.spec).to include(
       "adapter" => "runtime.rb",
@@ -58,7 +58,7 @@ RSpec.describe "bundled Codex extension" do
     expect(registry["codex"]).to include(
       "runtime_id" => "codex",
       "auth_mode" => "runtime",
-      "display_model" => "Codex default"
+      "display_model" => "ChatGPT default"
     )
     expect(registry.runtime_id_for("codex")).to eq("codex")
   end

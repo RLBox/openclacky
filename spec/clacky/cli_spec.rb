@@ -77,7 +77,7 @@ RSpec.describe Clacky::CLI do
 
       expect do
         cli.send(:ensure_cli_model_supported!, config)
-      end.to raise_error(Thor::Error, /clacky server.*Codex/i)
+      end.to raise_error(Thor::Error, /clacky server.*ChatGPT/i)
     end
 
     it "continues to accept ordinary API model cards" do

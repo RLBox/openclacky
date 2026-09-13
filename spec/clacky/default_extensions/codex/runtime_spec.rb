@@ -224,6 +224,7 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Connection do
       auth_reused: true,
       can_authenticate: true
     )
+    expect(connection.health[:message]).to eq("ChatGPT is connected.")
     expect(JSON.generate(status)).not_to include("private@example.com")
   ensure
     connection&.close
@@ -269,7 +270,11 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Connection do
 
     connection = build_connection
 
-    expect(connection.status).to include(status: "not_connected", authenticated: false)
+    expect(connection.health).to include(
+      status: "not_connected",
+      authenticated: false,
+      message: "Connect a ChatGPT account to use ChatGPT."
+    )
   ensure
     connection&.close
   end
@@ -327,8 +332,27 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Connection do
     expect(connection.authenticate_async[:started]).to be(true)
     eventually { connection.status[:status] == "error" }
     expect(connection.status[:message]).not_to include("private remote details")
+    expect(connection.status[:message]).to eq("ChatGPT authentication did not complete. Try again.")
     eventually { connection.authenticate_async[:started] == true }
     eventually { attempts == 2 }
+  ensure
+    connection&.close
+  end
+
+  it "uses the ChatGPT product name when authentication cannot start" do
+    client.auth_methods = [{ "id" => "chat-gpt" }]
+    connection = build_connection
+    connection.define_singleton_method(:spawn_thread) do |*|
+      raise "thread unavailable"
+    end
+
+    expect(connection.authenticate_async).to include(
+      ok: false,
+      started: false,
+      status: "error",
+      error_code: "authentication_start_failed",
+      message: "OpenClacky could not start ChatGPT authentication."
+    )
   ensure
     connection&.close
   end
@@ -721,8 +745,29 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Runtime do
     requests_before = client.requests.length
 
     expect { agent.set_model("not-advertised") }
-      .to raise_error(described_class::Error, /advertised/i)
+      .to raise_error(
+        described_class::Error,
+        "ChatGPT model was not advertised for this session"
+      )
     expect(client.requests.length).to eq(requests_before)
+  ensure
+    agent&.close
+  end
+
+  it "uses ChatGPT in model-selection validation messages" do
+    agent = runtime
+
+    expect { agent.set_model("") }
+      .to raise_error(described_class::Error, "ChatGPT model selection requires a model")
+    expect { agent.set_model("gpt-5.6-sol") }
+      .to raise_error(
+        described_class::Error,
+        "ChatGPT model selection is unavailable until the session starts"
+      )
+
+    agent.close
+    expect { agent.set_model("gpt-5.6-sol") }
+      .to raise_error(described_class::Error, "ChatGPT runtime is closed")
   ensure
     agent&.close
   end
@@ -732,7 +777,10 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Runtime do
 
     with_pending_prompt(agent) do
       expect { agent.set_model("gpt-5.3-codex") }
-        .to raise_error(Clacky::RuntimeSession::BusyError, /in-flight prompt/i)
+        .to raise_error(
+          Clacky::RuntimeSession::BusyError,
+          "ChatGPT model cannot change during an in-flight prompt"
+        )
     end
   ensure
     agent&.close
@@ -743,7 +791,10 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Runtime do
     agent = runtime
 
     expect { agent.run(input, generation: 1) }
-      .to raise_error(described_class::Error, /protected credential path/)
+      .to raise_error(
+        described_class::Error,
+        "ChatGPT workspace overlaps a protected credential path"
+      )
     expect(client.requests.map(&:first)).not_to include("session/new", "session/resume")
   ensure
     agent&.close
@@ -877,7 +928,7 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Runtime do
       hash_including(
         type: :warning,
         code: "resume_conflict",
-        content: include("started a new Codex thread")
+        content: include("started a new ChatGPT thread")
       )
     ])
   ensure
@@ -951,7 +1002,7 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Runtime do
       hash_including(
         type: :warning,
         code: "resume_failed",
-        content: include("started a new Codex thread")
+        content: include("started a new ChatGPT thread")
       )
     ])
   ensure
@@ -993,7 +1044,7 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Runtime do
       hash_including(
         type: :warning,
         code: "resume_failed",
-        content: include("started a new Codex thread")
+        content: include("started a new ChatGPT thread")
       )
     ])
   ensure
@@ -1213,7 +1264,11 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Runtime do
     turn = Thread.new { agent.run(input, generation: 14) }
     started.pop
 
-    expect { agent.run(input("second"), generation: 15) }.to raise_error(described_class::BusyError)
+    expect { agent.run(input("second"), generation: 15) }
+      .to raise_error(
+        described_class::BusyError,
+        "ChatGPT session already has an in-flight prompt"
+      )
     expect do
       Timeout.timeout(0.05) { agent.run(input("third"), generation: 16) }
     end.to raise_error(described_class::BusyError)
@@ -1475,7 +1530,7 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Runtime do
       hash_including(
         type: :warning,
         code: "codex_retry",
-        content: include("retrying")
+        content: include("ChatGPT", "retrying")
       ),
       hash_including(type: :unknown, session_update: "future_update")
     )
@@ -1595,6 +1650,25 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Runtime do
       "outcome" => { "outcome" => "selected", "optionId" => "reject" }
     )
     expect(ui.confirmations).to eq([["Edit files", false]])
+  ensure
+    agent&.close
+  end
+
+  it "uses ChatGPT in the fallback permission title" do
+    agent = runtime
+
+    with_pending_prompt(agent) do
+      agent.handle_permission_request(
+        "sessionId" => "acp-session",
+        "toolCall" => {},
+        "options" => [
+          { "optionId" => "allow", "kind" => "allow_once" },
+          { "optionId" => "reject", "kind" => "reject_once" }
+        ]
+      )
+    end
+
+    expect(ui.confirmations.last.first).to eq("Allow this ChatGPT action?")
   ensure
     agent&.close
   end

@@ -397,7 +397,7 @@ module Clacky
       end
 
       private def cli_runtime_model_message
-        "Agent runtime providers are available in the Web UI. Run `clacky server` and open the client to use Codex."
+        "Agent runtime providers are available in the Web UI. Run `clacky server` and open the client to use ChatGPT."
       end
 
       private def handle_time_machine_command(ui_controller, agent, session_manager)

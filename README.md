@@ -196,9 +196,9 @@ Set your **API Key**, **Model**, and **Base URL** (any OpenAI-compatible provide
 
 Supported out of the box: **Claude (Anthropic) · GPT (OpenAI) · DeepSeek · Kimi (Moonshot) · MiniMax · OpenRouter · OrcaRouter** — or any custom endpoint.
 
-### Codex (ChatGPT) — Web UI prototype
+### ChatGPT — Web UI prototype
 
-Codex support ships with the client as a bundled, default-enabled extension; no marketplace installation is required. The local Web UI can run it as an agent runtime. During onboarding, choose **Choose another provider (API or Codex)**, or later open **Settings → Models → Add Model**, then select **Codex (ChatGPT)** from the same provider dropdown. Model, Base URL, API Key, and API Format are replaced by connection status and **Connect with ChatGPT**. The saved runtime card contains no API credential. A safe model preference from the user's Codex config is used for the first message when available; after ACP establishes the session, its effective model and advertised model choices appear in the existing session model picker.
+ChatGPT support ships with the client as a bundled, default-enabled extension backed by Codex ACP; no marketplace installation is required. The local Web UI can run it as an agent runtime. During onboarding, choose **Choose another provider (API or ChatGPT)**, or later open **Settings → Models → Add Model**, then select **ChatGPT** from the same provider dropdown. Model, Base URL, API Key, and API Format are replaced by connection status and **Connect with ChatGPT**. The saved runtime card contains no API credential. A safe model preference from the user's Codex CLI config is used for the first message when available; after ACP establishes the session, its effective model and advertised model choices appear in the existing session model picker. When ChatGPT is the default runtime, **Visual Understanding** is shown as automatically supplied by the primary model; the other media rows keep their existing configuration behavior.
 
 OpenClacky connects through ACP using the version-locked pair `@agentclientprotocol/codex-acp@1.11.0` + `@openai/codex@0.153.4`. This prototype requires one of:
 

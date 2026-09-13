@@ -2234,6 +2234,8 @@ module Clacky
       # in shape so the UI can render OCR with the same row component.
       def api_get_ocr_config(res)
         state = @agent_config.ocr_state
+        runtime_vision = runtime_vision_payload(@agent_config, nil)
+        state = runtime_vision if runtime_vision && state["source"] != "custom"
         entry = @agent_config.find_model_by_type("ocr")
 
         out = {
@@ -6635,8 +6637,11 @@ module Clacky
         effective_model ||= card["display_model"]
         {
           "configured" => true,
+          "source" => "auto",
+          "provider" => card["provider_id"],
           "primary" => true,
-          "model" => effective_model
+          "model" => effective_model,
+          "available" => []
         }
       end
 

@@ -191,9 +191,9 @@ $ openclacky
 
 开箱即支持：**Claude (Anthropic) · GPT (OpenAI) · DeepSeek · Kimi (Moonshot) · MiniMax · OpenRouter · OrcaRouter**，或任意自定义端点。
 
-### Codex（ChatGPT）— Web UI 原型
+### ChatGPT — Web UI 原型
 
-Codex 功能以客户端内置、默认启用的扩展随包交付，不需要从扩展市场另行安装。本地 Web UI 可以把它作为 Agent 运行时使用。首次引导时点击**选择其他服务商（API 或 Codex）**，或者进入**设置 → 模型 → 添加模型**，在原有服务商下拉框中选择 **Codex（ChatGPT）**。选择后不再填写模型、Base URL、API Key 和 API Format，而是查看连接状态并点击**使用 ChatGPT 登录**。保存的是不含 API 凭据的运行时配置卡。若用户的 Codex 配置中存在安全的模型偏好，首次消息会沿用该偏好；ACP 会话建立后，实际模型和运行时公布的可选模型会显示在现有会话模型选择器中。
+ChatGPT 功能以客户端内置、默认启用的扩展随包交付，底层通过 Codex ACP 接入，不需要从扩展市场另行安装。本地 Web UI 可以把它作为 Agent 运行时使用。首次引导时点击**选择其他服务商（API 或 ChatGPT）**，或者进入**设置 → 模型 → 添加模型**，在原有服务商下拉框中选择 **ChatGPT**。选择后不再填写模型、Base URL、API Key 和 API Format，而是查看连接状态并点击**使用 ChatGPT 登录**。保存的是不含 API 凭据的运行时配置卡。若用户的 Codex CLI 配置中存在安全的模型偏好，首次消息会沿用该偏好；ACP 会话建立后，实际模型和运行时公布的可选模型会显示在现有会话模型选择器中。ChatGPT 为默认运行时时，设置页会把**视觉理解**显示为主模型自动提供；其他媒体配置保持原有行为。
 
 OpenClacky 通过 ACP 连接固定版本组合：`@agentclientprotocol/codex-acp@1.11.0` + `@openai/codex@0.153.4`。当前原型需要满足以下任一条件：
 

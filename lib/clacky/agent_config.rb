@@ -1518,6 +1518,11 @@ module Clacky
           sanitized = RUNTIME_MODEL_FIELDS.each_with_object({}) do |field, model|
             model[field] = runtime_model[field] if runtime_model.key?(field)
           end
+          if sanitized["provider_id"] == "codex" &&
+             sanitized["runtime_id"] == "codex" &&
+             sanitized["display_model"] == "Codex default"
+            sanitized["display_model"] = "ChatGPT default"
+          end
           sanitized[RUNTIME_MODEL_MARKER] = true
           models << sanitized
         end

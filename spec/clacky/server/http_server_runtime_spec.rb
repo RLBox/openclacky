@@ -152,7 +152,7 @@ RSpec.describe Clacky::Server::HttpServer, "runtime session lifecycle" do
         "id" => "runtime-card-current",
         "provider_id" => "codex",
         "runtime_id" => "codex",
-        "display_model" => "Codex default",
+        "display_model" => "ChatGPT default",
         "type" => "default"
       }
     ])
@@ -175,9 +175,11 @@ RSpec.describe Clacky::Server::HttpServer, "runtime session lifecycle" do
       presets: {
         "codex" => {
           "id" => "codex",
-          "name" => "Codex",
+          "name" => "ChatGPT",
           "runtime_id" => "codex",
-          "auth_mode" => "runtime"
+          "auth_mode" => "runtime",
+          "display_model" => "ChatGPT default",
+          "capabilities" => { "vision" => true }
         }
       }
     )
@@ -274,6 +276,111 @@ RSpec.describe Clacky::Server::HttpServer, "runtime session lifecycle" do
         "configured" => true,
         "primary" => true,
         "model" => "codex-current"
+      )
+    end
+  end
+
+  it "shows provider-declared runtime vision as primary auto in Settings only" do
+    with_server(
+      agent_config: runtime_config,
+      provider_registry: provider_registry,
+      runtime_registry: runtime_registry
+    ) do |server|
+      ocr_res = fake_res
+      dispatch(
+        server,
+        fake_req(method: "GET", path: "/api/config/ocr"),
+        ocr_res
+      )
+
+      expect(ocr_res.status).to eq(200)
+      expect(parsed_body(ocr_res).fetch("ocr")).to include(
+        "configured" => true,
+        "source" => "auto",
+        "primary" => true,
+        "provider" => "codex",
+        "model" => "ChatGPT default"
+      )
+
+      media_res = fake_res
+      dispatch(
+        server,
+        fake_req(method: "GET", path: "/api/config/media"),
+        media_res
+      )
+      media_defaults = parsed_body(media_res).fetch("default_provider")
+      media = parsed_body(media_res).fetch("media")
+      %w[image video audio stt video_understanding].each do |kind|
+        expect(media_defaults.fetch(kind)).to include("model" => nil)
+        expect(media.fetch(kind)).to include(
+          "configured" => false,
+          "source" => "off",
+          "model" => nil
+        )
+      end
+    end
+  end
+
+  it "preserves a custom OCR sidecar when the runtime also declares vision" do
+    custom_config = Clacky::AgentConfig.new(models: runtime_config.models + [
+      {
+        "id" => "custom-ocr",
+        "type" => "ocr",
+        "mode" => "custom",
+        "model" => "custom-vision",
+        "base_url" => "https://vision.example.test/v1",
+        "api_key" => "secret-vision-key"
+      }
+    ])
+
+    with_server(
+      agent_config: custom_config,
+      provider_registry: provider_registry,
+      runtime_registry: runtime_registry
+    ) do |server|
+      res = fake_res
+      dispatch(server, fake_req(method: "GET", path: "/api/config/ocr"), res)
+
+      expect(parsed_body(res).fetch("ocr")).to include(
+        "configured" => true,
+        "source" => "custom",
+        "primary" => false,
+        "model" => "custom-vision",
+        "base_url" => "https://vision.example.test/v1"
+      )
+      expect(parsed_body(res).dig("ocr", "api_key_masked")).to include("****")
+      expect(custom_config.models.map { |model| model["id"] }).to include("custom-ocr")
+    end
+  end
+
+  it "keeps Visual Understanding off when a runtime does not declare vision" do
+    no_vision_registry = Clacky::ProviderRegistry.new(
+      extension_units: [],
+      presets: {
+        "codex" => {
+          "id" => "codex",
+          "name" => "ChatGPT",
+          "runtime_id" => "codex",
+          "auth_mode" => "runtime",
+          "display_model" => "ChatGPT default",
+          "capabilities" => { "vision" => false }
+        }
+      }
+    )
+
+    with_server(
+      agent_config: runtime_config,
+      provider_registry: no_vision_registry,
+      runtime_registry: runtime_registry
+    ) do |server|
+      res = fake_res
+      dispatch(server, fake_req(method: "GET", path: "/api/config/ocr"), res)
+
+      expect(parsed_body(res).fetch("ocr")).to include(
+        "configured" => false,
+        "source" => "off",
+        "primary" => false,
+        "model" => nil
       )
     end
   end

@@ -196,9 +196,9 @@ $ openclacky
 
 標準でサポート: **Claude (Anthropic) · GPT (OpenAI) · DeepSeek · Kimi (Moonshot) · MiniMax · OpenRouter · OrcaRouter** — または任意のカスタムエンドポイント。
 
-### Codex（ChatGPT）— Web UI プロトタイプ
+### ChatGPT — Web UI プロトタイプ
 
-Codex 機能はクライアント同梱・既定有効の拡張として提供され、マーケットプレイスから別途インストールする必要はありません。ローカル Web UI では、Codex を Agent ランタイムとして利用できます。初回セットアップで **Choose another provider (API or Codex)** を選ぶか、**Settings → Models → Add Model** を開き、既存のプロバイダー一覧から **Codex (ChatGPT)** を選択します。Model、Base URL、API Key、API Format の代わりに接続状態と **Connect with ChatGPT** が表示されます。保存されるランタイムカードに API 認証情報は含まれません。ユーザーの Codex 設定に安全なモデル設定があれば最初のメッセージに反映され、ACP セッション確立後は実際のモデルとランタイムが通知した候補が既存のセッションモデル選択 UI に表示されます。
+ChatGPT 機能は Codex ACP を利用するクライアント同梱・既定有効の拡張として提供され、マーケットプレイスから別途インストールする必要はありません。ローカル Web UI では、ChatGPT を Agent ランタイムとして利用できます。初回セットアップで **Choose another provider (API or ChatGPT)** を選ぶか、**Settings → Models → Add Model** を開き、既存のプロバイダー一覧から **ChatGPT** を選択します。Model、Base URL、API Key、API Format の代わりに接続状態と **Connect with ChatGPT** が表示されます。保存されるランタイムカードに API 認証情報は含まれません。ユーザーの Codex CLI 設定に安全なモデル設定があれば最初のメッセージに反映され、ACP セッション確立後は実際のモデルとランタイムが通知した候補が既存のセッションモデル選択 UI に表示されます。ChatGPT が既定のランタイムの場合、設定画面では **Visual Understanding** が主モデルによって自動的に提供されるものとして表示され、その他のメディア設定は従来どおりです。
 
 OpenClacky は ACP 経由で、バージョン固定ペア `@agentclientprotocol/codex-acp@1.11.0` + `@openai/codex@0.153.4` に接続します。このプロトタイプには次のいずれかが必要です。
 

@@ -187,7 +187,7 @@ module Clacky
             started: false,
             status: "error",
             error_code: "authentication_start_failed",
-            message: "OpenClacky could not start Codex authentication."
+            message: "OpenClacky could not start ChatGPT authentication."
           }
         end
 
@@ -521,7 +521,7 @@ module Clacky
           payload[:version] = launch.version if launch&.version
           if state[:auth_error]
             payload[:error_code] = "authentication_failed"
-            payload[:message] = "Codex authentication did not complete. Try again."
+            payload[:message] = "ChatGPT authentication did not complete. Try again."
           end
           payload
         end
@@ -547,10 +547,10 @@ module Clacky
 
         private def health_message(snapshot)
           return snapshot[:message] if snapshot[:message]
-          return "Codex is connected." if snapshot[:authenticated] == true
-          return "Connect a ChatGPT account to use Codex." if snapshot[:authenticated] == false
+          return "ChatGPT is connected." if snapshot[:authenticated] == true
+          return "Connect a ChatGPT account to use ChatGPT." if snapshot[:authenticated] == false
 
-          "Waiting for Codex authentication status."
+          "Waiting for ChatGPT authentication status."
         end
 
         private def canonical_path(path)
@@ -648,16 +648,16 @@ module Clacky
         MAX_THOUGHT_BYTES = 8 * 1024
         MISSING_ROLLOUT_ERROR_PREFIX = "no rollout found for thread id "
         RESUME_CONFLICT_WARNING =
-          "Codex could not reuse the saved runtime context because it is " \
-          "already active elsewhere. This turn started a new Codex thread; " \
+          "ChatGPT could not reuse the saved runtime context because it is " \
+          "already active elsewhere. This turn started a new ChatGPT thread; " \
           "the transcript remains visible, but the new thread received only " \
           "this turn."
         RESUME_FAILED_WARNING =
-          "Codex could not resume the saved runtime context. This turn " \
-          "started a new Codex thread; the transcript remains visible, but " \
+          "ChatGPT could not resume the saved runtime context. This turn " \
+          "started a new ChatGPT thread; the transcript remains visible, but " \
           "the new thread received only this turn."
         CODEX_RETRY_WARNING =
-          "Codex encountered a temporary provider error and is retrying this turn."
+          "ChatGPT encountered a temporary provider error and is retrying this turn."
 
         class << self
           def connection
@@ -773,23 +773,23 @@ module Clacky
 
         def set_model(model_name)
           requested = model_name.to_s.strip
-          raise Error, "Codex model selection requires a model" if requested.empty?
+          raise Error, "ChatGPT model selection requires a model" if requested.empty?
 
           @run_mutex.synchronize do
-            raise Error, "Codex runtime is closed" if @closed
+            raise Error, "ChatGPT runtime is closed" if @closed
             if @in_flight
               raise Clacky::RuntimeSession::BusyError,
-                    "Codex model cannot change during an in-flight prompt"
+                    "ChatGPT model cannot change during an in-flight prompt"
             end
 
             client = connected_client
             unless client && external_session_id && session_ready?
-              raise Error, "Codex model selection is unavailable until the session starts"
+              raise Error, "ChatGPT model selection is unavailable until the session starts"
             end
 
             option = config_option("model")
             unless option && advertised_value?(option, requested)
-              raise Error, "Codex model was not advertised for this session"
+              raise Error, "ChatGPT model was not advertised for this session"
             end
             return true if option["currentValue"].to_s == requested
 
@@ -1000,8 +1000,8 @@ module Clacky
 
         private def reserve_turn!
           @run_mutex.synchronize do
-            raise Error, "Codex runtime is closed" if @closed
-            raise BusyError, "Codex session already has an in-flight prompt" if @in_flight
+            raise Error, "ChatGPT runtime is closed" if @closed
+            raise BusyError, "ChatGPT session already has an in-flight prompt" if @in_flight
 
             @in_flight = true
             @turn_sequence += 1
@@ -1254,7 +1254,7 @@ module Clacky
           tool_call = request["toolCall"].is_a?(Hash) ? request["toolCall"] : {}
           raw_input = tool_call["rawInput"].is_a?(Hash) ? tool_call["rawInput"] : {}
           title = tool_call["title"].to_s.strip
-          title = "Allow this Codex action?" if title.empty?
+          title = "Allow this ChatGPT action?" if title.empty?
           lines = [title]
           append_permission_detail(lines, "Command", raw_input["command"])
           append_permission_detail(lines, "Working directory", raw_input["cwd"])
@@ -1283,7 +1283,7 @@ module Clacky
           client, generation = @connection.client_with_generation
           if @connection.respond_to?(:workspace_allowed?) &&
              !@connection.workspace_allowed?(@context[:working_dir] || Dir.pwd)
-            raise Error, "Codex workspace overlaps a protected credential path"
+            raise Error, "ChatGPT workspace overlaps a protected credential path"
           end
           remember_turn_client(client, generation, turn_token)
           if connected_to_generation?(generation)

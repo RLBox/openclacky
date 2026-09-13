@@ -71,7 +71,7 @@ RSpec.describe "Runtime provider WebUI" do
       end
     end
 
-    it "ships connection states, actions, dynamic model guidance, and Codex name in both languages" do
+    it "ships connection states, actions, dynamic model guidance, and ChatGPT name in both languages" do
       %w[
         provider.name.codex runtime.provider.status.checking
         runtime.provider.status.connected runtime.provider.status.notConnected
@@ -84,12 +84,13 @@ RSpec.describe "Runtime provider WebUI" do
       ].each do |key|
         expect(i18n.scan(%("#{key}")).length).to be >= 2, "missing bilingual key #{key}"
       end
+      expect(i18n.scan('"provider.name.codex":         "ChatGPT"').length).to eq(2)
     end
 
     it "does not hide runtime providers behind API-key-only onboarding copy" do
-      expect(index).to include("Choose another provider (API or Codex)")
-      expect(i18n).to include('"onboard.manual.toggle":      "Choose another provider (API or Codex)"')
-      expect(i18n).to include('"onboard.manual.toggle":      "选择其他服务商（API 或 Codex）"')
+      expect(index).to include("Choose another provider (API or ChatGPT)")
+      expect(i18n).to include('"onboard.manual.toggle":      "Choose another provider (API or ChatGPT)"')
+      expect(i18n).to include('"onboard.manual.toggle":      "选择其他服务商（API 或 ChatGPT）"')
     end
   end
 

@@ -1,9 +1,9 @@
 id: codex
-name: Codex
-display_name: Codex
-display_name_zh: Codex
-description: Use Codex through a managed local ACP runtime
-description_zh: 通过隔离的本地 ACP 运行时使用 Codex
+name: ChatGPT
+display_name: ChatGPT
+display_name_zh: ChatGPT
+description: Use ChatGPT through a managed local Codex ACP runtime
+description_zh: 通过隔离的本地 Codex ACP 运行时使用 ChatGPT
 version: "0.1.0"
 origin: self
 author: OpenClacky
@@ -13,13 +13,13 @@ contributes:
   api: api/handler.rb
   providers:
     - id: codex
-      name: Codex
+      name: ChatGPT
       name_key: provider.name.codex
       runtime_id: codex
       auth_mode: runtime
       credential_fields: []
       dynamic_models: session
-      display_model: Codex default
+      display_model: ChatGPT default
       capabilities:
         chat: true
         tools: true
