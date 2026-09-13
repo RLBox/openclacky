@@ -23,7 +23,7 @@ module Clacky
     def show_subagent_start(skill: nil, iterations: nil, cost_usd: nil); end
     def show_subagent_end; end
     def show_tool_call(name, args); end
-    def show_tool_result(result); end
+    def show_tool_result(result, ui: nil); end
     # Keyed variants preserve an external runtime's call identity while
     # degrading to the positional UI contract for legacy controllers.
     def show_keyed_tool_call(name, args, tool_call_id:)

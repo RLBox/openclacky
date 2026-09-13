@@ -27,4 +27,17 @@ RSpec.describe "Runtime event rendering" do
     expect(sessions).to include('status.className = `tool-item-status ${failed ? "err" : "ok"}`')
     expect(sessions).to include("result.formatted_output")
   end
+
+  it "preserves structured tool UI alongside keyed runtime result metadata" do
+    expect(dispatcher).to include(
+      "status: ev.status, exitCode: ev.exit_code, ui: ev.ui || null"
+    )
+    expect(sessions).to include(
+      "status: resultStatus = null,\n    exitCode = null,\n    ui = null"
+    )
+    expect(sessions).to include("stdout.innerHTML = _renderWebSearchResults(ui)")
+    expect(sessions).to include(
+      "status: ev.status,\n          exitCode: ev.exit_code,\n          ui: ev.ui"
+    )
+  end
 end
