@@ -16,18 +16,54 @@ RSpec.describe Clacky::Server::HttpServer, "runtime session lifecycle" do
   end
 
   class RuntimeServerSpecAdapter
-    attr_reader :context, :persisted_state, :runs, :cancel_reasons
+    attr_reader :context, :persisted_state, :runs, :cancel_reasons,
+      :selected_models
 
     def initialize(context:, persisted_state: nil)
       @context = context
       @persisted_state = persisted_state
       @runs = []
       @cancel_reasons = []
+      @selected_models = []
+      @selectable_models = nil
+      @model_selection_result = true
+      @model_selection_busy = false
+      @current_model = "codex-current"
       @closed = false
     end
 
     def capabilities
-      { cancel: true, image_input: true }
+      capabilities = { cancel: true, image_input: true }
+      capabilities[:model_selection] = true if @selectable_models
+      capabilities
+    end
+
+    def enable_model_selection(*models)
+      @selectable_models = models
+    end
+
+    def model_options
+      Array(@selectable_models)
+    end
+
+    def reject_model_selection!
+      @model_selection_result = false
+    end
+
+    def make_model_selection_busy!
+      @model_selection_busy = true
+    end
+
+    def set_model(model)
+      if @model_selection_busy
+        raise Clacky::RuntimeSession::BusyError,
+              "Runtime model cannot change during an in-flight prompt"
+      end
+      return false unless @model_selection_result
+
+      @selected_models << model
+      @current_model = model
+      true
     end
 
     def run(input, generation:)
@@ -49,7 +85,7 @@ RSpec.describe Clacky::Server::HttpServer, "runtime session lifecycle" do
     def dump_state
       @persisted_state || {
         "session_id" => "external-new",
-        "model" => "codex-current"
+        "model" => @current_model
       }
     end
 
@@ -242,6 +278,152 @@ RSpec.describe Clacky::Server::HttpServer, "runtime session lifecycle" do
     end
   end
 
+  it "switches a runtime-native model through the existing session endpoint" do
+    with_server(
+      agent_config: runtime_config,
+      provider_registry: provider_registry,
+      runtime_registry: runtime_registry
+    ) do |server|
+      session_id = server.send(
+        :build_session,
+        name: "Codex task",
+        working_dir: Dir.pwd,
+        model_id: "runtime-card-current"
+      )
+      runtime = built_runtimes.fetch(0)
+      runtime.enable_model_selection("codex-current", "gpt-5.6-sol")
+      expect(server).to receive(:broadcast_session_update).with(session_id)
+      res = fake_res
+
+      server.send(
+        :api_switch_session_submodel,
+        session_id,
+        fake_req(
+          method: "PATCH",
+          path: "",
+          body: { model_name: "gpt-5.6-sol" }
+        ),
+        res
+      )
+
+      expect(res.status).to eq(200)
+      expect(parsed_body(res)).to include(
+        "ok" => true,
+        "sub_model" => "gpt-5.6-sol"
+      )
+      expect(runtime.selected_models).to eq(["gpt-5.6-sol"])
+      expect(server.instance_variable_get(:@session_manager).load(session_id))
+        .to include(runtime: hash_including(
+          state: hash_including(model: "gpt-5.6-sol")
+        ))
+    end
+  end
+
+  it "rejects a model not advertised by the runtime" do
+    with_server(
+      agent_config: runtime_config,
+      provider_registry: provider_registry,
+      runtime_registry: runtime_registry
+    ) do |server|
+      session_id = server.send(
+        :build_session,
+        name: "Codex task",
+        working_dir: Dir.pwd,
+        model_id: "runtime-card-current"
+      )
+      runtime = built_runtimes.fetch(0)
+      runtime.enable_model_selection("codex-current", "gpt-5.6-sol")
+      res = fake_res
+
+      server.send(
+        :api_switch_session_submodel,
+        session_id,
+        fake_req(
+          method: "PATCH",
+          path: "",
+          body: { model_name: "unadvertised-model" }
+        ),
+        res
+      )
+
+      expect(res.status).to eq(400)
+      expect(parsed_body(res)["error"]).to match(/advertised|available/i)
+      expect(runtime.selected_models).to be_empty
+    end
+  end
+
+  it "returns conflict when a runtime becomes busy during model selection" do
+    with_server(
+      agent_config: runtime_config,
+      provider_registry: provider_registry,
+      runtime_registry: runtime_registry
+    ) do |server|
+      session_id = server.send(
+        :build_session,
+        name: "Codex task",
+        working_dir: Dir.pwd,
+        model_id: "runtime-card-current"
+      )
+      runtime = built_runtimes.fetch(0)
+      runtime.enable_model_selection("codex-current", "gpt-5.6-sol")
+      runtime.make_model_selection_busy!
+      expect(server).not_to receive(:broadcast_session_update)
+      expect(server.instance_variable_get(:@session_manager)).not_to receive(:save)
+      res = fake_res
+
+      server.send(
+        :api_switch_session_submodel,
+        session_id,
+        fake_req(
+          method: "PATCH",
+          path: "",
+          body: { model_name: "gpt-5.6-sol" }
+        ),
+        res
+      )
+
+      expect(res.status).to eq(409)
+      expect(parsed_body(res)["error"]).to match(/in-flight prompt/i)
+      expect(runtime.selected_models).to be_empty
+    end
+  end
+
+  it "does not persist or broadcast a rejected runtime model selection" do
+    with_server(
+      agent_config: runtime_config,
+      provider_registry: provider_registry,
+      runtime_registry: runtime_registry
+    ) do |server|
+      session_id = server.send(
+        :build_session,
+        name: "Codex task",
+        working_dir: Dir.pwd,
+        model_id: "runtime-card-current"
+      )
+      runtime = built_runtimes.fetch(0)
+      runtime.enable_model_selection("codex-current", "gpt-5.6-sol")
+      runtime.reject_model_selection!
+      expect(server).not_to receive(:broadcast_session_update)
+      expect(server.instance_variable_get(:@session_manager)).not_to receive(:save)
+      res = fake_res
+
+      server.send(
+        :api_switch_session_submodel,
+        session_id,
+        fake_req(
+          method: "PATCH",
+          path: "",
+          body: { model_name: "gpt-5.6-sol" }
+        ),
+        res
+      )
+
+      expect(res.status).to eq(500)
+      expect(parsed_body(res)["error"]).to match(/failed.*model/i)
+      expect(runtime.selected_models).to be_empty
+    end
+  end
+
   it "restores an API session on its saved API card when Codex is now the default" do
     config = Clacky::AgentConfig.new(models: [
       {
@@ -392,6 +574,49 @@ RSpec.describe Clacky::Server::HttpServer, "runtime session lifecycle" do
       expect(parsed_body(res)["events"].map { |event| event["content"] })
         .to eq(["Earlier question", "Earlier answer"])
       expect(built_runtimes.fetch(0).runs).to be_empty
+    end
+  end
+
+  it "returns the restored session-owned runtime model when its global card is gone" do
+    config = Clacky::AgentConfig.new(models: [{
+      "id" => "api-card",
+      "model" => "api-model",
+      "base_url" => "https://api.example.test",
+      "api_key" => "secret"
+    }])
+
+    with_server(
+      agent_config: config,
+      provider_registry: provider_registry,
+      runtime_registry: runtime_registry
+    ) do |server|
+      session_id = server.send(:build_session_from_data, persisted_runtime_session)
+      built_runtimes.fetch(0).enable_model_selection(
+        "codex-restored", "gpt-5.6-sol"
+      )
+      res = fake_res
+
+      server.send(
+        :api_get_config,
+        fake_req(
+          method: "GET",
+          path: "/api/config",
+          query_string: "session_id=#{session_id}"
+        ),
+        res
+      )
+
+      expect(res.status).to eq(200)
+      body = parsed_body(res)
+      expect(body["models"].map { |model| model["id"] }).to eq(["api-card"])
+      expect(body["session_model"]).to include(
+        "id" => "restored-runtime:codex:codex",
+        "provider_id" => "codex",
+        "runtime_id" => "codex",
+        "model" => "codex-restored",
+        "sub_model" => "codex-restored",
+        "sub_model_options" => ["codex-restored", "gpt-5.6-sol"]
+      )
     end
   end
 

@@ -9,7 +9,7 @@ RSpec.describe Clacky::RuntimeSession do
     attr_reader :assistant_messages, :assistant_deltas, :assistant_finishes,
       :tool_calls, :tool_results, :keyed_tool_calls, :keyed_tool_results,
       :queues, :events, :progress, :todo_updates, :token_usages,
-      :user_messages
+      :user_messages, :warnings
 
     def initialize
       @assistant_messages = []
@@ -25,6 +25,7 @@ RSpec.describe Clacky::RuntimeSession do
       @todo_updates = []
       @token_usages = []
       @user_messages = []
+      @warnings = []
     end
 
     def show_assistant_message(content, files:, interim: false, created_at: nil)
@@ -78,6 +79,10 @@ RSpec.describe Clacky::RuntimeSession do
       @progress << [progress_type, content]
     end
 
+    def show_warning(content)
+      @warnings << content
+    end
+
     def update_todos(entries)
       @todo_updates << entries
     end
@@ -88,18 +93,38 @@ RSpec.describe Clacky::RuntimeSession do
   end
 
   class RuntimeSessionSpecRuntime
-    attr_reader :context, :persisted_state, :inputs, :cancel_reasons
+    attr_reader :context, :persisted_state, :inputs, :cancel_reasons,
+      :selected_models
 
     def initialize(context:, persisted_state: nil)
       @context = context
       @persisted_state = persisted_state
       @inputs = []
       @cancel_reasons = []
+      @selected_models = []
+      @selectable_models = nil
+      @current_model = "gpt-5.3-codex"
       @closed = false
     end
 
     def capabilities
-      { cancel: true, image_input: true }
+      capabilities = { cancel: true, image_input: true }
+      capabilities[:model_selection] = true if @selectable_models
+      capabilities
+    end
+
+    def enable_model_selection(*models)
+      @selectable_models = models
+    end
+
+    def model_options
+      Array(@selectable_models)
+    end
+
+    def set_model(model)
+      @selected_models << model
+      @current_model = model
+      true
     end
 
     def run(input, generation:)
@@ -140,7 +165,7 @@ RSpec.describe Clacky::RuntimeSession do
     def dump_state
       {
         "session_id" => "acp-session-1",
-        "model" => "gpt-5.3-codex",
+        "model" => @current_model,
         "reasoning_effort" => "high"
       }
     end
@@ -284,6 +309,30 @@ RSpec.describe Clacky::RuntimeSession do
     expect(accepted).to be(false)
     expect(session.history).to be_empty
     expect(ui.assistant_messages).to be_empty
+  ensure
+    session&.close
+  end
+
+  it "forwards runtime warnings only for the active generation" do
+    session = build_session
+    session.begin_generation(4)
+
+    expect(session.accept_runtime_event(
+      4,
+      type: :warning,
+      code: "resume_failed",
+      content: "The saved runtime context could not be resumed."
+    )).to be(true)
+    expect(session.accept_runtime_event(
+      3,
+      type: :warning,
+      code: "resume_failed",
+      content: "This stale warning must not appear."
+    )).to be(false)
+
+    expect(ui.warnings).to eq([
+      "The saved runtime context could not be resumed."
+    ])
   ensure
     session&.close
   end
@@ -605,6 +654,31 @@ RSpec.describe Clacky::RuntimeSession do
     expect { session.fork_runtime_state }.to raise_error(
       Clacky::RuntimeSession::UnsupportedCapability,
       /fork/
+    )
+    expect { session.set_session_sub_model("gpt-5.6-sol") }.to raise_error(
+      Clacky::RuntimeSession::UnsupportedCapability,
+      /model selection/
+    )
+  ensure
+    session&.close
+  end
+
+  it "maps runtime-native model selection onto the existing session model picker" do
+    session = build_session
+    runtime = built_runtimes.fetch(0)
+    runtime.enable_model_selection("gpt-5.3-codex", "gpt-5.6-sol")
+
+    expect(session.current_model_info).to include(
+      model: "gpt-5.3-codex",
+      sub_model: "gpt-5.3-codex",
+      sub_model_options: ["gpt-5.3-codex", "gpt-5.6-sol"]
+    )
+
+    expect(session.set_session_sub_model("gpt-5.6-sol")).to be(true)
+    expect(runtime.selected_models).to eq(["gpt-5.6-sol"])
+    expect(session.current_model_info).to include(
+      model: "gpt-5.6-sol",
+      sub_model: "gpt-5.6-sol"
     )
   ensure
     session&.close

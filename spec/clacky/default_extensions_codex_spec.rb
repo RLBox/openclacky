@@ -127,6 +127,249 @@ RSpec.describe "Codex managed home" do
     expect(File.stat(File.join(managed_home, "config.toml")).mode & 0o777).to eq(0o600)
   end
 
+  it "rejects an overlapping source and managed home before changing source files" do
+    shared_home = File.join(tmpdir, "shared-codex-home")
+    FileUtils.mkdir_p(shared_home)
+    source_config = File.join(shared_home, "config.toml")
+    source_auth = File.join(shared_home, "auth.json")
+    config_content = "model = \"gpt-5.6-sol\"\n[mcp_servers.private]\ncommand = \"keep-me\"\n"
+    File.write(source_config, config_content)
+    File.write(source_auth, "private-auth-material")
+    File.chmod(0o600, source_config)
+    File.chmod(0o600, source_auth)
+
+    expect do
+      build_home(managed_home: shared_home, source_home: shared_home).prepare
+    end.to raise_error(
+      codex_home_class::UnsafeManagedHomeError,
+      /source.*managed|managed.*source/i
+    )
+
+    expect(File.binread(source_config)).to eq(config_content)
+    expect(File.binread(source_auth)).to eq("private-auth-material")
+    expect(File.exist?("#{shared_home}.prepare.lock")).to be(false)
+  end
+
+  it "rejects nesting the managed home inside the source home" do
+    FileUtils.mkdir_p(source_home)
+    nested_managed_home = File.join(source_home, "openclacky-managed")
+
+    expect do
+      build_home(managed_home: nested_managed_home).prepare
+    end.to raise_error(codex_home_class::UnsafeManagedHomeError, /separate/i)
+
+    expect(File.exist?(nested_managed_home)).to be(false)
+    expect(File.exist?("#{nested_managed_home}.prepare.lock")).to be(false)
+  end
+
+  it "rejects nesting the source home inside the managed home" do
+    nested_source_home = File.join(managed_home, "source")
+    FileUtils.mkdir_p(nested_source_home)
+
+    expect do
+      build_home(source_home: nested_source_home).prepare
+    end.to raise_error(codex_home_class::UnsafeManagedHomeError, /separate/i)
+
+    expect(File.exist?(File.join(managed_home, "config.toml"))).to be(false)
+    expect(File.exist?("#{managed_home}.prepare.lock")).to be(false)
+  end
+
+  it "rejects source and managed homes that resolve to the same directory" do
+    shared_home = File.join(tmpdir, "shared-codex-home")
+    aliased_source_home = File.join(tmpdir, "source-alias")
+    FileUtils.mkdir_p(shared_home)
+    File.symlink(shared_home, aliased_source_home)
+    source_config = File.join(shared_home, "config.toml")
+    File.write(source_config, "model = \"gpt-5.6-sol\"\n")
+
+    expect do
+      build_home(
+        managed_home: shared_home,
+        source_home: aliased_source_home
+      ).prepare
+    end.to raise_error(codex_home_class::UnsafeManagedHomeError, /separate/i)
+
+    expect(File.binread(source_config)).to eq("model = \"gpt-5.6-sol\"\n")
+    expect(File.exist?("#{shared_home}.prepare.lock")).to be(false)
+  end
+
+  it "imports only safe top-level Codex model preferences" do
+    FileUtils.mkdir_p(source_home)
+    source_config = File.join(source_home, "config.toml")
+    File.write(source_config, <<~TOML)
+      notify = ["run-untrusted-program"]
+      service_tier = "priority" # preserve the user's account tier
+      model = "gpt-5.6-sol"
+      model_reasoning_effort = "ultra"
+
+      [mcp_servers.evil]
+      command = "steal-secrets"
+    TOML
+    File.chmod(0o644, source_config)
+
+    build_home.prepare
+
+    expect(File.read(File.join(managed_home, "config.toml"))).to eq(<<~TOML)
+      cli_auth_credentials_store = "auto"
+      service_tier = "priority"
+      model = "gpt-5.6-sol"
+      model_reasoning_effort = "ultra"
+    TOML
+  end
+
+  it "accepts safe literal-string model preferences" do
+    FileUtils.mkdir_p(source_home)
+    source_config = File.join(source_home, "config.toml")
+    File.write(source_config, "model = 'gpt-5.6-sol'\n")
+    File.chmod(0o600, source_config)
+
+    build_home.prepare
+
+    expect(File.read(File.join(managed_home, "config.toml"))).to include(
+      %(model = "gpt-5.6-sol")
+    )
+  end
+
+  it "does not follow a source config symlink" do
+    FileUtils.mkdir_p(source_home)
+    outside = File.join(tmpdir, "outside-source-config.toml")
+    File.write(outside, "model = \"gpt-5.6-sol\"\n")
+    File.symlink(outside, File.join(source_home, "config.toml"))
+
+    build_home.prepare
+
+    expect(File.read(File.join(managed_home, "config.toml"))).to eq(
+      "cli_auth_credentials_store = \"auto\"\n"
+    )
+  end
+
+  it "ignores a source config writable by another user" do
+    FileUtils.mkdir_p(source_home)
+    source_config = File.join(source_home, "config.toml")
+    File.write(source_config, "model = \"gpt-5.6-sol\"\n")
+    File.chmod(0o622, source_config)
+
+    build_home.prepare
+
+    expect(File.read(File.join(managed_home, "config.toml"))).to eq(
+      "cli_auth_credentials_store = \"auto\"\n"
+    )
+  end
+
+  it "ignores model preferences from an unsafe source home" do
+    FileUtils.mkdir_p(source_home)
+    source_config = File.join(source_home, "config.toml")
+    File.write(source_config, "model = \"gpt-5.6-sol\"\n")
+    File.chmod(0o600, source_config)
+    File.chmod(0o777, source_home)
+
+    build_home.prepare
+
+    expect(File.read(File.join(managed_home, "config.toml"))).to eq(
+      "cli_auth_credentials_store = \"auto\"\n"
+    )
+  end
+
+  it "does not parse model-looking lines inside multiline TOML strings" do
+    FileUtils.mkdir_p(source_home)
+    source_config = File.join(source_home, "config.toml")
+    File.write(source_config, <<~TOML)
+      description = """
+      model = "gpt-5.6-sol"
+      """
+    TOML
+    File.chmod(0o600, source_config)
+
+    build_home.prepare
+
+    expect(File.read(File.join(managed_home, "config.toml"))).to eq(
+      "cli_auth_credentials_store = \"auto\"\n"
+    )
+  end
+
+  it "rejects quoted or dotted keys that conflict with imported preferences" do
+    [
+      %(model = "gpt-5.6-sol"\n"model" = "gpt-5.5"\n),
+      %(model = "gpt-5.6-sol"\nmodel.name = "gpt-5.5"\n)
+    ].each do |content|
+      FileUtils.rm_rf(managed_home)
+      FileUtils.mkdir_p(source_home)
+      source_config = File.join(source_home, "config.toml")
+      File.write(source_config, content)
+      File.chmod(0o600, source_config)
+
+      build_home.prepare
+
+      expect(File.read(File.join(managed_home, "config.toml"))).to eq(
+        "cli_auth_credentials_store = \"auto\"\n"
+      )
+    end
+  end
+
+  it "rejects preference-looking lines inside a multiline top-level value" do
+    FileUtils.mkdir_p(source_home)
+    source_config = File.join(source_home, "config.toml")
+    File.write(source_config, <<~TOML)
+      notify = [
+      model = "gpt-5.6-sol"
+      ]
+    TOML
+    File.chmod(0o600, source_config)
+
+    build_home.prepare
+
+    expect(File.read(File.join(managed_home, "config.toml"))).to eq(
+      "cli_auth_credentials_store = \"auto\"\n"
+    )
+  end
+
+  it "reads preferences from the opened file descriptor if the path is replaced" do
+    FileUtils.mkdir_p(source_home)
+    source_config = File.join(source_home, "config.toml")
+    original_config = File.join(source_home, "original-config.toml")
+    replacement_config = File.join(tmpdir, "replacement-config.toml")
+    File.write(source_config, "model = \"gpt-5.6-sol\"\n")
+    File.write(replacement_config, "model = \"gpt-5.5\"\n")
+    File.chmod(0o600, source_config)
+    File.chmod(0o600, replacement_config)
+    source_config_opener = lambda do |path, flags, &block|
+      File.open(path, flags) do |file|
+        File.rename(path, original_config)
+        File.symlink(replacement_config, path)
+        block.call(file)
+      end
+    end
+
+    build_home(source_config_opener: source_config_opener).prepare
+
+    expect(File.read(File.join(managed_home, "config.toml"))).to include(
+      %(model = "gpt-5.6-sol")
+    )
+    expect(File.read(File.join(managed_home, "config.toml"))).not_to include(
+      %(model = "gpt-5.5")
+    )
+  end
+
+  it "rejects a different regular file installed before the opener reads it" do
+    FileUtils.mkdir_p(source_home)
+    source_config = File.join(source_home, "config.toml")
+    original_config = File.join(source_home, "original-config.toml")
+    File.write(source_config, "model = \"gpt-5.6-sol\"\n")
+    File.chmod(0o600, source_config)
+    source_config_opener = lambda do |path, flags, &block|
+      File.rename(path, original_config)
+      File.write(path, "model = \"gpt-5.5\"\n")
+      File.chmod(0o600, path)
+      File.open(path, flags, &block)
+    end
+
+    build_home(source_config_opener: source_config_opener).prepare
+
+    expect(File.read(File.join(managed_home, "config.toml"))).to eq(
+      "cli_auth_credentials_store = \"auto\"\n"
+    )
+  end
+
   it "rejects a managed home below an ancestor owned by another user" do
     FileUtils.mkdir_p(managed_home)
     untrusted_ancestor = File.expand_path(tmpdir)
@@ -252,7 +495,10 @@ RSpec.describe "Codex managed home" do
 
   it "does not inherit source configuration, plugins, skills, MCP data, or history" do
     write_secure_auth(File.join(source_home, "auth.json"))
-    File.write(File.join(source_home, "config.toml"), "[mcp_servers.evil]")
+    File.write(
+      File.join(source_home, "config.toml"),
+      "[mcp_servers.evil]\nmodel = \"gpt-from-mcp-table\"\n"
+    )
     %w[plugins skills rules history sessions].each do |name|
       FileUtils.mkdir_p(File.join(source_home, name))
       File.write(File.join(source_home, name, "sentinel"), "do-not-inherit")
@@ -261,6 +507,9 @@ RSpec.describe "Codex managed home" do
     build_home.prepare
 
     expect(Dir.children(managed_home)).to contain_exactly("auth.json", "config.toml")
+    expect(File.read(File.join(managed_home, "config.toml"))).to eq(
+      "cli_auth_credentials_store = \"auto\"\n"
+    )
   end
 
   it "rejects a source auth.json that is itself a symlink" do
@@ -1024,7 +1273,7 @@ RSpec.describe "Codex extension status shell" do
     klass = codex_api_class
     runtime = Clacky::DefaultExtensions::Codex::Runtime
     allow(runtime).to receive(:passive_status).and_return(
-      available: nil, status: "not_connected", authenticated: false
+      available: nil, status: "idle", authenticated: nil
     )
     allow(runtime).to receive(:status).and_return(
       available: true, status: "connected", authenticated: true
@@ -1049,7 +1298,7 @@ RSpec.describe "Codex extension status shell" do
     expect { status_handler.invoke }.to raise_error(Clacky::ApiExtension::Halt) do |halt|
       expect(halt.status).to eq(200)
       expect(JSON.parse(halt.payload)).to include(
-        "status" => "not_connected", "authenticated" => false
+        "status" => "idle", "authenticated" => nil
       )
     end
 

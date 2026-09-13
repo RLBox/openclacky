@@ -7,6 +7,7 @@ require "json"
 module Clacky
   # Host-owned session state for an extension-provided agent runtime.
   class RuntimeSession
+    class BusyError < StandardError; end
     class UnsupportedCapability < StandardError; end
 
     # Keeps the host-owned transcript readable when an extension that owns a
@@ -173,15 +174,18 @@ module Clacky
     def current_model_info
       card = @config&.current_model || {}
       state = runtime_state
+      model = state["model"] || card["display_model"] || "Runtime default"
+      model_options = runtime_model_options
       {
         id: card["id"],
-        model: state["model"] || card["display_model"] || "Runtime default",
+        model: model,
         base_url: nil,
         provider_id: card["provider_id"],
         runtime_id: @runtime_id,
         remark: card["remark"],
         card_model: card["display_model"],
-        sub_model: nil
+        sub_model: model_options.include?(model) ? model : nil,
+        sub_model_options: model_options
       }
     end
 
@@ -264,6 +268,8 @@ module Clacky
         record_tool_result(generation, event)
       when "thought"
         show_runtime_progress(generation, event, progress_type: "thinking")
+      when "warning"
+        show_runtime_warning(generation, event)
       when "usage"
         apply_usage(generation, event)
       when "plan"
@@ -372,9 +378,23 @@ module Clacky
       false
     end
 
-    def set_session_sub_model(_model_name)
-      raise UnsupportedCapability,
-            "agent runtime sessions do not support sub-model overlays"
+    def set_session_sub_model(model_name)
+      unless capability?(:model_selection) && @runtime.respond_to?(:set_model)
+        raise UnsupportedCapability,
+              "agent runtime does not support model selection"
+      end
+
+      requested = model_name.to_s.strip
+      if requested.empty?
+        raise UnsupportedCapability,
+              "runtime model selection requires an advertised model"
+      end
+
+      result = @runtime.set_model(requested)
+      return false if result == false
+
+      refresh_effective_configuration
+      true
     end
 
     def to_session_data(status: :success, error_message: nil, raw_message: nil,
@@ -959,6 +979,16 @@ module Clacky
       accepted
     end
 
+    private def show_runtime_warning(generation, event)
+      content = (event[:content] || event["content"] ||
+                 event[:message] || event["message"]).to_s.strip
+      accepted = current_generation?(generation)
+      if accepted && !content.empty? && @ui&.respond_to?(:show_warning)
+        with_runtime_generation(generation) { @ui.show_warning(content) }
+      end
+      accepted
+    end
+
     private def current_generation?(generation)
       @generation_mutex.synchronize do
         @current_generation && @current_generation.to_i == generation.to_i
@@ -995,6 +1025,18 @@ module Clacky
     private def refresh_effective_configuration
       state = runtime_state
       self.reasoning_effort = state["reasoning_effort"] if state["reasoning_effort"]
+    end
+
+    private def runtime_model_options
+      return [] unless capability?(:model_selection)
+      return [] unless @runtime.respond_to?(:model_options)
+
+      Array(@runtime.model_options).filter_map do |model|
+        value = model.to_s.strip
+        value unless value.empty?
+      end.uniq
+    rescue StandardError
+      []
     end
 
     private def runtime_state

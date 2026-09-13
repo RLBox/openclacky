@@ -6,13 +6,18 @@ require "securerandom"
 module Clacky
   module DefaultExtensions
     module Codex
-      # Creates an isolated CODEX_HOME and reuses only a securely validated
-      # file-backed login. No other source-home content is copied or linked.
+      # Creates an isolated CODEX_HOME and reuses a securely validated
+      # file-backed login plus a small allowlist of safe model preferences.
       class CodexHome
         class Error < StandardError; end
         class UnsafeManagedHomeError < Error; end
 
         CONFIG_CONTENT = "cli_auth_credentials_store = \"auto\"\n"
+        MAX_SOURCE_CONFIG_BYTES = 1_048_576
+        MODEL_VALUE_PATTERN = /\A[A-Za-z0-9][A-Za-z0-9._:+\/-]{0,127}\z/
+        REASONING_EFFORTS = %w[none minimal low medium high xhigh max ultra].freeze
+        SERVICE_TIERS = %w[auto default flex scale priority fast ultrafast].freeze
+        PREFERENCE_KEYS = %w[service_tier model model_reasoning_effort].freeze
         SENSITIVE_HOME_PATHS = [
           ".clacky",
           ".ssh",
@@ -57,7 +62,8 @@ module Clacky
         def initialize(managed_home: nil, source_home: nil, source_auth_path: nil,
                        platform: RUBY_PLATFORM, current_uid: Process.uid,
                        symlink_creator: nil, stat_reader: nil,
-                       managed_stat_reader: nil, managed_lstat_reader: nil)
+                       managed_stat_reader: nil, managed_lstat_reader: nil,
+                       source_config_opener: nil)
           @platform = platform.to_s
           @managed_home = File.expand_path(
             managed_home || default_managed_home
@@ -72,9 +78,13 @@ module Clacky
           @managed_uid = Process.uid
           @managed_stat_reader = managed_stat_reader || File.method(:stat)
           @managed_lstat_reader = managed_lstat_reader || File.method(:lstat)
+          @source_config_opener = source_config_opener || lambda do |path, flags, &block|
+            File.open(path, flags, &block)
+          end
         end
 
         def prepare
+          validate_home_separation!
           prepare_managed_parent!
           if File.symlink?(prepare_lock_path)
             raise UnsafeManagedHomeError, "managed Codex lock must not be a symlink"
@@ -88,6 +98,36 @@ module Clacky
             lock.flock(File::LOCK_EX)
             prepare_locked
           end
+        end
+
+        private def validate_home_separation!
+          managed = canonical_home_path(@managed_home)
+          source = canonical_home_path(@source_home)
+          separated = managed != source &&
+                      !inside_directory?(managed, source) &&
+                      !inside_directory?(source, managed)
+          return if separated
+
+          raise UnsafeManagedHomeError,
+                "managed and source Codex homes must be separate"
+        end
+
+        private def canonical_home_path(path)
+          expanded = File.expand_path(path)
+          suffix = []
+          current = expanded
+
+          until File.exist?(current)
+            parent = File.dirname(current)
+            break if parent == current
+
+            suffix.unshift(File.basename(current))
+            current = parent
+          end
+
+          File.expand_path(File.join(File.realpath(current), *suffix))
+        rescue SystemCallError, ArgumentError
+          expanded
         end
 
         private def prepare_locked
@@ -228,7 +268,7 @@ module Clacky
             File::WRONLY | File::CREAT | File::EXCL,
             0o600
           ) do |file|
-            file.write(CONFIG_CONTENT)
+            file.write(managed_config_content)
             file.flush
             file.fsync
           end
@@ -237,6 +277,148 @@ module Clacky
           FileUtils.chmod(0o600, destination)
         ensure
           File.unlink(temporary) if temporary && path_entry?(temporary)
+        end
+
+        private def managed_config_content
+          preferences = validated_source_preferences
+          lines = [CONFIG_CONTENT.chomp]
+          PREFERENCE_KEYS.each do |key|
+            value = preferences[key]
+            lines << %(#{key} = "#{value}") if value
+          end
+          "#{lines.join("\n")}\n"
+        end
+
+        private def validated_source_preferences
+          return {} unless File.directory?(@source_home)
+          return {} if File.symlink?(@source_home)
+
+          source_home_real = File.realpath(@source_home)
+          return {} if validate_source_home(source_home_real)
+
+          source_config = File.join(@source_home, "config.toml")
+          entry_stat = File.lstat(source_config)
+          return {} unless entry_stat.file?
+
+          source_real = File.realpath(source_config)
+          return {} unless inside_directory?(source_real, source_home_real)
+
+          flags = File::RDONLY
+          flags |= File::NOFOLLOW if File.const_defined?(:NOFOLLOW)
+          flags |= File::NONBLOCK if File.const_defined?(:NONBLOCK)
+          @source_config_opener.call(source_config, flags) do |file|
+            stat = file.stat
+            return {} unless stat.file?
+            return {} unless same_file?(entry_stat, stat)
+            return {} if !@current_uid.nil? && stat.respond_to?(:uid) &&
+                         stat.uid != @current_uid
+            return {} unless (stat.mode & 0o022).zero?
+            return {} if stat.size > MAX_SOURCE_CONFIG_BYTES
+
+            file.binmode
+            content = file.read(MAX_SOURCE_CONFIG_BYTES + 1) || ""
+            return {} if content.bytesize > MAX_SOURCE_CONFIG_BYTES
+
+            content.force_encoding(Encoding::UTF_8)
+            return {} unless content.valid_encoding?
+
+            return parse_source_preferences(content)
+          end
+          {}
+        rescue SystemCallError, ArgumentError
+          {}
+        end
+
+        private def parse_source_preferences(content)
+          preferences = {}
+          content.each_line do |raw_line|
+            statement = single_line_toml_statement(raw_line)
+            return {} if statement.nil?
+            next if statement.empty?
+            break if statement.start_with?("[")
+
+            assignment = statement.match(/\A([^=]+?)\s*=\s*(.+)\z/)
+            return {} unless assignment
+
+            key = assignment[1].strip
+            # Quoted and dotted root keys are valid TOML, but rejecting them
+            # keeps this deliberately small importer from missing aliases or
+            # conflicts for one of the allowlisted preference names.
+            return {} unless /\A[A-Za-z0-9_-]+\z/.match?(key)
+            next unless PREFERENCE_KEYS.include?(key)
+
+            value_match = assignment[2].strip.match(
+              /\A(?:"([^"\\]*)"|'([^']*)')\z/
+            )
+            return {} unless value_match
+
+            value = value_match[1] || value_match[2]
+            return {} if preferences.key?(key)
+            return {} unless valid_preference?(key, value)
+
+            preferences[key] = value
+          end
+          preferences
+        end
+
+        private def single_line_toml_statement(raw_line)
+          output = +""
+          quote = nil
+          escaped = false
+          brackets = []
+
+          raw_line.each_char do |character|
+            if quote
+              output << character
+              if quote == '"'
+                if escaped
+                  escaped = false
+                elsif character == "\\"
+                  escaped = true
+                elsif character == quote
+                  quote = nil
+                end
+              elsif character == quote
+                quote = nil
+              end
+              next
+            end
+
+            case character
+            when "#"
+              break
+            when '"', "'"
+              quote = character
+            when "[", "{"
+              brackets << character
+            when "]"
+              return nil unless brackets.pop == "["
+            when "}"
+              return nil unless brackets.pop == "{"
+            end
+            output << character
+          end
+
+          return nil if quote || escaped || !brackets.empty?
+
+          output.strip
+        end
+
+        private def same_file?(expected, actual)
+          expected.dev == actual.dev && expected.ino == actual.ino
+        end
+
+        private def valid_preference?(key, value)
+          case key
+          when "model"
+            MODEL_VALUE_PATTERN.match?(value)
+          when "model_reasoning_effort"
+            REASONING_EFFORTS.include?(value)
+          when "service_tier"
+            SERVICE_TIERS.include?(value)
+          else
+            false
+          end
         end
 
         private def validated_source_auth

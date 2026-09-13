@@ -6480,7 +6480,7 @@ module Clacky
         query   = URI.decode_www_form(req.query_string.to_s).to_h
         session_agent = agent_for_session(query["session_id"])
         cfg     = session_agent&.config || @agent_config
-        json_response(res, 200, {
+        payload = {
           models: models,
           current_index: @agent_config.current_model_index,
           current_id: @agent_config.current_model&.dig("id"),
@@ -6488,7 +6488,34 @@ module Clacky
             cfg,
             runtime_session: session_agent
           )
-        })
+        }
+        session_model = runtime_session_model_payload(session_agent)
+        payload[:session_model] = session_model if session_model
+        json_response(res, 200, payload)
+      end
+
+      # Return only the session-owned runtime model fields needed by the model
+      # picker. A restored runtime card may be private to this session and must
+      # not be inferred from, or inserted into, the global model collection.
+      private def runtime_session_model_payload(agent)
+        return nil unless runtime_session?(agent)
+
+        info = agent.current_model_info
+        return nil unless info.is_a?(Hash)
+
+        card_model = indifferent_value(info, :card_model).to_s
+        model = indifferent_value(info, :model).to_s
+        {
+          id: indifferent_value(info, :id),
+          provider_id: indifferent_value(info, :provider_id),
+          runtime_id: indifferent_value(info, :runtime_id),
+          display_model: card_model.empty? ? model : card_model,
+          model: model,
+          remark: indifferent_value(info, :remark),
+          card_model: card_model,
+          sub_model: indifferent_value(info, :sub_model),
+          sub_model_options: Array(indifferent_value(info, :sub_model_options))
+        }
       end
 
       # POST /api/backup/restore — accept a tar.gz upload, extract over ~/.clacky, hot-restart
@@ -7633,33 +7660,62 @@ module Clacky
         return json_response(res, 404, { error: "Session not found" }) unless @registry.ensure(session_id)
 
         agent = nil
-        @registry.with_session(session_id) { |s| agent = s[:agent] }
+        session_status = nil
+        @registry.with_session(session_id) do |s|
+          agent = s[:agent]
+          session_status = s[:status]
+        end
         return json_response(res, 404, { error: "Session not found" }) unless agent
-        return unless runtime_capability_available?(
-          agent, :sub_model, res, "sub-model overlays"
-        )
 
-        if model_name && !model_name.empty?
-          info = agent.current_model_info
-          # Prefer explicitly saved provider_id, fall back to base_url lookup
-          provider_id = info&.dig(:provider_id).to_s.strip.then { |v| v.empty? ? nil : v }
-          provider_id ||= (info && Clacky::Providers.find_by_base_url(info[:base_url]))
-          allowed = provider_id ? Clacky::Providers.models(provider_id) : []
-          if allowed.empty?
-            return json_response(res, 400, { error: "Current model has no provider preset; sub-model switching unavailable" })
+        info = agent.current_model_info
+        runtime_model_selection = agent.respond_to?(:runtime?) && agent.runtime?
+        if runtime_model_selection
+          return unless runtime_capability_available?(
+            agent, :model_selection, res, "model selection"
+          )
+          if session_status.to_s == "running"
+            return json_response(res, 409, { error: "Model cannot change while the session is running" })
           end
+          if model_name.nil? || model_name.empty?
+            return json_response(res, 400, { error: "Select a model advertised by the runtime" })
+          end
+
+          allowed = Array(info&.dig(:sub_model_options))
           unless allowed.include?(model_name)
-            return json_response(res, 400, { error: "Sub-model '#{model_name}' not listed under provider '#{provider_id}'" })
+            return json_response(res, 400, { error: "Model '#{model_name}' is not advertised by the runtime" })
           end
         else
-          model_name = nil
+          return unless runtime_capability_available?(
+            agent, :sub_model, res, "sub-model overlays"
+          )
+
+          if model_name && !model_name.empty?
+            # Prefer explicitly saved provider_id, fall back to base_url lookup
+            provider_id = info&.dig(:provider_id).to_s.strip.then { |v| v.empty? ? nil : v }
+            provider_id ||= (info && Clacky::Providers.find_by_base_url(info[:base_url]))
+            allowed = provider_id ? Clacky::Providers.models(provider_id) : []
+            if allowed.empty?
+              return json_response(res, 400, { error: "Current model has no provider preset; sub-model switching unavailable" })
+            end
+            unless allowed.include?(model_name)
+              return json_response(res, 400, { error: "Sub-model '#{model_name}' not listed under provider '#{provider_id}'" })
+            end
+          else
+            model_name = nil
+          end
         end
 
-        agent.set_session_sub_model(model_name)
+        success = agent.set_session_sub_model(model_name)
+        unless success
+          return json_response(res, 500, { error: "Failed to switch session model" })
+        end
+
         @session_manager.save(agent.to_session_data(updated_at: Time.now))
         broadcast_session_update(session_id)
 
         json_response(res, 200, { ok: true, sub_model: agent.current_model_info[:sub_model] })
+      rescue Clacky::RuntimeSession::BusyError => e
+        json_response(res, 409, { error: e.message })
       rescue => e
         json_response(res, 500, { error: e.message })
       end

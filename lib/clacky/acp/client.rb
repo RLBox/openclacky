@@ -10,11 +10,14 @@ module Clacky
       class Error < StandardError; end
       class TransportError < Error; end
       class ProtocolError < Error
-        attr_reader :code, :method
+        attr_reader :code, :method, :remote_message, :data
 
-        def initialize(message = nil, code: nil, method: nil)
+        def initialize(message = nil, code: nil, method: nil,
+                       remote_message: nil, data: nil)
           @code = code
           @method = method && method.to_s
+          @remote_message = remote_message && remote_message.to_s
+          @data = data
           super(message)
         end
       end
@@ -193,7 +196,9 @@ module Clacky
           raise ProtocolError.new(
             "ACP request '#{method}' failed (code #{code})",
             code: code,
-            method: method
+            method: method,
+            remote_message: remote_error["message"],
+            data: deep_copy(remote_error["data"])
           )
         end
 

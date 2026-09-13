@@ -431,6 +431,12 @@ module Clacky
       # treats that as "no sub-model switcher available".
       private def sub_model_options_for(model_info)
         return [] unless model_info
+        if model_info.key?(:sub_model_options) || model_info.key?("sub_model_options")
+          return Array(
+            model_info[:sub_model_options] || model_info["sub_model_options"]
+          )
+        end
+
         # Prefer explicitly saved provider_id, fall back to base_url lookup
         provider_id = model_info[:provider_id].to_s.strip.then { |v| v.empty? ? nil : v }
         provider_id ||= (model_info[:base_url] && Clacky::Providers.find_by_base_url(model_info[:base_url]))

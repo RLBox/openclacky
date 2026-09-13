@@ -12,6 +12,29 @@ require "clacky/server/session_registry"
 RSpec.describe Clacky::Server::SessionRegistry do
   let(:default_config) { Clacky::AgentConfig.new }
 
+  describe "runtime model options" do
+    it "prefers an explicitly supplied dynamic list, including an empty list" do
+      registry = described_class.new(agent_config: default_config)
+      allow(Clacky::Providers).to receive(:models).with("codex")
+        .and_return(["static-model"])
+
+      expect(registry.send(
+        :sub_model_options_for,
+        provider_id: "codex",
+        sub_model_options: ["gpt-5.6-sol", "gpt-5.6-terra"]
+      )).to eq(["gpt-5.6-sol", "gpt-5.6-terra"])
+      expect(registry.send(
+        :sub_model_options_for,
+        provider_id: "codex",
+        sub_model_options: []
+      )).to eq([])
+      expect(registry.send(
+        :sub_model_options_for,
+        provider_id: "codex"
+      )).to eq(["static-model"])
+    end
+  end
+
   def write_session_file(dir, session_id:, name:, created_at:, pinned: false,
                          source: "manual", project_id: nil)
     data = {

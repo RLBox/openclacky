@@ -307,7 +307,7 @@ RSpec.describe Clacky::Acp::Client do
     client&.stop
   end
 
-  it "raises a protocol error with the remote method context" do
+  it "raises a protocol error with private remote details kept out of its message" do
     client = initialized_client
     transport.on_send do |message|
       next unless message[:method] == "session/new"
@@ -315,17 +315,23 @@ RSpec.describe Clacky::Acp::Client do
       transport.emit(
         "jsonrpc" => "2.0",
         "id" => message[:id],
-        "error" => { "code" => -32_000, "message" => "not authenticated" }
+        "error" => {
+          "code" => -32_603,
+          "message" => "Internal error",
+          "data" => { "details" => "private remote details" }
+        }
       )
     end
 
     expect do
       client.request("session/new", {}, timeout: 1)
     end.to raise_error(Clacky::Acp::Client::ProtocolError) do |error|
-      expect(error.message).to include("session/new", "-32000")
-      expect(error.message).not_to include("not authenticated", "private")
-      expect(error.code).to eq(-32_000)
+      expect(error.message).to include("session/new", "-32603")
+      expect(error.message).not_to include("Internal error", "private remote details")
+      expect(error.code).to eq(-32_603)
       expect(error.method).to eq("session/new")
+      expect(error.remote_message).to eq("Internal error")
+      expect(error.data).to eq("details" => "private remote details")
     end
   ensure
     client&.stop

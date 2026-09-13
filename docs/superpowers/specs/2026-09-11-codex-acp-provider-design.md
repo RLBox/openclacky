@@ -28,7 +28,7 @@ The key decisions are:
 - Use ACP instead of implementing the Codex App Server protocol directly. `codex-acp` already translates authentication, model configuration, session operations, approvals, tool events, and streamed output into a provider-neutral protocol.
 - Add a thin core runtime SPI and provider contribution type. Do not implement the feature with `contributes.patches` monkey-patches.
 - Put Codex-specific startup, authentication, home-directory preparation, event mapping, and diagnostics in a bundled default extension.
-- Use an application-managed `CODEX_HOME` for sessions, state databases, caches, and logs. Reuse an existing file-backed Codex login only through a validated `auth.json` symlink; do not reuse the whole user Codex home.
+- Use an application-managed `CODEX_HOME` for sessions, state databases, caches, and logs. Reuse an existing file-backed Codex login only through a validated `auth.json` symlink and rebuild the managed config from a strict allowlist of model preferences; do not reuse the whole user Codex home.
 - Start with codex-acp's safer `read-only` mode, then map each OpenClacky permission mode to an advertised adapter mode after session creation. Never select `agent-full-access` automatically.
 - Pin the version pair `@agentclientprotocol/codex-acp@1.11.0` and `@openai/codex@0.153.4`. For every launch path, verify the published adapter bundle by SHA-256, require the exact Codex package version, and patch the adapter's unconditional project trust assignment to `untrusted`, so project-local config, hooks, and exec policies cannot become an out-of-sandbox code-execution path. The prototype uses double-pinned `npx` with npm package-integrity verification, or an explicit operator-trusted packaging path; production packaging must lock and attest the full dependency tree and platform binary.
 
@@ -44,7 +44,7 @@ When selected:
 
 - Base URL, API key, API format, and provider-key help are hidden.
 - Model, Base URL, and API Key fields are hidden. The panel explains that Codex will report its actual model after the first prompt establishes the ACP session.
-- A connection panel shows one of `Connected`, `Not connected`, `Starting`, or an actionable dependency/version error.
+- A connection panel distinguishes `Not started` (the passive, side-effect-free state), `Connected`, `Not connected` (a live runtime that reported no account), `Starting`, and actionable dependency/version errors. `Not started` explains that the runtime starts automatically on first use.
 - If a reusable Codex login is already available, the user can continue without signing in again.
 - Otherwise, `Connect with ChatGPT` starts ACP's `chat-gpt` authentication method, opens the system browser, and the page polls status until the account is connected.
 - `Continue` saves a credentialless runtime card and follows the existing onboarding completion flow without sending the OpenClacky-specific `/onboard` skill command to Codex.
@@ -55,13 +55,19 @@ The OpenClacky AI Keys device-login card remains unchanged. Its secondary action
 
 The Add Model dialog uses the same provider descriptor behavior. Selecting Codex hides API-key-only fields, shows connection status, and saves a runtime-backed model card after a runtime health check instead of calling the OpenAI-compatible model tester.
 
-Codex model cards show the provider name, `Codex default` until a session reports its effective model, connection state, and a `Test` action that checks ACP process readiness plus authentication. Removing the card removes only OpenClacky's model configuration. It does not log out the shared Codex account or delete the source Codex home's `auth.json` (`$CODEX_HOME`, or `~/.codex` when unset).
+Codex model cards show the provider name, `Codex default` until a session reports its effective model, connection state, and a `Test` action that checks ACP process readiness plus authentication. After the first prompt opens an ACP session, the existing session model picker lists the models advertised in ACP `configOptions`; selecting one calls `session/set_config_option` and persists the effective value. Removing the card removes only OpenClacky's model configuration. It does not log out the shared Codex account or delete the source Codex home's `auth.json` (`$CODEX_HOME`, or `~/.codex` when unset).
 
 ### Session behavior
 
 Creating an OpenClacky session with a Codex card creates the local host session immediately; the first prompt lazily creates or resumes its ACP session in that workspace. Prompts, supported image attachments, cancellation, streamed assistant output, tool activity, usage, and permission requests are mapped into the existing OpenClacky session UI. The sidebar and session URL remain owned by OpenClacky.
 
-Features that require internals unique to `Clacky::Agent` are capability-gated for ACP sessions. The first version does not expose Time Machine branching, OpenClacky sub-model overlays, OpenClacky idle compression, or OpenClacky goal loops on Codex sessions. Unsupported capabilities, forks, and live API/runtime switches return `409 Conflict`; malformed runtime-card fields and forged runtime IDs return `422 Unprocessable Content`. Switching between API and runtime cards, or between runtime provider cards, requires a new session.
+`session/new` and `session/resume` are side-effectful bootstrap operations: codex-acp may refresh Skills, create or load a Codex thread, enumerate models, and refresh account state before returning the authoritative session ID. They therefore do not inherit the five-second timeout used by short control requests. OpenClacky waits for their response and uses its generation-scoped Stop/cancel watchdog to terminate a stuck ACP process; abandoning the JSON-RPC request while the adapter continued would lose a late session ID and create a duplicate thread on retry.
+
+If a saved ACP thread can no longer be resumed, or is already owned by another live OpenClacky session, the runtime starts a fresh Codex thread for the current turn. The local transcript remains readable, but it is not replayed into the new thread; OpenClacky emits a visible warning so this loss of runtime-context continuity is never silent.
+
+Features that require internals unique to `Clacky::Agent` are capability-gated for ACP sessions. ACP-native model selection has its own runtime capability and reuses only the existing model-picker presentation; it remains distinct from OpenClacky's static provider sub-model overlays. The effective ACP reasoning level is visible but read-only because version 1 does not expose a reasoning-selection runtime capability. OpenClacky-specific Skill autocomplete and `/new` project initialization are omitted, and Fork controls are hidden, for runtime sessions rather than sending unsupported host commands as ordinary Codex prompts. The first version does not expose Time Machine branching, OpenClacky idle compression, or OpenClacky goal loops on Codex sessions. Unsupported capabilities, forks, and live API/runtime provider switches return `409 Conflict`; malformed runtime-card fields and forged runtime IDs return `422 Unprocessable Content`. Switching between API and runtime cards, or between runtime provider cards, requires a new session.
+
+Runtime-native model selection also fails closed across concurrency boundaries. If a prompt starts after the HTTP handler's initial status check, the runtime raises the host-owned busy error and the endpoint returns `409 Conflict`; a model selection that returns `false` is not persisted or broadcast as a successful change.
 
 ## Core Extension Boundary
 
@@ -227,7 +233,7 @@ ACP `session/update` notifications map as follows:
 | `plan` | Map entries to the existing task/todo presentation when possible; otherwise show a non-blocking progress summary. |
 | `usage_update` and prompt usage | Update token/context metadata and aggregate runtime counters. |
 | `config_option_update` | Refresh the runtime session's effective model and reasoning metadata. |
-| `session_info_update` | Accept an ACP title only while the OpenClacky session still has an autogenerated name. |
+| `session_info_update` | Accept an ACP title only while the OpenClacky session still has an autogenerated name; surface Codex retry metadata as a visible warning without exposing raw provider details. |
 | unknown update | Ignore safely and log only update type plus adapter version. |
 
 Existing WebSocket event types remain valid. Keyed assistant and tool fields are additive, and the frontend retains positional fallback behavior for `Clacky::Agent` events and older session history.
@@ -259,7 +265,7 @@ POSIX: ${XDG_DATA_HOME:-~/.local/share}/openclacky/codex
 
 The directory is created with mode `0700`. Sessions, SQLite state, caches, logs, and installation metadata stay there.
 
-The source home is the launch environment's existing `CODEX_HOME`, falling back to `~/.codex`. OpenClacky may create `managed/auth.json` as a symlink to `source/auth.json` only when all of these checks pass:
+The source home is the launch environment's existing `CODEX_HOME`, falling back to `~/.codex`. Before creating a lock, directory, or config file, OpenClacky resolves existing ancestors and rejects source and managed homes that are identical, nested in either direction, or aliases of the same directory. OpenClacky may create `managed/auth.json` as a symlink to `source/auth.json` only when all of these checks pass:
 
 - platform supports safe file symlinks;
 - the source path is a regular file and not itself a symlink;
@@ -270,7 +276,7 @@ The source home is the launch environment's existing `CODEX_HOME`, falling back 
 
 If the checks fail or the symlink cannot be created, OpenClacky does not copy credentials. ACP uses its own browser login in the managed home. Windows defaults to independent login rather than copying a refresh token.
 
-OpenClacky does not inherit or link the source `config.toml`, `plugins`, `skills`, `rules`, hooks, MCP definitions, custom providers, OTEL exporters, OAuth files, history, or databases. The managed config selects Codex's `auto` credential store. A per-launch, unpredictable permission profile denies reads of the managed and source Codex homes, `~/.clacky`, common cloud/SSH/container credential paths, git/netrc/npm credentials, and shell startup files; login-shell initialization is disabled and sensitive environment variables are removed. This prevents unexpected code execution, recursive OpenClacky integrations, telemetry leakage, and session collisions while still allowing Codex to refresh the linked login through its own auth subsystem.
+OpenClacky never copies or links the source `config.toml`. It accepts a config no larger than 1 MiB (reading one additional sentinel byte to detect overflow) from a same-user regular file inside a validated, non-writable source home. The file is opened with no-follow/non-blocking flags where the platform supports them, then ownership, type, permissions, identity, size, and content are checked on that same descriptor. OpenClacky reconstructs a mode-`0600` managed config from only the top-level string keys `model`, `model_reasoning_effort`, and `service_tier`; values must be simple, unescaped basic or literal strings and pass strict model-token or enum validation. Duplicate allowlisted keys, unsupported quoted/dotted root keys, multiline root statements, malformed preference assignments, or unsafe input fall back to the base config. The importer stops at the first table, so nested preferences are ignored rather than imported. Plugins, skills, rules, hooks, MCP definitions, custom providers, notifications, OTEL exporters, OAuth files, history, and databases are never imported. The managed config also selects Codex's `auto` credential store. A per-launch, unpredictable permission profile denies reads of the managed and source Codex homes, `~/.clacky`, common cloud/SSH/container credential paths, git/netrc/npm credentials, and shell startup files; login-shell initialization is disabled and sensitive environment variables are removed. This prevents unexpected code execution, recursive OpenClacky integrations, telemetry leakage, and session collisions while preserving the user's first-session model choice and allowing Codex to refresh the linked login through its own auth subsystem.
 
 Removing a model card or stopping OpenClacky only unlinks or closes OpenClacky-owned resources. It never follows the auth symlink for recursive cleanup and never modifies the source Codex home. Because a shared auth file can still be refreshed by either Codex process, the UI labels it as a reused Codex login rather than an isolated credential.
 
@@ -295,7 +301,7 @@ The npm fallback requires Node.js 20 or newer, needs network access on first res
 - Workspaces that overlap protected credential paths are rejected before `session/new` or `session/resume`. The forced permission profile disables login shells and denies direct model reads of both linked credentials and common local secret locations.
 - stdout is protocol-only. stderr is bounded, redacted, and never returned verbatim to the browser.
 - Auth files, account tokens, browser-login internals, and environment values are absent from model cards, session files, logs, errors, and WebSocket events.
-- Short control requests use method-specific timeouts. Long-running authentication and prompt requests use liveness monitoring plus cooperative cancel rather than one global request deadline. Malformed lines, unknown IDs, oversized messages, and process exits fail waiting operations without hanging the server.
+- Short control requests use method-specific timeouts. Side-effectful session-open requests wait for their authoritative result and are interrupted through generation-scoped process cancellation; long-running authentication and prompt requests use their own liveness/cancellation policy rather than one global short deadline. Malformed lines, unknown IDs, oversized messages, and process exits fail waiting operations without hanging the server.
 - A runtime health test verifies process startup, ACP initialize compatibility, and authentication state. Model availability is validated only when a real session returns `configOptions`; the health test does not create a session or run a billable prompt.
 - An authentication failure leaves existing API-key providers and sessions usable.
 - An ACP crash marks only affected Codex sessions as errored. It does not terminate the OpenClacky server.
@@ -305,6 +311,7 @@ The npm fallback requires Node.js 20 or newer, needs network access on first res
 ## Compatibility
 
 - Existing provider presets, API responses, model cards, and sessions have no `runtime_id` and continue through `Clacky::Client` and `Clacky::Agent` unchanged.
+- A saved card is treated as runtime-backed only when its `runtime_id` matches the selected provider descriptor. This preserves older API cards whose historical `provider_id` happens to collide with a newly contributed runtime provider ID.
 - Runtime-backed cards live under `runtime_models`; an older OpenClacky ignores that unknown top-level key instead of constructing `Clacky::Client` with empty API credentials.
 - New provider-response fields are optional. Older frontends continue rendering provider name, model, and URL fields.
 - Extension manifests without `providers` or `agent_runtimes` load unchanged.
@@ -320,8 +327,9 @@ Version 1 includes:
 - a generic stdio ACP client sufficient for Codex;
 - the bundled Codex extension;
 - safe managed-home preparation and existing-login reuse;
+- safe import of model, reasoning-effort, and service-tier preferences;
 - ChatGPT browser authentication and status polling;
-- session-scoped model/reasoning discovery and effective-value persistence;
+- session-scoped model/reasoning discovery, ACP-native model selection, read-only reasoning display, and effective-value persistence;
 - new/resume/prompt/cancel session lifecycle;
 - text and image input;
 - local file and directory resource links;
@@ -336,20 +344,20 @@ Version 1 does not include:
 - direct implementation of the Codex App Server wire protocol;
 - full reuse of the user's Codex home, plugins, skills, MCP servers, hooks, rules, or session database;
 - API-key or custom-gateway Codex auth in the UI;
-- pre-session model selection or a hard-coded Codex model catalog;
+- a hard-coded Codex model catalog or pre-session model picker (the validated user preference supplies the initial default when present);
 - adapter-specific live steering;
 - automatic logout of a shared Codex credential;
 - bundling or publishing production platform binaries;
 - ACP filesystem, terminal, elicitation, native subagent-session, background-task, or goal extensions;
-- Time Machine, OpenClacky idle compression, OpenClacky sub-model overlays, or channel/cron execution for Codex sessions.
+- Time Machine, OpenClacky idle compression, OpenClacky static sub-model overlays, or channel/cron execution for Codex sessions.
 
 ## Acceptance Scenarios
 
 1. On a fresh OpenClacky install, the provider picker includes Codex beside existing providers; selecting it removes the base URL and API-key requirements.
 2. With a valid and securely permissioned file-backed `~/.codex/auth.json`, Codex status becomes connected through a managed-home symlink without reading or copying token contents.
 3. With no reusable login, `Connect with ChatGPT` opens browser authentication through ACP, status polling completes, and a credentialless card is saved under `runtime_models`.
-4. A source Codex home containing MCP commands, plugins, hooks, custom providers, or telemetry configuration does not make those settings visible in OpenClacky's managed home; repository-local `.codex` config, hooks, and exec policies remain disabled by the verified adapter patch.
-5. Sending the first prompt lazily establishes a Codex ACP session, accepts the adapter's `currentValue` model and reasoning effort, streams one assistant message, displays keyed tool progress, and persists the effective values plus ACP session ID without credentials.
+4. A source Codex home containing MCP commands, plugins, hooks, custom providers, notifications, or telemetry configuration exposes only valid top-level `model`, `model_reasoning_effort`, and `service_tier` preferences to OpenClacky's reconstructed managed config; repository-local `.codex` config, hooks, and exec policies remain disabled by the verified adapter patch.
+5. Sending the first prompt lazily establishes a Codex ACP session using the validated source model preference when available, accepts the adapter's effective values, streams one assistant message, displays keyed tool progress, and persists the model, reasoning effort, and ACP session ID without credentials. The session model picker then lists ACP-advertised models and can switch among them without changing provider cards.
 6. A permission request defaults to rejection, maps Yes/No to an option actually advertised by the agent, and is cancelled safely on interrupt.
 7. Interrupt sends ACP `session/cancel`, returns the OpenClacky session to idle, preserves completed output, and does not leave a blocked permission waiter.
 8. Restarting OpenClacky resumes the saved ACP session ID without replaying duplicate provider history and retains the local transcript. A missing external ACP session produces a warning and a fresh external session on the next prompt.

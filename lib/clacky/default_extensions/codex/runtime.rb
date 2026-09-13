@@ -3,6 +3,7 @@
 require "json"
 require "uri"
 require_relative "../../thread_registry"
+require_relative "../../runtime_session"
 require_relative "codex_home"
 require_relative "launcher"
 
@@ -112,8 +113,8 @@ module Clacky
           home = @home_result
           {
             available: nil,
-            status: "not_connected",
-            authenticated: false,
+            status: "idle",
+            authenticated: nil,
             auth_reused: home && home.auth_reused == true,
             auth_reason: home && home.auth_reason,
             can_authenticate: true
@@ -645,6 +646,18 @@ module Clacky
         CONTROL_TIMEOUT = 5
         CANCEL_GRACE = 1.0
         MAX_THOUGHT_BYTES = 8 * 1024
+        MISSING_ROLLOUT_ERROR_PREFIX = "no rollout found for thread id "
+        RESUME_CONFLICT_WARNING =
+          "Codex could not reuse the saved runtime context because it is " \
+          "already active elsewhere. This turn started a new Codex thread; " \
+          "the transcript remains visible, but the new thread received only " \
+          "this turn."
+        RESUME_FAILED_WARNING =
+          "Codex could not resume the saved runtime context. This turn " \
+          "started a new Codex thread; the transcript remains visible, but " \
+          "the new thread received only this turn."
+        CODEX_RETRY_WARNING =
+          "Codex encountered a temporary provider error and is retrying this turn."
 
         class << self
           def connection
@@ -740,8 +753,49 @@ module Clacky
             plans: true,
             time_machine: false,
             sub_model: false,
+            model_selection: true,
             fork: false
           }
+        end
+
+        # ACP owns the model catalog for an opened session. Keep this as a
+        # runtime-native capability rather than treating it as an API-provider
+        # sub-model overlay.
+        def model_options
+          option = config_option("model")
+          return [] unless option
+
+          flatten_options(option["options"]).filter_map do |candidate|
+            value = candidate["value"].to_s.strip
+            value unless value.empty?
+          end.uniq
+        end
+
+        def set_model(model_name)
+          requested = model_name.to_s.strip
+          raise Error, "Codex model selection requires a model" if requested.empty?
+
+          @run_mutex.synchronize do
+            raise Error, "Codex runtime is closed" if @closed
+            if @in_flight
+              raise Clacky::RuntimeSession::BusyError,
+                    "Codex model cannot change during an in-flight prompt"
+            end
+
+            client = connected_client
+            unless client && external_session_id && session_ready?
+              raise Error, "Codex model selection is unavailable until the session starts"
+            end
+
+            option = config_option("model")
+            unless option && advertised_value?(option, requested)
+              raise Error, "Codex model was not advertised for this session"
+            end
+            return true if option["currentValue"].to_s == requested
+
+            set_config_value(client, "model", requested)
+          end
+          true
         end
 
         def run(input, generation:)
@@ -1239,7 +1293,12 @@ module Clacky
 
           old_session_id = external_session_id
           if old_session_id && !reserve_external_session(old_session_id)
-            emit_event(active_generation, type: :warning, code: "resume_conflict")
+            emit_event(
+              active_generation,
+              type: :warning,
+              code: "resume_conflict",
+              content: RESUME_CONFLICT_WARNING
+            )
             @state_mutex.synchronize do
               @external_session_id = nil
               @client_generation = nil
@@ -1252,22 +1311,27 @@ module Clacky
               response = client.request(
                 "session/resume",
                 session_open_params(old_session_id),
-                timeout: CONTROL_TIMEOUT
+                timeout: nil
               )
               discard_opened_session_if_closed!(client, old_session_id)
               accept_opened_session(client, generation, old_session_id, response)
               configure_open_session(client, generation)
               return client
             rescue Clacky::Acp::Client::ProtocolError => e
-              raise unless e.code.to_i == -32_002
+              raise unless missing_resumed_session?(e, old_session_id)
 
-              emit_event(active_generation, type: :warning, code: "resume_failed")
+              emit_event(
+                active_generation,
+                type: :warning,
+                code: "resume_failed",
+                content: RESUME_FAILED_WARNING
+              )
               clear_external_session(old_session_id)
             end
           end
 
           response = client.request(
-            "session/new", session_open_params, timeout: CONTROL_TIMEOUT
+            "session/new", session_open_params, timeout: nil
           )
           session_id = response["sessionId"].to_s
           raise Error, "Codex ACP did not return a session id" if session_id.empty?
@@ -1277,6 +1341,16 @@ module Clacky
                                 previous_session_id: old_session_id)
           configure_open_session(client, generation)
           client
+        end
+
+        private def missing_resumed_session?(error, session_id)
+          return false unless error.method.to_s == "session/resume"
+          return true if error.code.to_i == -32_002
+          return false unless error.code.to_i == -32_603
+          return false unless error.remote_message == "Internal error"
+          return false unless error.data.is_a?(Hash)
+
+          error.data["details"] == "#{MISSING_ROLLOUT_ERROR_PREFIX}#{session_id}"
         end
 
         private def connected_to_generation?(generation)
@@ -1573,16 +1647,29 @@ module Clacky
               cost: deep_copy(update["cost"])
             }
           when "session_info_update"
-            {
+            info = {
               type: :session_info,
               title: update["title"],
               updated_at: update["updatedAt"]
             }
+            retry_warning = normalize_codex_retry_warning(update)
+            retry_warning ? [info, retry_warning] : info
           when "config_option_update"
             nil
           else
             { type: :unknown, session_update: update_type }
           end
+        end
+
+        private def normalize_codex_retry_warning(update)
+          error = update.dig("_meta", "codex", "error")
+          return nil unless error.is_a?(Hash) && error["willRetry"] == true
+
+          {
+            type: :warning,
+            code: "codex_retry",
+            content: CODEX_RETRY_WARNING
+          }
         end
 
         private def normalize_tool_update(update)

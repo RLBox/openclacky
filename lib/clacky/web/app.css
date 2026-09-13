@@ -2511,6 +2511,9 @@ body {
   cursor: pointer;
   transition: background .12s, color .12s;
 }
+#btn-slash[hidden], #ns-btn-slash[hidden] {
+  display: none;
+}
 .new-session-composer-btn:hover {
   color: var(--color-text-primary);
   background: var(--color-bg-hover);
@@ -5178,6 +5181,13 @@ body {
   background: var(--color-bg-hover);
   opacity: 1 !important;
   color: var(--color-accent-primary);
+}
+.sib-reasoning-disabled {
+  cursor: default !important;
+}
+.sib-reasoning-disabled:hover {
+  background: transparent !important;
+  color: inherit !important;
 }
 .sib-reasoning-dropdown {
   position: fixed;

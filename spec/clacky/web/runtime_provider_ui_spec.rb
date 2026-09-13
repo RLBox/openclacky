@@ -7,8 +7,11 @@ RSpec.describe "Runtime provider WebUI" do
   let(:onboard) { File.read(File.join(web_dir, "components/onboard.js")) }
   let(:settings) { File.read(File.join(web_dir, "settings.js")) }
   let(:model_picker) { File.read(File.join(web_dir, "components/model-picker.js")) }
+  let(:new_session_store) { File.read(File.join(web_dir, "features/new-session/store.js")) }
   let(:new_session) { File.read(File.join(web_dir, "features/new-session/view.js")) }
   let(:sessions) { File.read(File.join(web_dir, "sessions.js")) }
+  let(:skills) { File.read(File.join(web_dir, "skills.js")) }
+  let(:app_css) { File.read(File.join(web_dir, "app.css")) }
   let(:i18n) { File.read(File.join(web_dir, "i18n.js")) }
 
   def function_source(source, name)
@@ -40,6 +43,13 @@ RSpec.describe "Runtime provider WebUI" do
       expect(poll).to include("cancelled: true")
     end
 
+    it "treats a dormant runtime as a neutral terminal state rather than a logged-out account" do
+      status_view = function_source(runtime_store, "statusView")
+      expect(status_view).to include('status === "idle"')
+      expect(status_view).to include('state: "idle"')
+      expect(status_view).to match(/state:\s*"idle".*?terminal:\s*true/)
+    end
+
     it "keeps browser-login polling longer than the runtime authentication deadline" do
       expect(runtime_store).to include("const AUTH_POLL_ATTEMPTS = 305")
       expect(function_source(onboard, "_authenticateSetupRuntime"))
@@ -65,10 +75,12 @@ RSpec.describe "Runtime provider WebUI" do
       %w[
         provider.name.codex runtime.provider.status.checking
         runtime.provider.status.connected runtime.provider.status.notConnected
-        runtime.provider.status.starting runtime.provider.status.unavailable
+        runtime.provider.status.idle runtime.provider.status.starting
+        runtime.provider.status.unavailable
         runtime.provider.status.timeout runtime.provider.connect
         runtime.provider.recheck runtime.provider.dynamicHint
         runtime.provider.newSessionHint
+        sib.reasoning.minimal sib.reasoning.ultra
       ].each do |key|
         expect(i18n.scan(%("#{key}")).length).to be >= 2, "missing bilingual key #{key}"
       end
@@ -235,6 +247,16 @@ RSpec.describe "Runtime provider WebUI" do
       expect(card_status).to include("RuntimeProvider.statusView(data)")
     end
 
+    it "does not reinterpret a legacy API card when its provider id collides with a runtime provider" do
+      provider = function_source(settings, "_getProvider")
+      resolve = function_source(settings, "_resolveModalProviderId")
+
+      expect(provider).to include("RuntimeProvider.isRuntimeProvider(provider)")
+      expect(provider).to include("model.runtime_id === provider.runtime_id")
+      expect(resolve).to include("_getProvider(model)")
+      expect(resolve).not_to include("if (model.provider_id) return model.provider_id")
+    end
+
     it "connects from the model modal without making card rendering start a process" do
       modal_status = function_source(settings, "_refreshModalRuntimeStatus")
       card_status = function_source(settings, "_refreshRuntimeCardStatus")
@@ -294,9 +316,18 @@ RSpec.describe "Runtime provider WebUI" do
       expect(model_picker).to include('aria-disabled')
       expect(sessions).to include("currentIsRuntime")
       expect(sessions).to include("isSelectable:")
-      expect(sessions).to include("m.id === currentModelId")
+      expect(sessions).to include("m.id === effectiveCurrentId")
       expect(new_session).to include("m.runtime_available !== false")
       expect(new_session).to include("isSelectable:")
+    end
+
+    it "ships localized session model-picker empty and error states" do
+      %w[
+        sib.model.empty sib.model.loadError sib.model.switchError
+        sib.model.switchSubmodelError sib.model.unknownError
+      ].each do |key|
+        expect(i18n.scan(%("#{key}")).length).to be >= 2, "missing bilingual key #{key}"
+      end
     end
 
 
@@ -310,6 +341,79 @@ RSpec.describe "Runtime provider WebUI" do
     it "never writes benchmark state into a runtime row without a latency cell" do
       benchmark = function_source(model_picker, "_runBenchmark")
       expect(benchmark.scan(/if \(!cell\) return/).length).to be >= 2
+    end
+
+    it "renders runtime reasoning as read-only instead of opening the API switcher" do
+      expect(sessions).to include("const previousSessionId = this._lastSession && this._lastSession.id")
+      expect(sessions).to include("ReasoningEffortSwitcher.close()")
+      expect(sessions).to include("const ReasoningEffortSwitcher = (() =>")
+      expect(sessions).to include("const reasoningMutable = !s.runtime_id")
+      expect(sessions).to include('sibReasoning.dataset.reasoningMutable = String(reasoningMutable)')
+      expect(sessions).to include('sibReasoning.classList.toggle("sib-reasoning-disabled", !reasoningMutable)')
+      expect(sessions).to include('if (el.dataset.reasoningMutable !== "true") return')
+      expect(i18n.scan(%("sib.reasoning.runtimeManaged")).length).to be >= 2
+      expect(i18n.scan(%("sib.reasoning.pending")).length).to be >= 2
+      expect(sessions).to include('I18n.t("sib.reasoning.pending")')
+    end
+
+    it "omits fork controls for runtime sessions" do
+      expect(sessions).to include("if (session.runtime_id) return")
+      expect(sessions).to include("const forkItemHtml = session.runtime_id ? \"\"")
+      expect(sessions).to include("${forkItemHtml}")
+    end
+
+    it "does not advertise OpenClacky skills or project initialization to runtime sessions" do
+      runtime_check = function_source(new_session, "_selectedModelIsRuntime")
+      context_bar = function_source(new_session, "_renderContextBar")
+      submit = function_source(new_session, "_submit")
+      send_button = function_source(new_session, "_updateSendButton")
+
+      expect(runtime_check).to include("model.runtime_id")
+      expect(context_bar).to include("const hostCommandsAvailable = _modelsLoaded && !runtimeModel")
+      expect(context_bar).to include('const slashButton = $("ns-btn-slash")')
+      expect(context_bar).to include("slashButton.hidden = !hostCommandsAvailable")
+      expect(context_bar).to match(/agent && agent\.id === "coding" && hostCommandsAvailable/)
+      expect(submit).to match(/initProject.*?&&\s*!_selectedModelIsRuntime\(\)/m)
+      expect(send_button).to match(/initProject.*?&&\s*!_selectedModelIsRuntime\(\)/m)
+      expect(new_session).to include("isEnabled: () => _modelsLoaded && !_selectedModelIsRuntime()")
+      expect(new_session).to include("if (!_modelsLoaded || _selectedModelIsRuntime()) return []")
+      expect(skills).to include("isEnabled")
+      expect(skills).to include("if (!_isEnabled())")
+      expect(sessions).to include('const slashButton = $("btn-slash")')
+      expect(sessions).to include("slashButton.hidden = !!s.runtime_id")
+      expect(app_css).to include('#btn-slash[hidden], #ns-btn-slash[hidden]')
+    end
+
+    it "blocks creation until the selected model kind is known and retries failed model loads" do
+      populate = function_source(new_session, "_populateModels")
+      submit = function_source(new_session, "_submit")
+      panel_show = function_source(new_session, "onPanelShow")
+      send_button = function_source(new_session, "_updateSendButton")
+      load_models = function_source(new_session_store, "loadModels")
+
+      expect(new_session).to include("let _modelsPromise = null")
+      expect(populate).to include("if (_modelsPromise) return _modelsPromise")
+      expect(populate).to include("if (!Array.isArray(models)) return false")
+      expect(populate).to include("_modelsLoaded = true")
+      expect(submit).to include("const modelsReady = await _populateModels()")
+      expect(submit).to include("if (!modelsReady)")
+      expect(panel_show).to include("await _populateModels()")
+      expect(send_button).to include("!_modelsLoaded")
+      expect(load_models.scan("return null").length).to be >= 2
+      expect(i18n.scan(%("sessions.new.modelsUnavailable")).length).to be >= 2
+    end
+
+    it "discards stale asynchronous skill results after composer or session context changes" do
+      render = function_source(skills, "_render")
+      load_session = function_source(skills, "_loadForSession")
+
+      expect(skills).to include("let _renderRequest")
+      expect(skills).to include("let _snapshotRequest")
+      expect(render).to include("const cfg = _cfg")
+      expect(render).to include("request !== _renderRequest")
+      expect(render).to include("_cfg !== cfg")
+      expect(load_session).to include("_cfg = _chatCfg")
+      expect(load_session).to include("_currentSession === sessionId")
     end
   end
 end

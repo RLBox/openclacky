@@ -139,8 +139,8 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Connection do
 
     expect(connection.passive_status).to include(
       available: nil,
-      status: "not_connected",
-      authenticated: false,
+      status: "idle",
+      authenticated: nil,
       can_authenticate: true
     )
     expect(client.start_arguments).to be_nil
@@ -188,7 +188,7 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Connection do
     expect(connection.authenticate_async[:started]).to be(true)
     eventually { !client.alive? }
     expect(connection.passive_status).to include(
-      status: "not_connected", authenticated: false
+      status: "idle", authenticated: nil
     )
   ensure
     connection&.close
@@ -649,6 +649,95 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Runtime do
     agent&.close
   end
 
+  it "does not abandon side-effectful session creation at the short control deadline" do
+    install_new_session_handler
+    agent = runtime
+
+    expect(agent.run(input, generation: 71)).to include(stop_reason: "end_turn")
+
+    session_open = client.requests.find { |method,| method == "session/new" }
+    expect(session_open[2]).to be_nil
+  ensure
+    agent&.close
+  end
+
+  it "exposes ACP model options and switches the open session model" do
+    dynamic_options = Marshal.load(Marshal.dump(config_options))
+    model_option = dynamic_options.find { |option| option["id"] == "model" }
+    model_option["options"] = [
+      {
+        "name" => "Recommended",
+        "options" => [
+          { "value" => "gpt-6-codex" },
+          { "value" => "gpt-5.6-sol" }
+        ]
+      },
+      { "value" => "gpt-5.6-sol" },
+      { "value" => "gpt-5.3-codex" }
+    ]
+    client.request_handler = lambda do |method, params, _timeout|
+      case method
+      when "session/new"
+        { "sessionId" => "model-session", "configOptions" => dynamic_options }
+      when "session/set_config_option"
+        updated = Marshal.load(Marshal.dump(dynamic_options))
+        updated.find { |option| option["id"] == params["configId"] }["currentValue"] = params["value"]
+        dynamic_options = updated
+        { "configOptions" => updated }
+      when "session/prompt"
+        { "stopReason" => "end_turn" }
+      else
+        {}
+      end
+    end
+    agent = runtime
+
+    expect(agent.capabilities).to include(model_selection: true, sub_model: false)
+    expect(agent.model_options).to eq([])
+    agent.run(input, generation: 72)
+
+    expect(agent.model_options).to eq(
+      ["gpt-6-codex", "gpt-5.6-sol", "gpt-5.3-codex"]
+    )
+    expect(agent.set_model("gpt-5.6-sol")).to be(true)
+    expect(client.requests.select { |request| request.first == "session/set_config_option" }.last).to eq([
+      "session/set_config_option",
+      {
+        "sessionId" => "model-session",
+        "configId" => "model",
+        "value" => "gpt-5.6-sol"
+      },
+      described_class::CONTROL_TIMEOUT
+    ])
+    expect(agent.dump_state).to include("model" => "gpt-5.6-sol")
+  ensure
+    agent&.close
+  end
+
+  it "rejects unknown model choices without sending them to ACP" do
+    install_new_session_handler
+    agent = runtime
+    agent.run(input, generation: 73)
+    requests_before = client.requests.length
+
+    expect { agent.set_model("not-advertised") }
+      .to raise_error(described_class::Error, /advertised/i)
+    expect(client.requests.length).to eq(requests_before)
+  ensure
+    agent&.close
+  end
+
+  it "rejects model changes while a prompt is in flight" do
+    agent = runtime
+
+    with_pending_prompt(agent) do
+      expect { agent.set_model("gpt-5.3-codex") }
+        .to raise_error(Clacky::RuntimeSession::BusyError, /in-flight prompt/i)
+    end
+  ensure
+    agent&.close
+  end
+
   it "does not open an ACP session for a protected workspace" do
     connection.workspace_allowed = false
     agent = runtime
@@ -696,6 +785,7 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Runtime do
     methods = client.requests.map(&:first)
     expect(methods).to include("session/resume", "session/prompt")
     expect(methods).not_to include("session/load")
+    expect(client.requests.find { |request| request.first == "session/resume" }[2]).to be_nil
     expect(client.requests.select { |request| request.first == "session/set_config_option" }.map { |request| request[1] }).to include(
       { "sessionId" => "old-acp-session", "configId" => "model", "value" => "gpt-5.3-codex" },
       { "sessionId" => "old-acp-session", "configId" => "reasoning_effort", "value" => "high" }
@@ -782,6 +872,14 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Runtime do
       "fresh-session" => second
     )
     expect(client.requests.count { |method,| method == "session/resume" }).to eq(1)
+    expect(events).to include([
+      19,
+      hash_including(
+        type: :warning,
+        code: "resume_conflict",
+        content: include("started a new Codex thread")
+      )
+    ])
   ensure
     first&.close
     second&.close
@@ -848,7 +946,112 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Runtime do
     agent.run(input, generation: 9)
 
     expect(agent.dump_state["session_id"]).to eq("replacement")
-    expect(events).to include([9, hash_including(type: :warning, code: "resume_failed")])
+    expect(events).to include([
+      9,
+      hash_including(
+        type: :warning,
+        code: "resume_failed",
+        content: include("started a new Codex thread")
+      )
+    ])
+  ensure
+    agent&.close
+  end
+
+  it "falls back when the pinned adapter wraps a missing Codex rollout as an internal error" do
+    client.request_handler = lambda do |method, _params, _timeout|
+      case method
+      when "session/resume"
+        raise Clacky::Acp::Client::ProtocolError.new(
+          "ACP request 'session/resume' failed (code -32603)",
+          code: -32_603,
+          method: "session/resume",
+          remote_message: "Internal error",
+          data: {
+            "details" => "no rollout found for thread id missing-rollout"
+          }
+        )
+      when "session/new"
+        { "sessionId" => "replacement", "configOptions" => config_options }
+      when "session/prompt"
+        { "stopReason" => "end_turn" }
+      else
+        {}
+      end
+    end
+    agent = described_class.new(
+      context: context,
+      persisted_state: { "session_id" => "missing-rollout" },
+      connection: connection
+    )
+
+    agent.run(input, generation: 91)
+
+    expect(agent.dump_state["session_id"]).to eq("replacement")
+    expect(events).to include([
+      91,
+      hash_including(
+        type: :warning,
+        code: "resume_failed",
+        content: include("started a new Codex thread")
+      )
+    ])
+  ensure
+    agent&.close
+  end
+
+  it "does not swallow unrelated adapter internal errors while resuming" do
+    client.request_handler = lambda do |method, _params, _timeout|
+      if method == "session/resume"
+        raise Clacky::Acp::Client::ProtocolError.new(
+          "ACP request 'session/resume' failed (code -32603)",
+          code: -32_603,
+          method: "session/resume",
+          remote_message: "Internal error",
+          data: { "details" => "database unavailable" }
+        )
+      end
+
+      raise "unexpected ACP request: #{method}"
+    end
+    agent = described_class.new(
+      context: context,
+      persisted_state: { "session_id" => "existing-rollout" },
+      connection: connection
+    )
+
+    expect { agent.run(input, generation: 92) }
+      .to raise_error(Clacky::Acp::Client::ProtocolError)
+    expect(client.requests.map(&:first)).to eq(["session/resume"])
+  ensure
+    agent&.close
+  end
+
+  it "does not treat another thread id's missing-rollout error as the restored session" do
+    client.request_handler = lambda do |method, _params, _timeout|
+      if method == "session/resume"
+        raise Clacky::Acp::Client::ProtocolError.new(
+          "ACP request 'session/resume' failed (code -32603)",
+          code: -32_603,
+          method: "session/resume",
+          remote_message: "Internal error",
+          data: {
+            "details" => "no rollout found for thread id different-rollout"
+          }
+        )
+      end
+
+      raise "unexpected ACP request: #{method}"
+    end
+    agent = described_class.new(
+      context: context,
+      persisted_state: { "session_id" => "expected-rollout" },
+      connection: connection
+    )
+
+    expect { agent.run(input, generation: 93) }
+      .to raise_error(Clacky::Acp::Client::ProtocolError)
+    expect(client.requests.map(&:first)).to eq(["session/resume"])
   ensure
     agent&.close
   end
@@ -1241,6 +1444,17 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Runtime do
       { "sessionUpdate" => "plan_update", "plan" => { "type" => "markdown", "planId" => "plan-1", "content" => "1. Run tests" } },
       { "sessionUpdate" => "usage_update", "used" => 10, "size" => 100 },
       { "sessionUpdate" => "session_info_update", "title" => "Codex task" },
+      {
+        "sessionUpdate" => "session_info_update",
+        "_meta" => {
+          "codex" => {
+            "error" => {
+              "message" => "temporary upstream failure",
+              "willRetry" => true
+            }
+          }
+        }
+      },
       { "sessionUpdate" => "future_update", "value" => 1 }
     ]
     agent.instance_variable_set(:@active_generation, 16)
@@ -1258,6 +1472,11 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Runtime do
       hash_including(type: :plan, plan_id: "plan-1", content: "1. Run tests"),
       hash_including(type: :usage, used: 10, size: 100),
       hash_including(type: :session_info, title: "Codex task"),
+      hash_including(
+        type: :warning,
+        code: "codex_retry",
+        content: include("retrying")
+      ),
       hash_including(type: :unknown, session_update: "future_update")
     )
   ensure

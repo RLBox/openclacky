@@ -193,7 +193,7 @@ $ openclacky
 
 ### Codex（ChatGPT）— Web UI 原型
 
-Codex 功能以客户端内置、默认启用的扩展随包交付，不需要从扩展市场另行安装。本地 Web UI 可以把它作为 Agent 运行时使用。首次引导时点击**选择其他服务商（API 或 Codex）**，或者进入**设置 → 模型 → 添加模型**，在原有服务商下拉框中选择 **Codex（ChatGPT）**。选择后不再填写模型、Base URL、API Key 和 API Format，而是查看连接状态并点击**使用 ChatGPT 登录**。保存的是不含 API 凭据的运行时配置卡；首次发送消息并建立 ACP 会话后，界面才会获得实际 Codex 模型和推理强度。
+Codex 功能以客户端内置、默认启用的扩展随包交付，不需要从扩展市场另行安装。本地 Web UI 可以把它作为 Agent 运行时使用。首次引导时点击**选择其他服务商（API 或 Codex）**，或者进入**设置 → 模型 → 添加模型**，在原有服务商下拉框中选择 **Codex（ChatGPT）**。选择后不再填写模型、Base URL、API Key 和 API Format，而是查看连接状态并点击**使用 ChatGPT 登录**。保存的是不含 API 凭据的运行时配置卡。若用户的 Codex 配置中存在安全的模型偏好，首次消息会沿用该偏好；ACP 会话建立后，实际模型和运行时公布的可选模型会显示在现有会话模型选择器中。
 
 OpenClacky 通过 ACP 连接固定版本组合：`@agentclientprotocol/codex-acp@1.11.0` + `@openai/codex@0.153.4`。当前原型需要满足以下任一条件：
 
@@ -202,9 +202,9 @@ OpenClacky 通过 ACP 连接固定版本组合：`@agentclientprotocol/codex-acp
 
 所有适配器路径（包括 `CLACKY_CODEX_ACP_PATH`）都会校验已发布适配器源码的 SHA-256、要求 Codex 包精确版本，并应用一个很小的兼容补丁，把会话工作区标记为不受信任，因此不会加载仓库内的 `.codex` 配置、Hook 和执行策略。精确版本校验不等于完整产物证明；正式打包还需要锁定并验证完整依赖树与平台二进制。
 
-OpenClacky 使用独立的 managed home：macOS 为 `~/Library/Application Support/OpenClacky/codex`，其他 POSIX 系统为 `${XDG_DATA_HOME:-~/.local/share}/openclacky/codex`，不会直接共用整套来源 Codex home。它只会复用 `$CODEX_HOME`（未设置时为 `~/.codex`）中当前用户拥有、权限私密且不是符号链接的普通 `auth.json`；不会导入 Codex 的配置、MCP、插件、Skill、Hook、历史或数据库。强制权限配置还会屏蔽源认证目录、managed home 和常见本地秘密路径，并禁止登录 Shell 初始化。无法安全复用时，请走浏览器登录。删除模型配置卡不会退出 ChatGPT，也不会修改源认证文件。客户端内置的是该扩展；当前原型尚未把 Node/codex-acp 运行制品一起打包。
+OpenClacky 使用独立的 managed home：macOS 为 `~/Library/Application Support/OpenClacky/codex`，其他 POSIX 系统为 `${XDG_DATA_HOME:-~/.local/share}/openclacky/codex`，不会直接共用整套来源 Codex home。它可以链接 `$CODEX_HOME`（未设置时为 `~/.codex`）中当前用户拥有、权限私密且不是符号链接的普通 `auth.json`，并只从源配置中读取、校验后重建三个顶层偏好：`model`、`model_reasoning_effort` 和 `service_tier`。源配置本身不会被复制或链接，MCP、插件、Skill、Hook、规则、历史和数据库也不会被导入。强制权限配置还会屏蔽源认证目录、managed home 和常见本地秘密路径，并禁止登录 Shell 初始化。无法安全复用时，请走浏览器登录。删除模型配置卡不会退出 ChatGPT，也不会修改源认证文件。客户端内置的是该扩展；当前原型尚未把 Node/codex-acp 运行制品一起打包。
 
-当前限制：仅 Web UI 支持配置；普通 API 卡与 Agent 运行时卡不能在同一会话内热切换，需要新建会话。仓库当前的 Docker 镜像尚未内置 Node/npm/npx 或适配器；远程/无头登录和 Windows 进程树托管仍属于发布前工作。连接面板里的 `missing_dependencies`、`incompatible_node`、`incompatible_codex_acp` 和 `untrusted_installed_codex_acp` 可定位常见启动问题。
+当前限制：仅 Web UI 支持配置；普通 API 卡与 Agent 运行时卡不能在同一会话内热切换，需要新建会话。Codex ACP 会话建立后，可以在当前会话的模型选择器中切换运行时公布的模型。Codex 的思考等级会按 ACP 返回值显示，但此版本中只读；运行时会话会隐藏 OpenClacky 专属的 Skill、`/new` 初始化和 Fork 入口。仓库当前的 Docker 镜像尚未内置 Node/npm/npx 或适配器；远程/无头登录和 Windows 进程树托管仍属于发布前工作。连接面板里的 `missing_dependencies`、`incompatible_node`、`incompatible_codex_acp` 和 `untrusted_installed_codex_acp` 可定位常见启动问题。
 
 ## 代码开发场景
 
