@@ -43,25 +43,26 @@ The existing provider dropdown gains a `ChatGPT` entry. Its descriptor marks it 
 When selected:
 
 - Base URL, API key, API format, and provider-key help are hidden.
-- Model, Base URL, and API Key fields are hidden. The panel explains that Codex will report its actual model after the first prompt establishes the ACP session.
-- A connection panel distinguishes `Not started` (the passive, side-effect-free state), `Connected`, `Not connected` (a live runtime that reported no account), `Starting`, and actionable dependency/version errors. `Not started` explains that the runtime starts automatically on first use.
+- Base URL and API Key fields are hidden. The model field becomes a required runtime-backed selector after ChatGPT connects and model discovery completes.
+- Selecting ChatGPT starts the shared ACP connection in the background. The connection panel distinguishes `Starting`, `Connected`, `Not connected` (a live runtime that reported no account), and actionable dependency/version errors without requiring a user-visible conversation or first prompt.
 - If a reusable Codex login is already available, the user can continue without signing in again.
 - Otherwise, `Connect with ChatGPT` starts ACP's `chat-gpt` authentication method, opens the system browser, and the page polls status until the account is connected.
-- `Continue` saves a credentialless runtime card and follows the existing onboarding completion flow without sending the OpenClacky-specific `/onboard` skill command to Codex.
+- After authentication, OpenClacky discovers the account's ACP-advertised models through a temporary, non-user-visible session and closes that discovery session immediately. The user's current Codex preference is preselected when it remains available.
+- `Continue` is enabled only after the user has selected the model they normally want to use. It saves a credentialless runtime card whose display model is that selection, then follows the existing onboarding completion flow without sending the OpenClacky-specific `/onboard` skill command to Codex.
 
 The OpenClacky AI Keys device-login card remains unchanged. Its secondary action uses provider-neutral copy (`Choose another provider (API or ChatGPT)`), and ChatGPT appears in that normal provider list rather than behind a dedicated setup path.
 
 ### Settings
 
-The Add Model dialog uses the same provider descriptor behavior. Selecting ChatGPT hides API-key-only fields, shows connection status, and saves a runtime-backed model card after a runtime health check instead of calling the OpenAI-compatible model tester.
+The Add Model dialog uses the same provider descriptor behavior. Selecting ChatGPT hides API-key-only fields, starts or reuses the shared ACP connection, and loads a required model selector from a temporary discovery session. Saving validates that the selected model is still advertised and stores it as the normal default for future ChatGPT sessions.
 
-ChatGPT model cards show the provider name, `ChatGPT default` until a session reports its effective model, connection state, and a `Test` action that checks ACP process readiness plus authentication. After the first prompt opens an ACP session, the existing session model picker lists the models advertised in ACP `configOptions`; selecting one calls `session/set_config_option` and persists the effective value. Removing the card removes only OpenClacky's model configuration. It does not log out the shared ChatGPT account or delete the source Codex home's `auth.json` (`$CODEX_HOME`, or `~/.codex` when unset).
+ChatGPT model cards show the provider name, the user's selected default model (for example, `gpt-5.6-sol`), connection state, and a `Test` action that checks ACP process readiness plus authentication. The placeholder `ChatGPT default` is not normal user-facing state; existing cards that still contain it are upgraded after successful discovery. Each new ACP session starts with the card's selected default when that value is still advertised. The session model picker may temporarily switch the active session without changing the saved default for other sessions. Removing the card removes only OpenClacky's model configuration. It does not log out the shared ChatGPT account or delete the source Codex home's `auth.json` (`$CODEX_HOME`, or `~/.codex` when unset).
 
 When ChatGPT is the default runtime, Settings projects its declared image-input capability into the existing Visual Understanding row as a read-only primary capability: `configured: true`, `source: auto`, and `primary: true`. This does not create or persist an OCR sidecar. Image generation, video generation, audio generation, speech transcription, and video understanding remain unchanged and are not inferred from the ChatGPT login because those paths require separate media adapters and API credentials.
 
 ### Session behavior
 
-Creating an OpenClacky session with a Codex card creates the local host session immediately; the first prompt lazily creates or resumes its ACP session in that workspace. Prompts, supported image attachments, cancellation, streamed assistant output, tool activity, usage, and permission requests are mapped into the existing OpenClacky session UI. The sidebar and session URL remain owned by OpenClacky.
+Creating an OpenClacky session with a Codex card creates the local host session immediately; the first prompt creates or resumes its ACP session in that workspace and applies the card's selected default model before the prompt. Connection and model discovery have already happened during setup or Settings, so the user does not need to send a sacrificial first message to make ChatGPT appear connected or populate model choices. Prompts, supported image attachments, cancellation, streamed assistant output, tool activity, usage, and permission requests are mapped into the existing OpenClacky session UI. The sidebar and session URL remain owned by OpenClacky.
 
 `session/new` and `session/resume` are side-effectful bootstrap operations: codex-acp may refresh Skills, create or load a Codex thread, enumerate models, and refresh account state before returning the authoritative session ID. They therefore do not inherit the five-second timeout used by short control requests. OpenClacky waits for their response and uses its generation-scoped Stop/cancel watchdog to terminate a stuck ACP process; abandoning the JSON-RPC request while the adapter continued would lose a late session ID and create a duplicate thread on retry.
 
@@ -88,8 +89,7 @@ contributes:
       runtime_id: codex
       auth_mode: runtime
       credential_fields: []
-      dynamic_models: session
-      display_model: ChatGPT default
+      dynamic_models: discovery
       capabilities:
         vision: true
 ```
@@ -128,14 +128,14 @@ The existing `Clacky::Agent` remains the default execution object and is not rew
 
 ## Model Configuration Contract
 
-A saved Codex runtime card contains no secret, generated ID, fake endpoint, or hard-coded Codex model:
+A saved Codex runtime card contains no secret, generated ID, or fake endpoint. Its display model is the ACP-advertised default explicitly selected by the user:
 
 ```yaml
 runtime_models:
   - provider_id: codex
     type: default
     runtime_id: codex
-    display_model: ChatGPT default
+    display_model: gpt-5.6-sol
     remark: ""
 ```
 
@@ -145,7 +145,7 @@ Runtime cards are persisted under a separate top-level `runtime_models` array in
 
 Runtime-backed cards are never passed to `Clacky::Client`. Session construction selects the runtime factory before any API client is built.
 
-For backward compatibility, a runtime card whose provider and runtime IDs are both exactly `codex` may normalize the legacy placeholder `Codex default` to `ChatGPT default` for display. Stable card IDs, provider/runtime IDs, effective ACP model names, and user remarks are never rewritten by that normalization.
+For backward compatibility, a runtime card whose provider and runtime IDs are both exactly `codex` may retain the legacy placeholders `Codex default` or `ChatGPT default` until the next successful discovery. Discovery then replaces only those recognized placeholders with the validated selected model. Stable card IDs, provider/runtime IDs, real ACP model names, and user remarks are never rewritten by that migration.
 
 ## ACP Client and Lifecycle
 
@@ -210,7 +210,7 @@ No credentials, launch environment, or auth metadata are stored in OpenClacky se
 
 ### Turn configuration
 
-After `session/new` or `session/resume`, the extension reads `configOptions`. A new session keeps each option's `currentValue`; a restored session reapplies saved effective values only when those values are still advertised. A successful `session/set_config_option` response or `config_option_update` replaces the complete cached option set, including mode, collaboration mode, model, reasoning effort, and fast mode. OpenClacky never hard-codes a catalog or assumes an unavailable value is accepted.
+After discovery, `session/new`, or `session/resume`, the extension reads `configOptions`. Discovery exposes the advertised model values and current default to the configuration UI, then closes its temporary session. A new user session applies the model saved on its ChatGPT card when that value is still advertised; a restored session reapplies its own saved effective value first so historical sessions retain their model choice. A successful `session/set_config_option` response or `config_option_update` replaces the complete cached option set, including mode, collaboration mode, model, reasoning effort, and fast mode. OpenClacky never hard-codes a catalog or assumes an unavailable value is accepted.
 
 The extension maps OpenClacky permission modes only to modes advertised by codex-acp. `confirm_all`, `confirm_edits`, and `confirm_safes` prefer `read-only`, whose adapter label is "Ask for approval" and whose Codex sandbox is workspace-write without network. `auto_approve` prefers `agent`, whose adapter label is "Approve for me" and which can auto-review operations. Unmapped modes, including OpenClacky's `plan_only`, retain the launcher's initial `read-only` mode; version 1 does not claim a true plan-only equivalent. The extension never selects `agent-full-access` automatically. Any permission request the adapter does send remains mediated by ACP, and network or out-of-workspace access is not silently granted.
 
@@ -350,7 +350,7 @@ Version 1 does not include:
 - full reuse of the user's Codex home, plugins, skills, MCP servers, hooks, rules, or session database;
 - API-key or custom-gateway Codex auth in the UI;
 - automatic media sidecars for image generation, video generation, audio generation, speech transcription, or video understanding;
-- a hard-coded Codex model catalog or pre-session model picker (the validated user preference supplies the initial default when present);
+- a hard-coded Codex model catalog (configuration-time choices always come from ACP discovery);
 - adapter-specific live steering;
 - automatic logout of a shared Codex credential;
 - bundling or publishing production platform binaries;
@@ -360,18 +360,20 @@ Version 1 does not include:
 ## Acceptance Scenarios
 
 1. On a fresh OpenClacky install, the provider picker includes ChatGPT beside existing providers; selecting it removes the base URL and API-key requirements.
-2. With a valid and securely permissioned file-backed `~/.codex/auth.json`, Codex status becomes connected through a managed-home symlink without reading or copying token contents.
-3. With no reusable login, `Connect with ChatGPT` opens browser authentication through ACP, status polling completes, and a credentialless card is saved under `runtime_models`.
+2. With a valid and securely permissioned file-backed `~/.codex/auth.json`, opening ChatGPT setup or a configured Settings card starts ACP and shows connected through a managed-home symlink without reading or copying token contents.
+3. With no reusable login, `Connect with ChatGPT` opens browser authentication through ACP, status polling completes, and the model selector is populated without creating a user-visible conversation.
 4. A source Codex home containing MCP commands, plugins, hooks, custom providers, notifications, or telemetry configuration exposes only valid top-level `model`, `model_reasoning_effort`, and `service_tier` preferences to OpenClacky's reconstructed managed config; repository-local `.codex` config, hooks, and exec policies remain disabled by the verified adapter patch.
-5. Sending the first prompt lazily establishes a Codex ACP session using the validated source model preference when available, accepts the adapter's effective values, streams one assistant message, displays keyed tool progress, and persists the model, reasoning effort, and ACP session ID without credentials. The session model picker then lists ACP-advertised models and can switch among them without changing provider cards.
-6. A permission request defaults to rejection, maps Yes/No to an option actually advertised by the agent, and is cancelled safely on interrupt.
-7. Interrupt sends ACP `session/cancel`, returns the OpenClacky session to idle, preserves completed output, and does not leave a blocked permission waiter.
-8. Restarting OpenClacky resumes the saved ACP session ID without replaying duplicate provider history and retains the local transcript. A missing external ACP session produces a warning and a fresh external session on the next prompt.
-9. Existing API-key model create, edit, test, default selection, session restore, steering, and deletion specs continue to pass unchanged.
-10. Missing or incompatible codex-acp/Node dependencies produce an actionable provider status while the rest of OpenClacky remains operational.
-11. Logs, API responses, session JSON, and WebSocket payloads contain no auth token, refresh token, API key, or raw auth file content.
-12. The complete RSpec suite passes on the feature branch, and all new Ruby files parse under Ruby 2.6-compatible syntax.
-13. With ChatGPT selected as the default runtime, Settings shows Visual Understanding as automatically supplied by the primary model while leaving the other five media rows unchanged.
+5. Creating a ChatGPT model card requires choosing one ACP-advertised model, preselects the validated source preference when available, and persists that choice as the card's display model without credentials or a static `ChatGPT default` label.
+6. Before any user prompt, a configured ChatGPT card shows connected and exposes the discovered model list; its temporary discovery session has been closed and does not appear in the OpenClacky sidebar.
+7. Sending the first prompt establishes a Codex ACP session, applies the card's selected default, accepts the adapter's effective values, streams one assistant message, displays keyed tool progress, and persists the session model, reasoning effort, and ACP session ID without credentials. The session model picker can switch only that session without changing the card default.
+8. A permission request defaults to rejection, maps Yes/No to an option actually advertised by the agent, and is cancelled safely on interrupt.
+9. Interrupt sends ACP `session/cancel`, returns the OpenClacky session to idle, preserves completed output, and does not leave a blocked permission waiter.
+10. Restarting OpenClacky resumes the saved ACP session ID without replaying duplicate provider history and retains the local transcript. A missing external ACP session produces a warning and a fresh external session on the next prompt.
+11. Existing API-key model create, edit, test, default selection, session restore, steering, and deletion specs continue to pass unchanged.
+12. Missing or incompatible codex-acp/Node dependencies produce an actionable provider status while the rest of OpenClacky remains operational.
+13. Logs, API responses, session JSON, HTTP payloads, and WebSocket payloads contain no auth token, refresh token, API key, or raw auth file content.
+14. The complete RSpec suite passes on the feature branch, and all new Ruby files parse under Ruby 2.6-compatible syntax.
+15. With ChatGPT selected as the default runtime, Settings shows Visual Understanding as automatically supplied by the selected primary model while leaving the other five media rows unchanged.
 
 ## Assumptions
 
