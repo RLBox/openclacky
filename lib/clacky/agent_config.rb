@@ -1211,7 +1211,12 @@ module Clacky
       # sub-model pin without erasing it.
       merged = resolved
       if @session_model_overlay && !@session_model_overlay.empty?
-        merged = merged.merge(@session_model_overlay)
+        if resolved["enterprise_managed"] == true &&
+           !Array(resolved["managed_models"]).include?(@session_model_overlay["model"])
+          @session_model_overlay = nil
+        else
+          merged = merged.merge(@session_model_overlay)
+        end
       end
       if @virtual_model_overlay && !@virtual_model_overlay.empty?
         merged = merged.merge(@virtual_model_overlay)

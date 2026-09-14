@@ -249,6 +249,7 @@ module Clacky
         # Version cache: { latest: "x.y.z", checked_at: Time }
         @version_cache   = nil
         @version_mutex   = Mutex.new
+        @enterprise_models_refresh_mutex = Mutex.new
         @scheduler       = Scheduler.new(
           session_registry: @registry,
           session_builder:  method(:build_session),
@@ -711,6 +712,7 @@ module Clacky
         when ["DELETE", "/api/store/extension"]         then api_store_extension_uninstall(req, res)
         when ["GET",    "/api/brand/status"]      then api_brand_status(res)
         when ["GET",    "/api/enterprise/license"] then api_enterprise_license(res)
+        when ["POST",   "/api/enterprise/models/refresh"] then api_refresh_enterprise_models(res)
         when ["POST",   "/api/brand/activate"]    then api_brand_activate(req, res)
         when ["DELETE", "/api/brand/license"]     then api_brand_deactivate(res)
         when ["GET",    "/api/brand/skills"]      then api_brand_skills(res)
@@ -2572,6 +2574,103 @@ module Clacky
 
       private def api_enterprise_license(res)
         json_response(res, 200, enterprise_license_status)
+      end
+
+      private def api_refresh_enterprise_models(res)
+        @enterprise_models_refresh_mutex.synchronize do
+          identity = Clacky::Identity.load
+          source = effective_clacky_license_server
+          unless identity.bound? && identity.platform_source == source
+            return json_response(res, 200, { ok: true, bound: false, changed: false })
+          end
+
+          result = Clacky::PlatformHttpClient.new(host: source).post(
+            "/api/v1/model_gateway/introspect",
+            {},
+            headers: { "Authorization" => "Bearer #{identity.device_token}" }
+          )
+          unless result[:success]
+            return json_response(res, 502, {
+              ok: false,
+              bound: true,
+              error: "enterprise_models_unavailable"
+            })
+          end
+
+          data = result[:data] || {}
+          unless data["active"] == true
+            return json_response(res, 409, {
+              ok: false,
+              bound: true,
+              error: "enterprise_access_inactive",
+              reason: data["reason"]
+            })
+          end
+
+          entry = @agent_config.models.find do |model|
+            model["enterprise_managed"] == true && model["enterprise_source"] == source
+          end
+          unless entry
+            return json_response(res, 409, {
+              ok: false,
+              bound: true,
+              error: "enterprise_model_missing"
+            })
+          end
+
+          default_model = data["default_model"].to_s
+          raw_models = Array(data["allowed_models"]).map(&:to_s)
+          unless raw_models.include?(default_model)
+            raise ArgumentError, "enterprise default model is not allowed"
+          end
+          managed_models = normalize_managed_models(raw_models, default_model: default_model)
+          gateway_url = data["gateway_url"].to_s.strip
+          gateway_url = normalize_http_origin(gateway_url) unless gateway_url.empty?
+
+          changes = {
+            "model" => default_model,
+            "managed_models" => managed_models
+          }
+          changes["base_url"] = gateway_url unless gateway_url.empty?
+          changed = changes.any? { |key, value| entry[key] != value }
+          if changed
+            entry.merge!(changes)
+            @agent_config.save
+            refresh_live_enterprise_sessions!(entry, managed_models)
+          end
+
+          json_response(res, 200, {
+            ok: true,
+            bound: true,
+            changed: changed,
+            default_model: default_model,
+            models: managed_models,
+            model_count: managed_models.length
+          })
+        end
+      rescue ArgumentError
+        json_response(res, 502, {
+          ok: false,
+          bound: true,
+          error: "invalid_enterprise_model_policy"
+        })
+      end
+
+      private def refresh_live_enterprise_sessions!(entry, managed_models)
+        @registry.each_live_agent do |session_id, agent, _thread|
+          info = agent.current_model_info
+          next unless info && info[:id] == entry["id"]
+
+          sub_model = agent.config.session_model_overlay_name
+          sub_model = nil unless managed_models.include?(sub_model)
+          agent.set_session_sub_model(sub_model)
+          @session_manager.save(agent.to_session_data(updated_at: Time.now))
+          broadcast_session_update(session_id)
+        rescue StandardError => e
+          Clacky::Logger.warn(
+            "[EnterpriseModels] Failed to refresh session #{session_id}: #{e.class}: #{e.message}"
+          )
+        end
       end
 
       private def enterprise_license_status

@@ -347,4 +347,164 @@ RSpec.describe Clacky::Server::HttpServer, "enterprise device onboarding" do
     expect(agent_config.models).to contain_exactly(hash_including("model" => "old-model", "type" => "default"))
     expect(agent_config.clacky_license_server).to eq(Clacky::PlatformHttpClient::PRIMARY_HOST)
   end
+
+  it "refreshes a bound enterprise model catalog without another device login" do
+    enterprise_model = {
+      "id" => "enterprise-model",
+      "model" => "old-enterprise-default",
+      "base_url" => "https://old-gateway.example.com",
+      "api_key" => "clacky-dt-secret",
+      "type" => "default",
+      "enterprise_managed" => true,
+      "enterprise_source" => "https://enterprise.example.com",
+      "managed_models" => ["old-enterprise-default"]
+    }
+    agent_config.models.replace([enterprise_model])
+    agent_config.clacky_license_server = "https://enterprise.example.com"
+
+    identity = instance_double(
+      Clacky::Identity,
+      bound?: true,
+      platform_source: "https://enterprise.example.com",
+      device_token: "clacky-dt-secret"
+    )
+    client = instance_double(Clacky::PlatformHttpClient)
+    expect(Clacky::Identity).to receive(:load).and_return(identity)
+    expect(Clacky::PlatformHttpClient).to receive(:new)
+      .with(host: "https://enterprise.example.com")
+      .and_return(client)
+    expect(client).to receive(:post).with(
+      "/api/v1/model_gateway/introspect",
+      {},
+      headers: { "Authorization" => "Bearer clacky-dt-secret" }
+    ).and_return(
+      success: true,
+      data: {
+        "active" => true,
+        "gateway_url" => "https://new-gateway.example.com",
+        "default_model" => "abs-claude-sonnet-5",
+        "allowed_models" => ["abs-claude-sonnet-5", "dsk-deepseek-v4-pro"]
+      }
+    )
+    expect(agent_config).to receive(:save).once.and_call_original
+
+    response, body = dispatch(path: "/api/enterprise/models/refresh", body: {})
+
+    expect(response.status).to eq(200)
+    expect(body).to include(
+      "ok" => true,
+      "bound" => true,
+      "changed" => true,
+      "default_model" => "abs-claude-sonnet-5",
+      "models" => ["abs-claude-sonnet-5", "dsk-deepseek-v4-pro"]
+    )
+    expect(body.to_json).not_to include("clacky-dt-secret")
+    expect(enterprise_model).to include(
+      "id" => "enterprise-model",
+      "model" => "abs-claude-sonnet-5",
+      "base_url" => "https://new-gateway.example.com",
+      "api_key" => "clacky-dt-secret",
+      "enterprise_managed" => true,
+      "managed_models" => ["abs-claude-sonnet-5", "dsk-deepseek-v4-pro"]
+    )
+  end
+
+  it "keeps the last usable catalog when enterprise introspection is unavailable" do
+    enterprise_model = {
+      "id" => "enterprise-model",
+      "model" => "current-model",
+      "base_url" => "https://gateway.example.com",
+      "api_key" => "clacky-dt-secret",
+      "enterprise_managed" => true,
+      "enterprise_source" => "https://enterprise.example.com",
+      "managed_models" => ["current-model"]
+    }
+    agent_config.models.replace([enterprise_model])
+    agent_config.clacky_license_server = "https://enterprise.example.com"
+    identity = instance_double(
+      Clacky::Identity,
+      bound?: true,
+      platform_source: "https://enterprise.example.com",
+      device_token: "clacky-dt-secret"
+    )
+    client = instance_double(Clacky::PlatformHttpClient)
+    allow(Clacky::Identity).to receive(:load).and_return(identity)
+    allow(Clacky::PlatformHttpClient).to receive(:new).and_return(client)
+    allow(client).to receive(:post).and_return(
+      success: false,
+      error: "HTTP 503",
+      data: { "active" => false, "reason" => "gateway_not_configured" }
+    )
+    expect(agent_config).not_to receive(:save)
+
+    response, body = dispatch(path: "/api/enterprise/models/refresh", body: {})
+
+    expect(response.status).to eq(502)
+    expect(body).to include("ok" => false, "error" => "enterprise_models_unavailable")
+    expect(enterprise_model).to include(
+      "model" => "current-model",
+      "base_url" => "https://gateway.example.com",
+      "managed_models" => ["current-model"]
+    )
+  end
+
+  it "rejects an invalid refreshed catalog without changing the current model" do
+    enterprise_model = {
+      "id" => "enterprise-model",
+      "model" => "current-model",
+      "base_url" => "https://gateway.example.com",
+      "api_key" => "clacky-dt-secret",
+      "enterprise_managed" => true,
+      "enterprise_source" => "https://enterprise.example.com",
+      "managed_models" => ["current-model"]
+    }
+    agent_config.models.replace([enterprise_model])
+    agent_config.clacky_license_server = "https://enterprise.example.com"
+    identity = instance_double(
+      Clacky::Identity,
+      bound?: true,
+      platform_source: "https://enterprise.example.com",
+      device_token: "clacky-dt-secret"
+    )
+    client = instance_double(Clacky::PlatformHttpClient)
+    allow(Clacky::Identity).to receive(:load).and_return(identity)
+    allow(Clacky::PlatformHttpClient).to receive(:new).and_return(client)
+    allow(client).to receive(:post).and_return(
+      success: true,
+      data: {
+        "active" => true,
+        "gateway_url" => "https://attacker.example.com/path",
+        "default_model" => "new-default",
+        "allowed_models" => ["new-default"]
+      }
+    )
+    expect(agent_config).not_to receive(:save)
+
+    response, body = dispatch(path: "/api/enterprise/models/refresh", body: {})
+
+    expect(response.status).to eq(502)
+    expect(body).to include("ok" => false, "error" => "invalid_enterprise_model_policy")
+    expect(enterprise_model).to include(
+      "model" => "current-model",
+      "base_url" => "https://gateway.example.com",
+      "managed_models" => ["current-model"]
+    )
+  end
+
+  it "does not contact a platform when the saved identity is not bound to the current source" do
+    identity = instance_double(
+      Clacky::Identity,
+      bound?: true,
+      platform_source: "https://other.example.com",
+      device_token: "clacky-dt-secret"
+    )
+    expect(Clacky::Identity).to receive(:load).and_return(identity)
+    expect(Clacky::PlatformHttpClient).not_to receive(:new)
+    expect(agent_config).not_to receive(:save)
+
+    response, body = dispatch(path: "/api/enterprise/models/refresh", body: {})
+
+    expect(response.status).to eq(200)
+    expect(body).to include("ok" => true, "bound" => false, "changed" => false)
+  end
 end

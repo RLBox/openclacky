@@ -1,6 +1,24 @@
 # frozen_string_literal: true
 
 RSpec.describe Clacky::AgentConfig do
+  it "drops a stale enterprise sub-model overlay after access is removed" do
+    config = described_class.new(
+      models: [{
+        "id" => "enterprise-model",
+        "model" => "allowed-default",
+        "base_url" => "https://gateway.example.com",
+        "api_key" => "device-token",
+        "enterprise_managed" => true,
+        "managed_models" => ["allowed-default"]
+      }],
+      current_model_id: "enterprise-model",
+      session_model_overlay: { "model" => "removed-model" }
+    )
+
+    expect(config.model_name).to eq("allowed-default")
+    expect(config.session_model_overlay_name).to be_nil
+  end
+
   # Helper to create a temporary config file
   def with_temp_config(data = nil)
     temp_dir = Dir.mktmpdir
