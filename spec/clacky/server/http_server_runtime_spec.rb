@@ -1,6 +1,8 @@
 # frozen_string_literal: true
 
 require "spec_helper"
+require "fileutils"
+require "tmpdir"
 require "clacky/server/http_server"
 require "clacky/runtime_session"
 require "clacky/agent_runtime_registry"
@@ -168,6 +170,8 @@ RSpec.describe Clacky::Server::HttpServer, "runtime session lifecycle" do
       }
     ])
   end
+  let(:runtime_config_dir) { Dir.mktmpdir("clacky_runtime_http_config") }
+  let(:runtime_config_file) { File.join(runtime_config_dir, "config.yml") }
   let(:built_runtimes) { [] }
   let(:runtime_factory) do
     lambda do |**options|
@@ -197,8 +201,18 @@ RSpec.describe Clacky::Server::HttpServer, "runtime session lifecycle" do
   end
 
   before do
+    stub_const("Clacky::AgentConfig::CONFIG_FILE", runtime_config_file)
     allow(Clacky::AgentProfile).to receive(:load)
       .and_return(RuntimeServerSpecProfile.new("general"))
+  end
+
+  after do
+    FileUtils.remove_entry(runtime_config_dir) if File.exist?(runtime_config_dir)
+  end
+
+  it "isolates runtime model persistence from the user configuration" do
+    expect(Clacky::AgentConfig::CONFIG_FILE).to eq(runtime_config_file)
+    expect(runtime_config_file).to start_with(runtime_config_dir)
   end
 
   def persisted_runtime_session(session_id: "runtime-restored", provider_id: "codex")
