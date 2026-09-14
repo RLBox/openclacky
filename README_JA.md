@@ -198,7 +198,7 @@ $ openclacky
 
 ### ChatGPT — Web UI プロトタイプ
 
-ChatGPT 機能は Codex ACP を利用するクライアント同梱・既定有効の拡張として提供され、マーケットプレイスから別途インストールする必要はありません。ローカル Web UI では、ChatGPT を Agent ランタイムとして利用できます。初回セットアップで **Choose another provider (API or ChatGPT)** を選ぶか、**Settings → Models → Add Model** を開き、既存のプロバイダー一覧から **ChatGPT** を選択します。Model、Base URL、API Key、API Format の代わりに接続状態と **Connect with ChatGPT** が表示されます。保存されるランタイムカードに API 認証情報は含まれません。ユーザーの Codex CLI 設定に安全なモデル設定があれば最初のメッセージに反映され、ACP セッション確立後は実際のモデルとランタイムが通知した候補が既存のセッションモデル選択 UI に表示されます。ChatGPT が既定のランタイムの場合、設定画面では **Visual Understanding** が主モデルによって自動的に提供されるものとして表示され、その他のメディア設定は従来どおりです。
+ChatGPT 機能は Codex ACP を利用するクライアント同梱・既定有効の拡張として提供され、マーケットプレイスから別途インストールする必要はありません。ローカル Web UI では、ChatGPT を Agent ランタイムとして利用できます。初回セットアップで **Choose another provider (API or ChatGPT)** を選ぶか、**Settings → Models → Add Model** を開き、既存のプロバイダー一覧から **ChatGPT** を選択します。OpenClacky は直ちに接続し、一時 ACP セッションでアカウントが利用できるモデル一覧を読み込みます。保存前に、新しい会話で通常使う既定モデルを選ぶ必要があります。Base URL、API Key、API Format は非表示のままで、ランタイムカードには選択したモデル名だけが保存され、API 認証情報は保存されません。一時ディスカバリーセッションはすぐに閉じられ、会話一覧にも表示されません。各会話では、その ACP セッションが通知したモデルへ個別に切り替えられ、カードの既定値は変わりません。ChatGPT が既定のランタイムの場合、設定画面では **Visual Understanding** が主モデルによって自動的に提供されるものとして表示され、その他のメディア設定は従来どおりです。
 
 OpenClacky は ACP 経由で、バージョン固定ペア `@agentclientprotocol/codex-acp@1.11.0` + `@openai/codex@0.153.4` に接続します。このプロトタイプには次のいずれかが必要です。
 

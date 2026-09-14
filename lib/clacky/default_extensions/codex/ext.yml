@@ -18,8 +18,7 @@ contributes:
       runtime_id: codex
       auth_mode: runtime
       credential_fields: []
-      dynamic_models: session
-      display_model: ChatGPT default
+      dynamic_models: discovery
       capabilities:
         chat: true
         tools: true

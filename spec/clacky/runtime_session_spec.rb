@@ -225,6 +225,7 @@ RSpec.describe Clacky::RuntimeSession do
       session_id: "session-1",
       working_dir: "/workspace",
       permission_mode: "confirm_all",
+      default_model: "Codex default",
       ui: ui
     )
     expect(runtime.context[:event_sink]).to respond_to(:call)

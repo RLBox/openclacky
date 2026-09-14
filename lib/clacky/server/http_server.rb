@@ -6796,7 +6796,7 @@ module Clacky
       end
 
       private def runtime_only_request?(body)
-        allowed = %w[provider_id runtime_id type remark]
+        allowed = %w[provider_id runtime_id display_model type remark]
         !body["provider_id"].to_s.strip.empty? && (body.keys - allowed).empty?
       end
 
@@ -6813,7 +6813,7 @@ module Clacky
         if runtime_id
           unless runtime_only_request?(body)
             return json_response(res, 422, {
-              error: "runtime models only allow provider_id, runtime_id, type, and remark"
+              error: "runtime models only allow provider_id, runtime_id, display_model, type, and remark"
             })
           end
           if body.key?("runtime_id") && body["runtime_id"].to_s.strip != runtime_id.to_s
@@ -6913,9 +6913,18 @@ module Clacky
         end
 
         descriptor = @provider_registry.fetch(provider_id)
-        display_model = descriptor["display_model"].to_s.strip
-        display_model = descriptor["name"].to_s.strip if display_model.empty?
-        display_model = provider_id if display_model.empty?
+        display_model = if discovery_runtime_provider?(descriptor)
+                          validate_runtime_display_model(
+                            runtime_id, body["display_model"]
+                          )
+                        else
+                          body["display_model"].to_s.strip
+                        end
+        if display_model.empty?
+          display_model = descriptor["display_model"].to_s.strip
+          display_model = descriptor["name"].to_s.strip if display_model.empty?
+          display_model = provider_id if display_model.empty?
+        end
         entry = {
           "id" => SecureRandom.uuid,
           Clacky::AgentConfig::RUNTIME_MODEL_MARKER => true,
@@ -7071,10 +7080,10 @@ module Clacky
       end
 
       private def api_update_runtime_model(target, body, res)
-        invalid_fields = body.keys - %w[remark type]
+        invalid_fields = body.keys - %w[display_model remark type]
         unless invalid_fields.empty?
           return json_response(res, 422, {
-            error: "runtime models only allow remark and type updates"
+            error: "runtime models only allow display_model, remark, and type updates"
           })
         end
 
@@ -7089,6 +7098,21 @@ module Clacky
             error: "select another model as default before clearing the current default"
           })
         end
+
+        display_model = nil
+        if body.key?("display_model")
+          descriptor = @provider_registry.fetch(target["provider_id"])
+          unless discovery_runtime_provider?(descriptor)
+            return json_response(res, 422, {
+              error: "this runtime provider does not support default-model discovery"
+            })
+          end
+          display_model = validate_runtime_display_model(
+            target["runtime_id"], body["display_model"]
+          )
+        end
+
+        target["display_model"] = display_model if display_model
 
         if body.key?("remark")
           remark = body["remark"].to_s.strip
@@ -7126,6 +7150,47 @@ module Clacky
         return "default" if normalized == "default"
 
         :invalid
+      end
+
+      private def discovery_runtime_provider?(descriptor)
+        descriptor && descriptor["dynamic_models"].to_s == "discovery"
+      end
+
+      private def validate_runtime_display_model(runtime_id, value)
+        selected = value.to_s.strip
+        raise ArgumentError, "display_model is required" if selected.empty?
+
+        runtime = @runtime_registry.build(
+          runtime_id,
+          purpose: :discovery,
+          context: { working_dir: Dir.pwd }
+        )
+        begin
+          unless runtime.respond_to?(:discover_models)
+            raise ArgumentError,
+                  "this runtime provider does not support default-model discovery"
+          end
+          discovery = runtime.discover_models(working_dir: Dir.pwd)
+          unless discovery.is_a?(Hash) && (discovery[:ok] || discovery["ok"])
+            message = discovery.is_a?(Hash) &&
+              (discovery[:message] || discovery["message"])
+            raise ArgumentError,
+                  message.to_s.empty? ?
+                    "runtime model discovery failed" : message.to_s
+          end
+          models = discovery[:models] || discovery["models"]
+          advertised = Array(models).filter_map do |model|
+            normalized = model.to_s.strip
+            normalized unless normalized.empty?
+          end.uniq
+          unless advertised.include?(selected)
+            raise ArgumentError,
+                  "display_model was not advertised by the runtime provider"
+          end
+          selected
+        ensure
+          runtime.close if runtime.respond_to?(:close)
+        end
       end
 
       private def clearing_current_default?(target, body)

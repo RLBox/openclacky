@@ -31,6 +31,7 @@ RSpec.describe "Runtime provider WebUI" do
       expect(runtime_store).not_to include('`/api/ext/${encodeURIComponent(provider.runtime_id)}/${action}`')
       expect(runtime_store).to include('runtimeRequest(provider, "status"')
       expect(runtime_store).to include('runtimeRequest(provider, "authenticate"')
+      expect(runtime_store).to include('runtimeRequest(provider, "discover", { method: "POST" })')
     end
 
     it "bounds login polling and stops on connected, rejected, error, or timeout states" do
@@ -62,9 +63,9 @@ RSpec.describe "Runtime provider WebUI" do
   describe "shared form contract" do
     it "provides API-field groups and runtime status panels in both existing forms" do
       %w[
-        model-modal-api-fields model-modal-runtime-panel
+        model-modal-model-field model-modal-api-fields model-modal-runtime-panel
         model-modal-runtime-status model-modal-runtime-login model-modal-runtime-recheck
-        setup-api-fields setup-runtime-panel setup-runtime-status
+        setup-model-field setup-api-fields setup-runtime-panel setup-runtime-status
         setup-runtime-login setup-runtime-recheck
       ].each do |id|
         expect(index).to include(%(id="#{id}")), "missing ##{id}"
@@ -102,14 +103,15 @@ RSpec.describe "Runtime provider WebUI" do
       expect(sync).to include("RuntimeProvider.isRuntimeProvider(provider)")
       expect(sync).to include('"setup-api-fields"')
       expect(sync).to include('"setup-runtime-panel"')
+      expect(sync).to include("input.readOnly = true")
     end
 
-    it "saves a runtime provider without API credentials or the API model tester" do
+    it "requires a discovered default model without API credentials or the API model tester" do
       save = function_source(onboard, "_saveRuntimeProvider")
-      expect(save).to include("RuntimeProvider.status(provider)")
+      expect(save).to include("RuntimeProvider.discover(provider)")
       expect(save).to include("provider_id: provider.id")
+      expect(save).to include("display_model: selectedModel")
       expect(save).to include('type: "default"')
-      expect(save).not_to include("model:")
       expect(save).not_to include("base_url:")
       expect(save).not_to include("api_key:")
       expect(save).not_to include("ModelTester.testConnection")
@@ -118,6 +120,7 @@ RSpec.describe "Runtime provider WebUI" do
     it "connects explicitly before polling passive status" do
       refresh = function_source(onboard, "_refreshSetupRuntimeStatus")
       expect(refresh).to include("RuntimeProvider.connect(provider)")
+      expect(refresh).to include("RuntimeProvider.discover(provider)")
       expect(runtime_store).to include('runtimeRequest(provider, "connect", { method: "POST" })')
     end
 
@@ -189,12 +192,12 @@ RSpec.describe "Runtime provider WebUI" do
       expect(test_model).to include("ModelTester.testRuntime")
     end
 
-    it "saves runtime cards with only provider identity and ordinary card metadata" do
+    it "saves runtime cards with the discovered default model and ordinary metadata" do
       save = function_source(settings, "_saveRuntimeModalModel")
       expect(save).to include("provider_id: provider.id")
+      expect(save).to include("display_model: selectedModel")
       expect(save).to include("remark")
       expect(save).to include("type")
-      expect(save).not_to include("model:")
       expect(save).not_to include("base_url:")
       expect(save).not_to include("api_key:")
     end
@@ -208,6 +211,7 @@ RSpec.describe "Runtime provider WebUI" do
       expect(select).to include("_clearModalApiFields()")
       expect(sync).to include('"model-modal-api-fields"')
       expect(sync).to include('"model-modal-runtime-panel"')
+      expect(sync).to include("input.readOnly = true")
     end
 
     it "invalidates an in-flight save or login status refresh after provider changes" do
@@ -244,7 +248,8 @@ RSpec.describe "Runtime provider WebUI" do
       card_status = function_source(settings, "_refreshRuntimeCardStatus")
       expect(changed).to include("provider_id !== provider.id")
       expect(settings).to include("_refreshRuntimeCardStatus(provider, model, index)")
-      expect(card_status).to include("RuntimeProvider.status(provider)")
+      expect(card_status).to include("RuntimeProvider.connect(provider)")
+      expect(card_status).to include("RuntimeProvider.discover(provider)")
       expect(card_status).to include("RuntimeProvider.statusView(data)")
     end
 
@@ -258,12 +263,15 @@ RSpec.describe "Runtime provider WebUI" do
       expect(resolve).not_to include("if (model.provider_id) return model.provider_id")
     end
 
-    it "connects from the model modal without making card rendering start a process" do
+    it "connects and discovers models from both the modal and configured cards" do
       modal_status = function_source(settings, "_refreshModalRuntimeStatus")
       card_status = function_source(settings, "_refreshRuntimeCardStatus")
       expect(modal_status).to include("RuntimeProvider.connect(provider)")
-      expect(card_status).to include("RuntimeProvider.status(provider)")
-      expect(card_status).not_to include("RuntimeProvider.connect(provider)")
+      expect(modal_status).to include("RuntimeProvider.discover(provider)")
+      expect(card_status).to include("RuntimeProvider.connect(provider)")
+      expect(card_status).to include("RuntimeProvider.discover(provider)")
+      dropdown = function_source(settings, "_updateModalModelDropdown")
+      expect(dropdown).to include("runtime ? _modalRuntimeModels")
     end
 
     it "does not offer the API-card duplicate action for runtime cards" do

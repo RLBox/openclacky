@@ -34,4 +34,8 @@ class CodexExt < Clacky::ApiExtension
     result = Clacky::DefaultExtensions::Codex::Runtime.authenticate_async
     json(result, status: result[:started] ? 202 : 200)
   end
+
+  post "/discover", timeout: 310, same_origin: true do
+    json(Clacky::DefaultExtensions::Codex::Runtime.discover_models)
+  end
 end

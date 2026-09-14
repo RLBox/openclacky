@@ -135,6 +135,8 @@ module Clacky
         session_id: @session_id,
         working_dir: @working_dir,
         permission_mode: permission_mode,
+        default_model: @config.current_model &&
+          @config.current_model["display_model"],
         ui: @ui,
         event_sink: method(:accept_runtime_event)
       }

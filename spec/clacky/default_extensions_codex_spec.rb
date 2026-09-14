@@ -38,8 +38,7 @@ RSpec.describe "bundled Codex extension" do
       "runtime_id" => "codex",
       "auth_mode" => "runtime",
       "credential_fields" => [],
-      "dynamic_models" => "session",
-      "display_model" => "ChatGPT default"
+      "dynamic_models" => "discovery"
     )
     expect(runtime.spec).to include(
       "adapter" => "runtime.rb",
@@ -58,8 +57,9 @@ RSpec.describe "bundled Codex extension" do
     expect(registry["codex"]).to include(
       "runtime_id" => "codex",
       "auth_mode" => "runtime",
-      "display_model" => "ChatGPT default"
+      "dynamic_models" => "discovery"
     )
+    expect(registry["codex"]["display_model"]).to be_nil
     expect(registry.runtime_id_for("codex")).to eq("codex")
   end
 
@@ -1269,7 +1269,7 @@ RSpec.describe "Codex extension status shell" do
     )
   end
 
-  it "keeps GET status passive and uses explicit POSTs to connect and authenticate" do
+  it "keeps GET status passive and uses explicit POSTs for connection and discovery" do
     klass = codex_api_class
     runtime = Clacky::DefaultExtensions::Codex::Runtime
     allow(runtime).to receive(:passive_status).and_return(
@@ -1281,18 +1281,29 @@ RSpec.describe "Codex extension status shell" do
     allow(runtime).to receive(:authenticate_async).and_return(
       ok: true, started: true, status: "authenticating"
     )
+    allow(runtime).to receive(:discover_models).and_return(
+      ok: true,
+      status: "connected",
+      authenticated: true,
+      default_model: "gpt-5.6-sol",
+      models: ["gpt-5.6-sol"]
+    )
 
     status_route = klass.routes.find { |route| route.method == :get && route.pattern == "/status" }
     connect_route = klass.routes.find { |route| route.method == :post && route.pattern == "/connect" }
     auth_route = klass.routes.find { |route| route.method == :post && route.pattern == "/authenticate" }
+    discover_route = klass.routes.find { |route| route.method == :post && route.pattern == "/discover" }
     expect(status_route).not_to be_nil
     expect(connect_route).not_to be_nil
     expect(auth_route).not_to be_nil
+    expect(discover_route).not_to be_nil
     expect(status_route.options).to include(timeout: 10, same_origin: true)
     expect(connect_route.options).to include(same_origin: true)
     expect(auth_route.options).to include(same_origin: true)
+    expect(discover_route.options).to include(same_origin: true)
     expect(connect_route.options[:timeout]).to eq(310)
     expect(auth_route.options[:timeout]).to eq(310)
+    expect(discover_route.options[:timeout]).to eq(310)
 
     status_handler = klass.new(req: nil, res: nil, route: status_route, params: {}, http_server: nil)
     expect { status_handler.invoke }.to raise_error(Clacky::ApiExtension::Halt) do |halt|
@@ -1315,6 +1326,18 @@ RSpec.describe "Codex extension status shell" do
       expect(halt.status).to eq(202)
       expect(JSON.parse(halt.payload)).to include(
         "ok" => true, "started" => true, "status" => "authenticating"
+      )
+    end
+
+    discover_handler = klass.new(
+      req: nil, res: nil, route: discover_route, params: {}, http_server: nil
+    )
+    expect { discover_handler.invoke }.to raise_error(Clacky::ApiExtension::Halt) do |halt|
+      expect(halt.status).to eq(200)
+      expect(JSON.parse(halt.payload)).to include(
+        "ok" => true,
+        "default_model" => "gpt-5.6-sol",
+        "models" => ["gpt-5.6-sol"]
       )
     end
   end

@@ -18,7 +18,7 @@
 - Test: `spec/clacky/default_extensions/codex/runtime_spec.rb`
 - Test: `spec/clacky/default_extensions_codex_spec.rb`
 
-- [ ] **Step 1: Write failing runtime discovery tests**
+- [x] **Step 1: Write failing runtime discovery tests**
 
 Add examples proving that discovery starts the shared connection, rejects an unauthenticated account, extracts the model option's current value and flattened choices, and closes the temporary ACP session even when parsing fails:
 
@@ -34,7 +34,7 @@ expect(client.requests.map(&:first)).to include("session/new", "session/close")
 expect(connection).not_to have_bound_sessions
 ```
 
-- [ ] **Step 2: Run the focused tests and verify RED**
+- [x] **Step 2: Run the focused tests and verify RED**
 
 Run:
 
@@ -46,7 +46,7 @@ BUNDLE_FROZEN=true bundle exec rspec \
 
 Expected: failures because `discover_models` and `POST /discover` do not exist.
 
-- [ ] **Step 3: Implement connection-owned discovery**
+- [x] **Step 3: Implement connection-owned discovery**
 
 Add a discovery mutex and a public operation with this contract:
 
@@ -62,7 +62,7 @@ end
 
 The result must contain only `ok`, `status`, `authenticated`, `default_model`, `models`, and a safe `message`. It must never bind the temporary session to a runtime, persist its session ID, or expose ACP metadata.
 
-- [ ] **Step 4: Expose discovery through the bundled extension**
+- [x] **Step 4: Expose discovery through the bundled extension**
 
 Add `Runtime.discover_models(working_dir: Dir.pwd)` and a same-origin endpoint:
 
@@ -72,7 +72,7 @@ post "/discover", timeout: 310, same_origin: true do
 end
 ```
 
-- [ ] **Step 5: Run the focused tests and verify GREEN**
+- [x] **Step 5: Run the focused tests and verify GREEN**
 
 Run the command from Step 2. Expected: all examples pass.
 
@@ -88,7 +88,7 @@ Run the command from Step 2. Expected: all examples pass.
 - Test: `spec/clacky/default_extensions/codex/runtime_spec.rb`
 - Test: `spec/clacky/default_extensions_codex_spec.rb`
 
-- [ ] **Step 1: Write failing persistence and session-default tests**
+- [x] **Step 1: Write failing persistence and session-default tests**
 
 Cover these cases:
 
@@ -109,7 +109,7 @@ expect(saved_runtime_card["display_model"]).to eq("gpt-5.6-sol")
 - a restored session's saved model wins over the card default;
 - a new ACP session calls `session/set_config_option` for the card default before its first prompt.
 
-- [ ] **Step 2: Run the focused tests and verify RED**
+- [x] **Step 2: Run the focused tests and verify RED**
 
 Run:
 
@@ -123,7 +123,7 @@ BUNDLE_FROZEN=true bundle exec rspec \
 
 Expected: failures around runtime-card field validation and default propagation.
 
-- [ ] **Step 3: Change the runtime-card contract**
+- [x] **Step 3: Change the runtime-card contract**
 
 Remove the static placeholder from the provider descriptor and mark dynamic models as discovery-backed:
 
@@ -133,7 +133,7 @@ dynamic_models: discovery
 
 Accept `display_model` only for runtime-card create/update. Before mutation, discover the current model catalog and require exact membership. Preserve the existing credentialless allowlist and keep `display_model` as the only persisted default-model field.
 
-- [ ] **Step 4: Propagate the card default to the runtime**
+- [x] **Step 4: Propagate the card default to the runtime**
 
 Add the selected default to the runtime context:
 
@@ -146,7 +146,7 @@ context = {
 
 The Codex runtime stores that value separately from restored session state. During session configuration it applies restored `model` first; otherwise it applies the card default, but only if ACP advertises the value.
 
-- [ ] **Step 5: Run the focused tests and verify GREEN**
+- [x] **Step 5: Run the focused tests and verify GREEN**
 
 Run the command from Step 2. Expected: all examples pass.
 
@@ -162,7 +162,7 @@ Run the command from Step 2. Expected: all examples pass.
 - Modify: `spec/clacky/web/runtime_provider_ui_spec.rb`
 - Modify: `spec/clacky/web/syntax_spec.rb`
 
-- [ ] **Step 1: Write failing UI source-contract tests**
+- [x] **Step 1: Write failing UI source-contract tests**
 
 Assert that:
 
@@ -174,7 +174,7 @@ expect(settings).to include("display_model: selectedModel")
 
 Also require configured runtime cards to initiate connection instead of passive-only status, require the save/continue button to stay disabled until discovery succeeds and a model is selected, and keep API-provider fields unchanged.
 
-- [ ] **Step 2: Run the UI tests and verify RED**
+- [x] **Step 2: Run the UI tests and verify RED**
 
 Run:
 
@@ -186,7 +186,7 @@ BUNDLE_FROZEN=true bundle exec rspec \
 
 Expected: failures because discovery and runtime model selection are absent.
 
-- [ ] **Step 3: Add the shared discovery helper**
+- [x] **Step 3: Add the shared discovery helper**
 
 Extend `RuntimeProvider`:
 
@@ -198,17 +198,17 @@ function discover(provider) {
 
 Normalize `models` to unique non-empty strings and select `default_model` only when it belongs to that list.
 
-- [ ] **Step 4: Reuse the existing model comboboxes for runtime providers**
+- [x] **Step 4: Reuse the existing model comboboxes for runtime providers**
 
 Keep the Model field visible while hiding Base URL, API Key, and API Format. Make the runtime model input selection-only after discovery; populate its dropdown from the returned catalog and preselect the returned default or the existing card model.
 
 Update the runtime hint to explain that this is the default for new conversations. Disable Save/Continue while disconnected, discovering, empty, or holding a value outside the discovered catalog.
 
-- [ ] **Step 5: Save the selected model and eagerly connect cards**
+- [x] **Step 5: Save the selected model and eagerly connect cards**
 
 Include the selected `display_model` in runtime create/update payloads. When a configured ChatGPT card renders, call connect once for the shared provider, then discover; render `Starting` during the operation and `Connected` afterward. If an existing card contains a recognized placeholder, PATCH it to the discovered default after successful validation.
 
-- [ ] **Step 6: Run the UI tests and verify GREEN**
+- [x] **Step 6: Run the UI tests and verify GREEN**
 
 Run the command from Step 2. Expected: all examples pass and JavaScript syntax checks succeed.
 
@@ -220,11 +220,11 @@ Run the command from Step 2. Expected: all examples pass and JavaScript syntax c
 - Modify: `README_JA.md`
 - Modify: `docs/superpowers/plans/2026-09-14-chatgpt-default-model-discovery.md`
 
-- [ ] **Step 1: Update setup documentation**
+- [x] **Step 1: Update setup documentation**
 
 Replace the statement that the actual model appears only after the first message. Document that setup connects ChatGPT, loads the account's model list, and requires a default selection before saving.
 
-- [ ] **Step 2: Run focused regression suites**
+- [x] **Step 2: Run focused regression suites**
 
 Run:
 
@@ -240,7 +240,7 @@ BUNDLE_FROZEN=true bundle exec rspec \
 
 Expected: zero failures.
 
-- [ ] **Step 3: Run the complete project verification**
+- [x] **Step 3: Run the complete project verification**
 
 Run:
 
@@ -251,11 +251,15 @@ git diff --check
 
 Expected: zero RSpec failures and no whitespace errors.
 
-- [ ] **Step 4: Perform live local verification**
+Observed on 2026-09-14: all 4,570 non-MCP examples passed; the complete
+4,574-example run retained the same four pre-existing fake-MCP initialize
+timeouts reproduced before implementation. `git diff --check` passed.
+
+- [x] **Step 4: Perform live local verification**
 
 On port 7777, verify that opening Settings without sending a message shows ChatGPT connected, the model card displays the selected real model, Add Model requires a choice from the discovered list, and no discovery conversation appears in the sidebar.
 
-- [ ] **Step 5: Commit the cohesive implementation**
+- [x] **Step 5: Commit the cohesive implementation**
 
 Stage implementation, tests, and synchronized documentation while excluding the user's pre-existing `Gemfile.lock` change:
 
@@ -265,4 +269,3 @@ git add README.md README_CN.md README_JA.md docs/superpowers \
   lib/clacky/server/http_server.rb lib/clacky/web spec/clacky
 git commit -m "fix: configure ChatGPT before first prompt"
 ```
-

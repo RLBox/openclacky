@@ -148,6 +148,122 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Connection do
     connection&.close
   end
 
+  it "discovers the authenticated account model catalog in a temporary session" do
+    client.request_handler = lambda do |method, _params, _timeout|
+      case method
+      when "authentication/status"
+        { "type" => "account", "label" => "ChatGPT Plus" }
+      when "session/new"
+        {
+          "sessionId" => "discovery-session",
+          "configOptions" => [
+            {
+              "id" => "model",
+              "currentValue" => "gpt-5.6-sol",
+              "options" => [
+                {
+                  "name" => "Recommended",
+                  "options" => [
+                    { "value" => "gpt-6-astra" },
+                    { "value" => "gpt-5.6-sol" }
+                  ]
+                },
+                { "value" => "gpt-5.6-sol" }
+              ]
+            }
+          ]
+        }
+      else
+        {}
+      end
+    end
+    connection = build_connection
+
+    expect(connection.discover_models(working_dir: "/workspace")).to include(
+      ok: true,
+      status: "connected",
+      authenticated: true,
+      default_model: "gpt-5.6-sol",
+      models: ["gpt-6-astra", "gpt-5.6-sol"]
+    )
+    expect(client.requests).to include(
+      [
+        "session/new",
+        { "cwd" => "/workspace", "mcpServers" => [] },
+        nil
+      ],
+      [
+        "session/close",
+        { "sessionId" => "discovery-session" },
+        described_class::CONTROL_TIMEOUT
+      ]
+    )
+    expect(connection.instance_variable_get(:@sessions)).to be_empty
+  ensure
+    connection&.close
+  end
+
+  it "does not open a discovery session before ChatGPT is authenticated" do
+    client.request_handler = lambda do |method, _params, _timeout|
+      method == "authentication/status" ? { "type" => "unauthenticated" } : {}
+    end
+    connection = build_connection
+
+    expect(connection.discover_models).to include(
+      ok: false,
+      status: "not_connected",
+      authenticated: false,
+      models: []
+    )
+    expect(client.requests.map(&:first)).not_to include("session/new")
+  ensure
+    connection&.close
+  end
+
+  it "does not open a discovery session inside a protected credential path" do
+    client.request_handler = lambda do |method, _params, _timeout|
+      method == "authentication/status" ? { "type" => "account" } : {}
+    end
+    connection = build_connection
+
+    expect(
+      connection.discover_models(working_dir: "/private/.clacky/project")
+    ).to include(
+      ok: false,
+      status: "error",
+      authenticated: true,
+      models: []
+    )
+    expect(client.requests.map(&:first)).not_to include("session/new")
+  ensure
+    connection&.close
+  end
+
+  it "closes the temporary session when model discovery cannot parse a catalog" do
+    client.request_handler = lambda do |method, _params, _timeout|
+      case method
+      when "authentication/status"
+        { "type" => "account" }
+      when "session/new"
+        { "sessionId" => "invalid-discovery", "configOptions" => [] }
+      else
+        {}
+      end
+    end
+    connection = build_connection
+
+    expect(connection.discover_models).to include(
+      ok: false,
+      status: "error",
+      authenticated: true,
+      models: []
+    )
+    expect(client.requests.map(&:first)).to include("session/close")
+    expect(connection.instance_variable_get(:@sessions)).to be_empty
+  ensure
+    connection&.close
+  end
+
   it "always launches the ACP transport from the isolated managed home" do
     connection = build_connection
     acp_client = connection.send(:build_client, launcher_result)
@@ -734,6 +850,52 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Runtime do
       described_class::CONTROL_TIMEOUT
     ])
     expect(agent.dump_state).to include("model" => "gpt-5.6-sol")
+  ensure
+    agent&.close
+  end
+
+  it "applies the card default model before the first prompt" do
+    install_new_session_handler
+    agent = described_class.new(
+      context: context.merge(default_model: "gpt-5.3-codex"),
+      persisted_state: nil,
+      connection: connection
+    )
+
+    agent.run(input, generation: 720)
+
+    set_model = client.requests.find do |method, params, _timeout|
+      method == "session/set_config_option" && params["configId"] == "model"
+    end
+    expect(set_model).to eq([
+      "session/set_config_option",
+      {
+        "sessionId" => "acp-session",
+        "configId" => "model",
+        "value" => "gpt-5.3-codex"
+      },
+      described_class::CONTROL_TIMEOUT
+    ])
+    expect(client.requests.map(&:first).index("session/set_config_option"))
+      .to be < client.requests.map(&:first).index("session/prompt")
+  ensure
+    agent&.close
+  end
+
+  it "prefers a restored session model over the card default" do
+    install_new_session_handler
+    agent = described_class.new(
+      context: context.merge(default_model: "gpt-6-codex"),
+      persisted_state: { "model" => "gpt-5.3-codex" },
+      connection: connection
+    )
+
+    agent.run(input, generation: 721)
+
+    set_model = client.requests.find do |method, params, _timeout|
+      method == "session/set_config_option" && params["configId"] == "model"
+    end
+    expect(set_model[1]["value"]).to eq("gpt-5.3-codex")
   ensure
     agent&.close
   end

@@ -19,7 +19,7 @@ RSpec.describe Clacky::Server::HttpServer, "runtime session lifecycle" do
     attr_reader :context, :persisted_state, :runs, :cancel_reasons,
       :selected_models
 
-    def initialize(context:, persisted_state: nil)
+    def initialize(context:, persisted_state: nil, **_options)
       @context = context
       @persisted_state = persisted_state
       @runs = []
@@ -44,6 +44,17 @@ RSpec.describe Clacky::Server::HttpServer, "runtime session lifecycle" do
 
     def model_options
       Array(@selectable_models)
+    end
+
+    def discover_models(working_dir: Dir.pwd)
+      {
+        ok: true,
+        status: "connected",
+        authenticated: true,
+        default_model: "codex-current",
+        models: ["codex-current", "gpt-5.6-sol"],
+        working_dir: working_dir
+      }
     end
 
     def reject_model_selection!
@@ -178,7 +189,7 @@ RSpec.describe Clacky::Server::HttpServer, "runtime session lifecycle" do
           "name" => "ChatGPT",
           "runtime_id" => "codex",
           "auth_mode" => "runtime",
-          "display_model" => "ChatGPT default",
+          "dynamic_models" => "discovery",
           "capabilities" => { "vision" => true }
         }
       }
@@ -219,6 +230,113 @@ RSpec.describe Clacky::Server::HttpServer, "runtime session lifecycle" do
         { role: "assistant", content: "Earlier answer", created_at: 2.0 }
       ]
     }
+  end
+
+  it "requires and persists an advertised default model on a runtime card" do
+    config = Clacky::AgentConfig.new(models: [
+      {
+        "id" => "api-card",
+        "model" => "api-model",
+        "base_url" => "https://api.example.test",
+        "api_key" => "secret",
+        "type" => "default"
+      }
+    ])
+
+    with_server(
+      agent_config: config,
+      provider_registry: provider_registry,
+      runtime_registry: runtime_registry
+    ) do |server|
+      missing = fake_res
+      dispatch(
+        server,
+        fake_req(
+          method: "POST",
+          path: "/api/config/models",
+          body: { provider_id: "codex" }
+        ),
+        missing
+      )
+      expect(missing.status).to eq(422)
+
+      unknown = fake_res
+      dispatch(
+        server,
+        fake_req(
+          method: "POST",
+          path: "/api/config/models",
+          body: { provider_id: "codex", display_model: "not-advertised" }
+        ),
+        unknown
+      )
+      expect(unknown.status).to eq(422)
+
+      created_response = fake_res
+      dispatch(
+        server,
+        fake_req(
+          method: "POST",
+          path: "/api/config/models",
+          body: {
+            provider_id: "codex",
+            display_model: "gpt-5.6-sol",
+            type: "default"
+          }
+        ),
+        created_response
+      )
+
+      expect(created_response.status).to eq(200)
+      created = config.models.find do |model|
+        model["id"] == parsed_body(created_response)["id"]
+      end
+      expect(created).to include(
+        "provider_id" => "codex",
+        "runtime_id" => "codex",
+        "display_model" => "gpt-5.6-sol",
+        "type" => "default"
+      )
+    end
+  end
+
+  it "updates a runtime card only to an advertised default model" do
+    with_server(
+      agent_config: runtime_config,
+      provider_registry: provider_registry,
+      runtime_registry: runtime_registry
+    ) do |server|
+      rejected = fake_res
+      dispatch(
+        server,
+        fake_req(
+          method: "PATCH",
+          path: "/api/config/models/runtime-card-current",
+          body: { display_model: "not-advertised", remark: "must not persist" }
+        ),
+        rejected
+      )
+      expect(rejected.status).to eq(422)
+      expect(runtime_config.current_model).to include(
+        "display_model" => "ChatGPT default"
+      )
+      expect(runtime_config.current_model).not_to have_key("remark")
+
+      updated = fake_res
+      dispatch(
+        server,
+        fake_req(
+          method: "PATCH",
+          path: "/api/config/models/runtime-card-current",
+          body: { display_model: "codex-current" }
+        ),
+        updated
+      )
+      expect(updated.status).to eq(200)
+      expect(runtime_config.current_model).to include(
+        "display_model" => "codex-current"
+      )
+    end
   end
 
   it "selects the runtime before constructing an API client" do

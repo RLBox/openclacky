@@ -44,6 +44,7 @@ module Clacky
           @state_mutex = Mutex.new
           @state_condition = ConditionVariable.new
           @auth_mutex = Mutex.new
+          @discovery_mutex = Mutex.new
           @sessions_mutex = Mutex.new
           @turns_mutex = Mutex.new
           @sessions = {}
@@ -188,6 +189,114 @@ module Clacky
             status: "error",
             error_code: "authentication_start_failed",
             message: "OpenClacky could not start ChatGPT authentication."
+          }
+        end
+
+        # Open a short-lived, unbound ACP session to read the account-scoped
+        # model catalog before OpenClacky creates a user-visible conversation.
+        def discover_models(working_dir: Dir.pwd)
+          snapshot = nil
+          @discovery_mutex.synchronize do
+            client = ensure_client
+            wait_for_initial_auth_status if @auth_push_supported
+            snapshot = status_snapshot
+            unless snapshot[:authenticated] == true
+              next discovery_result(
+                snapshot,
+                ok: false,
+                models: [],
+                message: "Connect a ChatGPT account before choosing a model."
+              )
+            end
+            unless workspace_allowed?(working_dir)
+              next discovery_result(
+                snapshot,
+                ok: false,
+                models: [],
+                message: "ChatGPT model discovery cannot use a protected credential path."
+              ).merge(status: "error")
+            end
+
+            session_id = nil
+            begin
+              response = client.request(
+                "session/new",
+                {
+                  "cwd" => File.expand_path(working_dir.to_s),
+                  "mcpServers" => []
+                },
+                timeout: nil
+              )
+              session_id = response["sessionId"].to_s.strip
+              if session_id.empty?
+                raise UnavailableError.new(
+                  "model_discovery_failed",
+                  "ChatGPT did not return a discovery session."
+                )
+              end
+
+              model_option = Array(response["configOptions"]).find do |option|
+                option.is_a?(Hash) && option["id"].to_s == "model"
+              end
+              models = discovery_model_values(model_option && model_option["options"])
+              if models.empty?
+                raise UnavailableError.new(
+                  "model_discovery_failed",
+                  "ChatGPT did not advertise any available models."
+                )
+              end
+              current = bounded_string(model_option["currentValue"])
+              current = models.first unless models.include?(current)
+              discovery_result(
+                snapshot,
+                ok: true,
+                default_model: current,
+                models: models,
+                message: "ChatGPT models are ready."
+              )
+            rescue UnavailableError => e
+              discovery_result(
+                snapshot,
+                ok: false,
+                models: [],
+                message: e.message
+              ).merge(status: "error")
+            rescue StandardError
+              discovery_result(
+                snapshot,
+                ok: false,
+                models: [],
+                message: "OpenClacky could not load the ChatGPT model list."
+              ).merge(status: "error")
+            ensure
+              if session_id && !session_id.empty?
+                begin
+                  client.request(
+                    "session/close",
+                    { "sessionId" => session_id },
+                    timeout: CONTROL_TIMEOUT
+                  )
+                rescue StandardError
+                  nil
+                end
+              end
+            end
+          end
+        rescue UnavailableError => e
+          {
+            ok: false,
+            status: "unavailable",
+            authenticated: nil,
+            models: [],
+            message: e.message
+          }
+        rescue StandardError
+          {
+            ok: false,
+            status: "unavailable",
+            authenticated: nil,
+            models: [],
+            message: "OpenClacky could not load the ChatGPT model list."
           }
         end
 
@@ -477,6 +586,41 @@ module Clacky
           label.byteslice(0, 120).to_s.force_encoding(Encoding::UTF_8).scrub
         end
 
+        private def discovery_result(snapshot, ok:, models:, message:,
+                                     default_model: nil)
+          result = {
+            ok: ok,
+            status: snapshot[:status],
+            authenticated: snapshot[:authenticated],
+            models: models,
+            message: message
+          }
+          result[:default_model] = default_model if default_model
+          result
+        end
+
+        private def discovery_model_values(options)
+          flatten_discovery_options(options).filter_map do |entry|
+            bounded_string(entry["value"])
+          end.reject(&:empty?).uniq.first(100)
+        end
+
+        private def flatten_discovery_options(options)
+          Array(options).each_with_object([]) do |entry, flattened|
+            next unless entry.is_a?(Hash)
+
+            if entry["options"].is_a?(Array)
+              flattened.concat(flatten_discovery_options(entry["options"]))
+            else
+              flattened << entry
+            end
+          end
+        end
+
+        private def bounded_string(value)
+          value.to_s.byteslice(0, 200).to_s.force_encoding(Encoding::UTF_8).scrub.strip
+        end
+
         private def wait_for_initial_auth_status
           @state_mutex.synchronize do
             if @auth_state.nil? && @auth_error.nil? && !@authenticating
@@ -682,6 +826,10 @@ module Clacky
             connection.authenticate_async
           end
 
+          def discover_models(working_dir: Dir.pwd)
+            connection.discover_models(working_dir: working_dir)
+          end
+
           def shutdown
             existing = connection_mutex.synchronize do
               value = @connection
@@ -719,6 +867,7 @@ module Clacky
           @persisted_session_id = value(persisted_state, "session_id")
           @saved_model = value(persisted_state, "model")
           @saved_reasoning_effort = value(persisted_state, "reasoning_effort")
+          @default_model = value(@context, "default_model")
           @external_session_id = @persisted_session_id.to_s
           @external_session_id = nil if @external_session_id.empty?
           @config_options = []
@@ -744,6 +893,12 @@ module Clacky
 
         def health
           @connection.health
+        end
+
+        def discover_models(working_dir: nil)
+          @connection.discover_models(
+            working_dir: working_dir || @context[:working_dir] || Dir.pwd
+          )
         end
 
         def capabilities
@@ -1440,10 +1595,14 @@ module Clacky
         end
 
         private def restore_effective_configuration(client)
-          saved_model, saved_effort = @state_mutex.synchronize do
-            [@saved_model, @saved_reasoning_effort]
+          saved_model, saved_effort, default_model = @state_mutex.synchronize do
+            [@saved_model, @saved_reasoning_effort, @default_model]
           end
-          apply_saved_config_value(client, "model", saved_model)
+          apply_saved_config_value(
+            client,
+            "model",
+            present_string(saved_model) || present_string(default_model)
+          )
           apply_saved_config_value(
             client, "reasoning_effort", saved_effort
           )
