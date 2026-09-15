@@ -18,7 +18,7 @@ module Clacky
     #   model card (e.g. { "vision" => false }). These win over both provider_id
     #   and base_url inference, so a custom gateway can declare "text-only"
     #   without matching any preset.
-    def initialize(api_key, base_url:, model:, anthropic_format: false, api_format: nil, read_timeout: nil, provider_id: nil, capabilities: nil)
+    def initialize(api_key, base_url:, model:, anthropic_format: false, api_format: nil, read_timeout: nil, provider_id: nil, capabilities: nil, enterprise_application_id: nil)
       @api_key = api_key
       @base_url = base_url
       @model = model
@@ -54,6 +54,18 @@ module Clacky
       # Optional override for Faraday read_timeout (e.g. benchmark calls).
       # nil means use the default (300s for streaming).
       @read_timeout = read_timeout
+      @enterprise_application_id = normalize_enterprise_application_id(enterprise_application_id)
+    end
+
+    # A managed enterprise agent can attach its extension identifier after the
+    # transport client has been constructed. Reset cached connections so the
+    # next request receives the updated, content-free attribution header.
+    def enterprise_application_id=(value)
+      normalized = normalize_enterprise_application_id(value)
+      return if normalized == @enterprise_application_id
+
+      @enterprise_application_id = normalized
+      reset_connections!
     end
 
     # Returns true when the client is using the AWS Bedrock Converse API.
@@ -684,6 +696,7 @@ module Clacky
         @bedrock_connection = Faraday.new(url: @base_url) do |conn|
           conn.headers["Content-Type"]  = "application/json"
           conn.headers["Authorization"] = "Bearer #{@api_key}"
+          apply_enterprise_application_header(conn)
           conn.options.timeout      = @read_timeout || 300
           conn.options.open_timeout = 10
           conn.ssl.verify           = false
@@ -701,6 +714,7 @@ module Clacky
         @openai_connection = Faraday.new(url: @base_url) do |conn|
           conn.headers["Content-Type"]  = "application/json"
           conn.headers["Authorization"] = "Bearer #{@api_key}"
+          apply_enterprise_application_header(conn)
           conn.options.timeout      = @read_timeout || 300
           conn.options.open_timeout = 10
           conn.ssl.verify           = false
@@ -720,6 +734,7 @@ module Clacky
           conn.headers["x-api-key"]      = @api_key
           conn.headers["anthropic-version"] = "2023-06-01"
           conn.headers["anthropic-dangerous-direct-browser-access"] = "true"
+          apply_enterprise_application_header(conn)
           if @provider_id == Clacky::Providers::OPENROUTER_ID
             conn.headers["Authorization"] = "Bearer #{@api_key}"
           end
@@ -736,6 +751,20 @@ module Clacky
         @anthropic_connection_epoch = current_epoch
       end
       @anthropic_connection
+    end
+
+    private def normalize_enterprise_application_id(value)
+      candidate = value.to_s.strip
+      return nil if candidate.empty?
+      return candidate if candidate.match?(/\A[a-z0-9][a-z0-9._-]{0,127}\z/i)
+
+      nil
+    end
+
+    private def apply_enterprise_application_header(connection)
+      return unless @enterprise_application_id
+
+      connection.headers["X-OpenClacky-Application-ID"] = @enterprise_application_id
     end
 
     # Correct relative path for the Anthropic /v1/messages endpoint, accounting

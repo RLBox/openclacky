@@ -77,6 +77,7 @@ module Clacky
       @client = client  # Client for current model
       @config = config.is_a?(AgentConfig) ? config : AgentConfig.new(config)
       @agent_profile = AgentProfile.load(profile)
+      configure_enterprise_application_context!
       @source = source.to_sym  # :manual | :cron | :channel
       @channel_info = nil  # { platform:, user_id:, user_name:, chat_id: } set by ChannelManager
       @tool_registry = ToolRegistry.new
@@ -232,13 +233,27 @@ module Clacky
         anthropic_format: @config.anthropic_format?,
         api_format: @config.api_format,
         provider_id: @config.provider_id_for(entry),
-        capabilities: entry && entry["capabilities"]
+        capabilities: entry && entry["capabilities"],
+        enterprise_application_id: current_enterprise_application_id
       )
       # Update message compressor with new client and model
       @message_compressor = MessageCompressor.new(@client, model: current_model)
 
       # Inject a new session context to notify the AI of the model switch
       inject_session_context
+    end
+
+    private def configure_enterprise_application_context!
+      return unless @client.respond_to?(:enterprise_application_id=)
+
+      @client.enterprise_application_id = current_enterprise_application_id
+    end
+
+    private def current_enterprise_application_id(config = @config)
+      entry = config.current_model
+      return unless entry && entry["enterprise_managed"] == true
+
+      @agent_profile.enterprise_application_id
     end
 
     # Change the working directory for this session
@@ -1966,7 +1981,8 @@ module Clacky
         anthropic_format: subagent_config.anthropic_format?,
         api_format: subagent_config.api_format,
         provider_id: subagent_config.provider_id_for(subagent_entry),
-        capabilities: subagent_entry && subagent_entry["capabilities"]
+        capabilities: subagent_entry && subagent_entry["capabilities"],
+        enterprise_application_id: current_enterprise_application_id(subagent_config)
       )
 
       # Create subagent (reuses all tools from parent, inherits agent profile from parent)

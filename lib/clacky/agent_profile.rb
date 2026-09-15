@@ -68,6 +68,18 @@ module Clacky
       @ext_unit&.dir
     end
 
+    # Stable enterprise application identifier for usage attribution. Only
+    # enterprise-delivered agents participate: local/user and marketplace
+    # agents must never make a managed model request fail merely because the
+    # control plane does not know about their container.
+    def enterprise_application_id
+      return if File.file?(File.join(user_agent_dir, "profile.yml"))
+      return unless @ext_unit&.origin.to_s == "enterprise"
+
+      identifier = @ext_unit.ext_id.to_s.strip
+      identifier unless identifier.empty?
+    end
+
     # Whether a skill is usable by this agent: it must not be in the agent's
     # disabled list AND must be allowed by the skill's own `agent:` declaration.
     # @param skill [Skill]
