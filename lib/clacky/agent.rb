@@ -77,12 +77,12 @@ module Clacky
       @client = client  # Client for current model
       @config = config.is_a?(AgentConfig) ? config : AgentConfig.new(config)
       @agent_profile = AgentProfile.load(profile)
-      configure_enterprise_application_context!
       @source = source.to_sym  # :manual | :cron | :channel
       @channel_info = nil  # { platform:, user_id:, user_name:, chat_id: } set by ChannelManager
       @tool_registry = ToolRegistry.new
       @hooks = HookManager.new(agent: self)
       @session_id = session_id
+      configure_enterprise_request_context!
       @name = ""
       @pinned = false
       @history = MessageHistory.new
@@ -234,7 +234,8 @@ module Clacky
         api_format: @config.api_format,
         provider_id: @config.provider_id_for(entry),
         capabilities: entry && entry["capabilities"],
-        enterprise_application_id: current_enterprise_application_id
+        enterprise_application_id: current_enterprise_application_id,
+        enterprise_session_id: current_enterprise_session_id
       )
       # Update message compressor with new client and model
       @message_compressor = MessageCompressor.new(@client, model: current_model)
@@ -243,10 +244,12 @@ module Clacky
       inject_session_context
     end
 
-    private def configure_enterprise_application_context!
+    private def configure_enterprise_request_context!
       return unless @client.respond_to?(:enterprise_application_id=)
 
       @client.enterprise_application_id = current_enterprise_application_id
+      @client.enterprise_session_id = current_enterprise_session_id if
+        @client.respond_to?(:enterprise_session_id=)
     end
 
     private def current_enterprise_application_id(config = @config)
@@ -254,6 +257,13 @@ module Clacky
       return unless entry && entry["enterprise_managed"] == true
 
       @agent_profile.enterprise_application_id
+    end
+
+    private def current_enterprise_session_id(config = @config)
+      entry = config.current_model
+      return unless entry && entry["enterprise_managed"] == true
+
+      @session_id
     end
 
     # Change the working directory for this session
