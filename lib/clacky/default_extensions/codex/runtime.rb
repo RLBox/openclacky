@@ -6,11 +6,14 @@ require_relative "../../thread_registry"
 require_relative "../../runtime_session"
 require_relative "codex_home"
 require_relative "launcher"
+require_relative "app_server_client"
+require_relative "installer"
+require_relative "process_transport"
 
 module Clacky
   module DefaultExtensions
     module Codex
-      # Owns the shared codex-acp connection, authentication state, and routing
+      # Owns the shared Codex App Server connection, authentication state, and routing
       # for session-scoped notifications and permission requests.
       class Connection
         class UnavailableError < StandardError
@@ -24,9 +27,6 @@ module Clacky
 
         CONTROL_TIMEOUT = 5
         INITIALIZE_TIMEOUT = 15
-        # The first npx launch may need to fetch the platform-specific Codex
-        # package (currently over 100 MB) before ACP initialization can begin.
-        NPX_INITIALIZE_TIMEOUT = 300
         AUTHENTICATION_TIMEOUT = 300
         AUTH_STATUS_WAIT = 0.25
         MAX_MESSAGE_BYTES = 8 * 1024 * 1024
@@ -59,7 +59,8 @@ module Clacky
           @auth_error = nil
           @authenticating = false
           @auth_thread = nil
-          @auth_push_supported = false
+          @auth_push_supported = true
+          @auth_url = nil
         end
 
         def client_with_generation
@@ -79,27 +80,32 @@ module Clacky
         end
 
         def status
-          ensure_client
-          wait_for_initial_auth_status if @auth_push_supported
+          client = ensure_client
+          if client.respond_to?(:account_status)
+            refresh_current_account_status(client)
+          else
+            wait_for_initial_auth_status if @auth_push_supported
+          end
           status_snapshot
         rescue UnavailableError => e
           unavailable_status(e.code, e.message)
         rescue StandardError
           unavailable_status(
-            "acp_unavailable",
-            "OpenClacky could not start the Codex ACP runtime."
+            "codex_runtime_unavailable",
+            "OpenClacky could not start the Codex runtime."
           )
         end
 
         # Readiness view for GET endpoints. It never prepares a home, resolves
-        # npx, or starts a process; those side effects require an explicit POST
+        # the CLI, or starts a process; those side effects require an explicit POST
         # to connect/authenticate or a real runtime health check.
         def passive_status
           client, closed = @lifecycle_mutex.synchronize { [@client, @closed] }
-          return unavailable_status("connection_closed", "The Codex ACP connection is closed.") if closed
+          return unavailable_status("connection_closed", "The Codex connection is closed.") if closed
 
           if client && client.initialized? &&
              (!client.respond_to?(:alive?) || client.alive?)
+            refresh_current_account_status(client) if client.respond_to?(:account_status)
             return status_snapshot
           end
 
@@ -107,7 +113,7 @@ module Clacky
           if launch && !launch.available?
             return unavailable_status(
               launch.error_code || "launcher_unavailable",
-              launch.message || "Codex ACP launch dependencies are unavailable."
+              launch.message || "Codex launch dependencies are unavailable."
             )
           end
 
@@ -122,8 +128,8 @@ module Clacky
           }
         rescue StandardError
           unavailable_status(
-            "acp_unavailable",
-            "OpenClacky could not inspect the Codex ACP runtime."
+            "codex_runtime_unavailable",
+            "OpenClacky could not inspect the Codex runtime."
           )
         end
 
@@ -148,32 +154,36 @@ module Clacky
 
         def authenticate_async
           client, generation = client_with_generation
-          unless client.auth_methods.any? { |method| method["id"].to_s == "chat-gpt" }
+          unless client.respond_to?(:start_chatgpt_login)
+            return authenticate_legacy_async(client, generation)
+          end
+
+          result = client.start_chatgpt_login(timeout: CONTROL_TIMEOUT)
+          auth_url = result && result["authUrl"].to_s
+          login_id = result && result["loginId"].to_s
+          if auth_url.empty? || login_id.empty?
             return {
               ok: false,
               started: false,
-              status: "unavailable",
-              error_code: "chatgpt_auth_unavailable",
-              message: "The Codex ACP runtime did not advertise ChatGPT browser login."
+              status: "error",
+              error_code: "authentication_start_failed",
+              message: "Codex did not return a ChatGPT login URL."
             }
           end
 
-          @auth_mutex.synchronize do
-            if @auth_thread&.alive? && @auth_thread_generation == generation
-              return { ok: true, started: false, status: "authenticating" }
-            end
-
-            @state_mutex.synchronize do
-              @authenticating = true
-              @auth_error = nil
-              @state_condition.broadcast
-            end
-            @auth_thread_generation = generation
-            @auth_thread = spawn_thread("codex-acp-authenticate") do
-              run_authentication(client, generation)
-            end
+          @state_mutex.synchronize do
+            @authenticating = true
+            @auth_error = nil
+            @auth_url = auth_url
+            @state_condition.broadcast
           end
-          { ok: true, started: true, status: "authenticating" }
+          {
+            ok: true,
+            started: true,
+            status: "authenticating",
+            auth_url: auth_url,
+            login_id: login_id
+          }
         rescue UnavailableError => e
           {
             ok: false,
@@ -192,8 +202,6 @@ module Clacky
           }
         end
 
-        # Open a short-lived, unbound ACP session to read the account-scoped
-        # model catalog before OpenClacky creates a user-visible conversation.
         def discover_models(working_dir: Dir.pwd)
           snapshot = nil
           @discovery_mutex.synchronize do
@@ -217,35 +225,35 @@ module Clacky
               ).merge(status: "error")
             end
 
-            session_id = nil
             begin
-              response = client.request(
-                "session/new",
-                {
-                  "cwd" => File.expand_path(working_dir.to_s),
-                  "mcpServers" => []
-                },
-                timeout: nil
-              )
-              session_id = response["sessionId"].to_s.strip
-              if session_id.empty?
-                raise UnavailableError.new(
-                  "model_discovery_failed",
-                  "ChatGPT did not return a discovery session."
+              if client.respond_to?(:model_catalog)
+                catalog = client.model_catalog(timeout: INITIALIZE_TIMEOUT)
+                visible = Array(catalog).reject { |entry| entry["hidden"] == true }
+                models = visible.filter_map do |entry|
+                  bounded_string(entry["id"] || entry["model"])
+                end.reject(&:empty?).uniq.first(100)
+                default_entry = visible.find { |entry| entry["isDefault"] == true }
+                current = bounded_string(default_entry && (default_entry["id"] || default_entry["model"]))
+              else
+                response = client.request(
+                  "session/new",
+                  { "cwd" => File.expand_path(working_dir.to_s), "mcpServers" => [] },
+                  timeout: nil
                 )
+                session_id = response["sessionId"].to_s.strip
+                raise UnavailableError.new("model_discovery_failed", "ChatGPT did not return a discovery session.") if session_id.empty?
+                model_option = Array(response["configOptions"]).find do |option|
+                  option.is_a?(Hash) && option["id"].to_s == "model"
+                end
+                models = discovery_model_values(model_option && model_option["options"])
+                current = bounded_string(model_option && model_option["currentValue"])
               end
-
-              model_option = Array(response["configOptions"]).find do |option|
-                option.is_a?(Hash) && option["id"].to_s == "model"
-              end
-              models = discovery_model_values(model_option && model_option["options"])
               if models.empty?
                 raise UnavailableError.new(
                   "model_discovery_failed",
                   "ChatGPT did not advertise any available models."
                 )
               end
-              current = bounded_string(model_option["currentValue"])
               current = models.first unless models.include?(current)
               discovery_result(
                 snapshot,
@@ -270,15 +278,9 @@ module Clacky
               ).merge(status: "error")
             ensure
               if session_id && !session_id.empty?
-                begin
-                  client.request(
-                    "session/close",
-                    { "sessionId" => session_id },
-                    timeout: CONTROL_TIMEOUT
-                  )
-                rescue StandardError
-                  nil
-                end
+                client.request(
+                  "session/close", { "sessionId" => session_id }, timeout: CONTROL_TIMEOUT
+                ) rescue nil
               end
             end
           end
@@ -330,7 +332,7 @@ module Clacky
           @turns_mutex.synchronize do
             @lifecycle_mutex.synchronize do
               raise UnavailableError.new(
-                "connection_closed", "The Codex ACP connection is closed."
+                "connection_closed", "The Codex connection is closed."
               ) if @closed
             end
             @active_turns[runtime.object_id] = runtime
@@ -343,7 +345,7 @@ module Clacky
           true
         end
 
-        # Stop a wedged ACP process only if it is still the exact connection
+        # Stop a wedged App Server process only if it is still the exact connection
         # generation observed by the cancelled request. A stale watchdog must
         # never tear down a replacement process started by a later turn.
         def restart_if_generation(client, generation, requester: nil)
@@ -406,7 +408,7 @@ module Clacky
         private def ensure_client_locked
           if @closed
             raise UnavailableError.new(
-              "connection_closed", "The Codex ACP connection is closed."
+              "connection_closed", "The Codex connection is closed."
             )
           end
           if @client && @client.initialized? &&
@@ -430,7 +432,7 @@ module Clacky
           unless launch.available?
             raise UnavailableError.new(
               launch.error_code || "launcher_unavailable",
-              launch.message || "Codex ACP launch dependencies are unavailable."
+              launch.message || "Codex launch dependencies are unavailable."
             )
           end
 
@@ -444,13 +446,18 @@ module Clacky
               "title" => "OpenClacky",
               "version" => Clacky.const_defined?(:VERSION) ? Clacky::VERSION.to_s : "unknown"
             },
-            capabilities: client_capabilities,
-            timeout: launch.source == :npx ? NPX_INITIALIZE_TIMEOUT : INITIALIZE_TIMEOUT
+            capabilities: client_capabilities(client),
+            timeout: INITIALIZE_TIMEOUT
           )
 
-          capabilities = client.agent_capabilities
-          @auth_push_supported = !capabilities.dig("_meta", "authStatus").nil?
-          refresh_legacy_auth_status(client) unless @auth_push_supported
+          if client.respond_to?(:account_status)
+            @auth_push_supported = true
+            apply_auth_status(client.account_status(timeout: CONTROL_TIMEOUT))
+          else
+            capabilities = client.agent_capabilities
+            @auth_push_supported = !capabilities.dig("_meta", "authStatus").nil?
+            refresh_legacy_auth_status(client) unless @auth_push_supported
+          end
           @generation += 1
           @client = client
         rescue StandardError
@@ -503,7 +510,9 @@ module Clacky
           end
         end
 
-        private def client_capabilities
+        private def client_capabilities(client = nil)
+          return { "experimentalApi" => true } if client.is_a?(AppServerClient)
+
           {
             "fs" => { "readTextFile" => false, "writeTextFile" => false },
             "terminal" => false,
@@ -516,7 +525,6 @@ module Clacky
         private def build_launcher(home_result)
           Launcher.new(
             codex_home: home_result.managed_home,
-            explicit_path: ENV["CLACKY_CODEX_ACP_PATH"],
             codex_path: ENV["CLACKY_CODEX_PATH"],
             protected_auth_paths: home_result.respond_to?(:protected_auth_paths) ?
               home_result.protected_auth_paths : [],
@@ -526,15 +534,15 @@ module Clacky
         end
 
         private def build_client(launch)
-          transport = Clacky::Acp::ProcessTransport.new(
-            name: "codex-acp",
+          transport = ProcessTransport.new(
+            name: "codex-app-server",
             argv: launch.argv,
             env: launch.env,
             cwd: launch.cwd,
             max_message_bytes: MAX_MESSAGE_BYTES,
             stderr_bytes: STDERR_BYTES
           )
-          Clacky::Acp::Client.new(transport: transport)
+          AppServerClient.new(transport: transport)
         end
 
         private def reset_connection_auth_state
@@ -542,6 +550,7 @@ module Clacky
             @auth_state = nil
             @auth_error = nil
             @authenticating = false
+            @auth_url = nil
           end
         end
 
@@ -550,7 +559,25 @@ module Clacky
             "authentication/status", {}, timeout: CONTROL_TIMEOUT
           )
           apply_auth_status(result)
-        rescue Clacky::Acp::Client::Error
+        rescue JsonRpcClient::Error
+          nil
+        end
+
+        # App Server writes browser-login credentials into CODEX_HOME before a
+        # completion notification is guaranteed to reach every embedding host.
+        # Treat account/read as the source of truth for status/recheck calls.
+        # An unauthenticated read while the browser flow is still open is only
+        # an intermediate observation and must not cancel that flow.
+        private def refresh_current_account_status(client)
+          raw_status = client.account_status(timeout: CONTROL_TIMEOUT)
+          normalized = normalize_auth_status(raw_status)
+          return unless normalized
+
+          authenticating = @state_mutex.synchronize { @authenticating }
+          return if authenticating && normalized[:authenticated] != true
+
+          apply_auth_status(raw_status)
+        rescue JsonRpcClient::Error
           nil
         end
 
@@ -561,6 +588,13 @@ module Clacky
           @state_mutex.synchronize do
             @auth_state = normalized
             @auth_error = nil
+            # App Server only publishes an auth status update when the account
+            # state has settled. A failed/cancelled browser login must therefore
+            # stop polling just like a successful login.
+            @authenticating = false
+            # The URL is tied to a single login attempt. Keeping it after a
+            # cancelled or expired attempt makes the UI offer a dead session.
+            @auth_url = nil
             @state_condition.broadcast
           end
         end
@@ -572,7 +606,7 @@ module Clacky
           case kind
           when "none", "unauthenticated"
             { authenticated: false, kind: kind, label: safe_label(raw_status) }
-          when "account", "chat-gpt", "api_key", "api-key", "gateway", "external"
+          when "account", "chatgpt", "chat-gpt", "api_key", "api-key", "gateway", "external"
             { authenticated: true, kind: kind, label: safe_label(raw_status) }
           else
             nil
@@ -634,7 +668,8 @@ module Clacky
             {
               auth_state: @auth_state && @auth_state.dup,
               auth_error: @auth_error,
-              authenticating: @authenticating
+              authenticating: @authenticating,
+              auth_url: @auth_url
             }
           end
           launch = @launcher_result
@@ -663,6 +698,7 @@ module Clacky
           payload[:label] = auth_state[:label] if auth_state && auth_state[:label]
           payload[:launcher] = launch.source.to_s if launch&.source
           payload[:version] = launch.version if launch&.version
+          payload[:auth_url] = state[:auth_url] if state[:auth_url]
           if state[:auth_error]
             payload[:error_code] = "authentication_failed"
             payload[:message] = "ChatGPT authentication did not complete. Try again."
@@ -684,6 +720,7 @@ module Clacky
             auth_reused: home && home.auth_reused == true,
             auth_reason: home && home.auth_reason,
             can_authenticate: false,
+            can_install: code.to_s == "codex_cli_missing",
             error_code: code.to_s,
             message: message.to_s
           }
@@ -724,7 +761,7 @@ module Clacky
               @auth_error = nil
             end
           end
-        rescue Clacky::Acp::Client::RequestTimeout
+        rescue JsonRpcClient::RequestTimeout
           restarted = restart_if_generation(client, generation)
           unless restarted
             if current_client_generation?(client, generation)
@@ -748,6 +785,32 @@ module Clacky
               @auth_thread_generation = nil
             end
           end
+        end
+
+        private def authenticate_legacy_async(client, generation)
+          unless client.auth_methods.any? { |method| method["id"].to_s == "chat-gpt" }
+            return {
+              ok: false, started: false, status: "unavailable",
+              error_code: "chatgpt_auth_unavailable",
+              message: "The Codex runtime did not advertise ChatGPT browser login."
+            }
+          end
+
+          @auth_mutex.synchronize do
+            if @auth_thread&.alive? && @auth_thread_generation == generation
+              return { ok: true, started: false, status: "authenticating" }
+            end
+            @state_mutex.synchronize do
+              @authenticating = true
+              @auth_error = nil
+              @state_condition.broadcast
+            end
+            @auth_thread_generation = generation
+            @auth_thread = spawn_thread("codex-authenticate") do
+              run_authentication(client, generation)
+            end
+          end
+          { ok: true, started: true, status: "authenticating" }
         end
 
         private def current_client_generation?(client, generation)
@@ -779,8 +842,9 @@ module Clacky
         end
       end
 
-      # Implements one OpenClacky agent-runtime instance over a shared ACP v1
-      # connection. The host remains authoritative for transcript and queueing.
+      # Implements one OpenClacky agent-runtime instance over a shared Codex
+      # App Server connection. The host remains authoritative for transcript
+      # and queueing.
       class Runtime
         class Error < StandardError; end
         class BusyError < Error; end
@@ -826,6 +890,23 @@ module Clacky
             connection.authenticate_async
           end
 
+          def install_cli
+            install_mutex.synchronize do
+              result = Installer.new.install
+              unless result.ok
+                return {
+                  ok: false,
+                  status: "unavailable",
+                  error_code: result.error_code,
+                  message: result.message
+                }
+              end
+
+              shutdown
+              status.merge(ok: true, installed: true, message: result.message)
+            end
+          end
+
           def discover_models(working_dir: Dir.pwd)
             connection.discover_models(working_dir: working_dir)
           end
@@ -856,6 +937,10 @@ module Clacky
 
           private def connection_mutex
             @connection_mutex ||= Mutex.new
+          end
+
+          private def install_mutex
+            @install_mutex ||= Mutex.new
           end
         end
 
@@ -913,7 +998,7 @@ module Clacky
           }
         end
 
-        # ACP owns the model catalog for an opened session. Keep this as a
+        # Codex owns the model catalog for an opened session. Keep this as a
         # runtime-native capability rather than treating it as an API-provider
         # sub-model overlay.
         def model_options
@@ -1000,7 +1085,7 @@ module Clacky
         rescue TurnCancelled
           discard_cancelled_external_session(client) unless prompt_sent
           { stop_reason: "cancelled", awaiting_user_feedback: false }
-        rescue Clacky::Acp::Client::TransportError
+        rescue JsonRpcClient::TransportError
           raise unless turn_cancelled?
 
           discard_cancelled_external_session(client)
@@ -1261,7 +1346,7 @@ module Clacky
           end
           return false unless spawn
 
-          spawn_thread("codex-acp-cancel-watchdog") do
+          spawn_thread("codex-app-server-cancel-watchdog") do
             watch_cancelled_turn(turn_token)
           end
           true
@@ -1472,7 +1557,7 @@ module Clacky
               accept_opened_session(client, generation, old_session_id, response)
               configure_open_session(client, generation)
               return client
-            rescue Clacky::Acp::Client::ProtocolError => e
+            rescue JsonRpcClient::ProtocolError => e
               raise unless missing_resumed_session?(e, old_session_id)
 
               emit_event(
@@ -1489,7 +1574,7 @@ module Clacky
             "session/new", session_open_params, timeout: nil
           )
           session_id = response["sessionId"].to_s
-          raise Error, "Codex ACP did not return a session id" if session_id.empty?
+          raise Error, "Codex did not return a session id" if session_id.empty?
 
           discard_opened_session_if_closed!(client, session_id)
           accept_opened_session(client, generation, session_id, response,
@@ -1547,7 +1632,7 @@ module Clacky
           bound = @connection.bind_session(
             self, session_id, previous_session_id: previous_session_id
           )
-          raise Error, "Codex ACP session is already owned locally" unless bound
+          raise Error, "Codex session is already owned locally" unless bound
 
           @state_mutex.synchronize do
             @external_session_id = session_id
@@ -1716,13 +1801,13 @@ module Clacky
             files.each do |file|
               image = image_block(file)
               if image
-                raise UnsupportedInput, "Codex ACP does not support image input" unless supports_images
+                raise UnsupportedInput, "Codex does not support image input" unless supports_images
 
                 blocks << image
               else
                 resource_link = resource_link_block(file)
                 unless resource_link
-                  raise UnsupportedInput, "Codex ACP cannot represent this attachment"
+                  raise UnsupportedInput, "Codex cannot represent this attachment"
                 end
 
                 blocks << resource_link
@@ -1731,7 +1816,7 @@ module Clacky
           end
           blocks
         rescue JSON::GeneratorError
-          raise UnsupportedInput, "Codex ACP cannot represent the supplied context"
+          raise UnsupportedInput, "Codex cannot represent the supplied context"
         end
 
         private def image_block(file)

@@ -632,7 +632,7 @@ module Clacky
           20
         elsif path == "/api/config/test"
           # Runtime providers may need to download and resolve a pinned local
-          # adapter on first use. Codex ACP permits up to five minutes for that
+          # CLI on first use. Codex may need up to five minutes for that
           # cold start; keep the outer HTTP guard slightly larger.
           330
         elsif path.end_with?("/benchmark")
@@ -3703,11 +3703,6 @@ module Clacky
         return false if method.to_s.upcase == "OPTIONS"
         return true if websocket_upgrade?(req)
 
-        extension_requires = Clacky::Server::ApiExtensionDispatcher.same_origin_path?(
-          path,
-          method
-        )
-        return true if extension_requires
         return false unless path.to_s.start_with?("/api/")
 
         !Clacky::Server::ApiExtensionDispatcher.public_path?(path, method)
@@ -8253,7 +8248,7 @@ module Clacky
         begin
           if session[:status] == :running
             if runtime_session?(agent)
-              # ACP sessions are single-flight. Put the claimed entry back at
+              # Runtime sessions are single-flight. Put the claimed entry back at
               # the head and let the current worker consume it only after the
               # cancelled prompt has actually returned.
               agent.restore_pending_input(entry)
@@ -8277,7 +8272,7 @@ module Clacky
         session = @registry.get(session_id)
         mode = @agent_config.input_behavior
 
-        # ACP v1 has no standard steering method and each provider session is
+        # Runtime providers have no common steering method and each session is
         # single-flight. Queue a replacement on the existing worker, then send
         # protocol cancellation; the worker drains it only after the original
         # session/prompt response has crossed the true completion barrier.
@@ -8802,59 +8797,12 @@ module Clacky
         @agent_config&.default_working_dir || File.expand_path("~/clacky_workspace")
       end
 
-      # Invalid extension contributions are reported by the extension verifier,
-      # but they must not prevent the HTTP server from starting. Keep the
-      # registry classes strict for direct callers while filtering only the
-      # process-level view assembled by the server.
       private def build_provider_registry
-        units = safe_registry_units(
-          :providers,
-          reserved_ids: Clacky::Providers::PRESETS.keys
-        )
-        runtime_ids = safe_registry_units(:agent_runtimes).map { |unit| unit.id.to_s }
-        units = units.reject do |unit|
-          runtime_id = unit.spec["runtime_id"].to_s
-          dangling = !runtime_id.empty? && !runtime_ids.include?(runtime_id)
-          if dangling
-            Clacky::Logger.warn(
-              "[HttpServer] skipped provider '#{unit.id}' with unavailable runtime '#{runtime_id}'"
-            )
-          end
-          dangling
-        end
-        Clacky::ProviderRegistry.new(extension_units: units)
+        Clacky::ProviderRegistry.new
       end
 
       private def build_runtime_registry
-        units = safe_registry_units(:agent_runtimes)
-        Clacky::AgentRuntimeRegistry.new(extension_units: units)
-      end
-
-      private def safe_registry_units(kind, reserved_ids: [])
-        result = Clacky::ExtensionLoader.last_result
-        units = result.respond_to?(kind) ? Array(result.public_send(kind)) : []
-        counts = units.each_with_object(Hash.new(0)) do |unit, memo|
-          memo[unit.id.to_s] += 1 if unit.respond_to?(:id)
-        end
-        reserved = Array(reserved_ids).map(&:to_s)
-        accepted, rejected = units.partition do |unit|
-          id = unit.respond_to?(:id) ? unit.id.to_s : ""
-          spec = unit.respond_to?(:spec) ? unit.spec : nil
-          !id.empty? && spec.is_a?(Hash) && counts[id] == 1 &&
-            !reserved.include?(id)
-        end
-        unless rejected.empty?
-          ids = rejected.map { |unit| unit.respond_to?(:id) ? unit.id.to_s : "?" }
-          Clacky::Logger.warn(
-            "[HttpServer] skipped invalid #{kind}: #{ids.uniq.join(', ')}"
-          )
-        end
-        accepted
-      rescue StandardError => e
-        Clacky::Logger.warn(
-          "[HttpServer] failed to assemble #{kind}: #{e.class}: #{e.message}"
-        )
-        []
+        Clacky::AgentRuntimeRegistry.new
       end
 
       # Create a session in the registry and wire up Agent + WebUIController.

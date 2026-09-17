@@ -9,6 +9,7 @@
   <link rel="stylesheet" href="/vendor/katex/katex.min.css">
   <link rel="stylesheet" href="/vendor/hljs/hljs-theme.css">
   <link rel="stylesheet" href="/app.css">
+  <link rel="stylesheet" href="/codex-runtime.css">
   <script>
     // Inline theme init — must run before CSS renders to prevent flash of wrong theme.
     (function() {
@@ -1652,7 +1653,7 @@
         </div>
       </div>
 
-      <div class="setup-field" id="setup-model-field">
+      <div class="setup-field" id="setup-model-field" style="display:none">
         <label class="setup-label" data-i18n="onboard.key.model">Model</label>
         <div class="model-name-combobox">
           <input id="setup-model" type="text" class="setup-input model-name-input" data-i18n-placeholder="settings.models.placeholder.model" placeholder="e.g. claude-sonnet-4-5">
@@ -1663,7 +1664,7 @@
         </div>
       </div>
 
-      <div id="setup-api-fields" class="runtime-api-fields">
+      <div id="setup-api-fields" class="runtime-api-fields" style="display:none">
 
       <div class="setup-field">
         <label class="setup-label" data-i18n="onboard.key.baseurl">Base URL</label>
@@ -1714,7 +1715,7 @@
 
       <div class="setup-key-actions">
         <button id="setup-btn-back" class="setup-back-btn" data-i18n="onboard.key.btn.back">← Back</button>
-        <button id="setup-btn-test" class="setup-submit-btn" data-i18n="onboard.key.btn.test">Test & Continue →</button>
+        <button id="setup-btn-test" class="setup-submit-btn" data-i18n="onboard.key.btn.test" disabled>Test & Continue →</button>
       </div>
       </div>
     </div>

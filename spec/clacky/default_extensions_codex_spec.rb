@@ -19,40 +19,26 @@ RSpec.describe "bundled Codex extension" do
     Clacky::ExtensionLoader.invalidate_cache!
   end
 
-  it "is enabled by default and contributes its provider, runtime, and status API" do
+  it "is enabled by default and contributes its status API" do
     result = Clacky::ExtensionLoader.load_all(
       layers: { builtin: Clacky::ExtensionLoader::BUILTIN_DIR },
       force: true
     )
     container = result.containers["codex"]
-    provider = result.providers.find { |unit| unit.id == "codex" }
-    runtime = result.agent_runtimes.find { |unit| unit.id == "codex" }
     api = result.api.find { |unit| unit.id == "codex" }
 
     expect(container).not_to be_nil
     expect(container[:disabled]).to be false
     expect(result.errors.select { |error| error.ext_id == "codex" }).to be_empty
-    expect(provider.spec).to include(
-      "name" => "ChatGPT",
-      "name_key" => "provider.name.codex",
-      "runtime_id" => "codex",
-      "auth_mode" => "runtime",
-      "credential_fields" => [],
-      "dynamic_models" => "discovery"
-    )
-    expect(runtime.spec).to include(
-      "adapter" => "runtime.rb",
-      "class" => "Clacky::DefaultExtensions::Codex::Runtime"
-    )
     expect(api.spec["handler"]).to eq("api/handler.rb")
   end
 
   it "is visible through the provider registry before any model is configured" do
-    result = Clacky::ExtensionLoader.load_all(
+    Clacky::ExtensionLoader.load_all(
       layers: { builtin: Clacky::ExtensionLoader::BUILTIN_DIR },
       force: true
     )
-    registry = Clacky::ProviderRegistry.new(extension_units: result.providers)
+    registry = Clacky::ProviderRegistry.new
 
     expect(registry["codex"]).to include(
       "runtime_id" => "codex",
@@ -64,11 +50,11 @@ RSpec.describe "bundled Codex extension" do
   end
 
   it "ships a loadable runtime adapter shell" do
-    result = Clacky::ExtensionLoader.load_all(
+    Clacky::ExtensionLoader.load_all(
       layers: { builtin: Clacky::ExtensionLoader::BUILTIN_DIR },
       force: true
     )
-    registry = Clacky::AgentRuntimeRegistry.new(extension_units: result.agent_runtimes)
+    registry = Clacky::AgentRuntimeRegistry.new
 
     runtime = registry.build("codex", session_id: "session-1")
 
@@ -644,575 +630,125 @@ RSpec.describe "Codex managed home" do
   end
 end
 
-RSpec.describe "Codex ACP launcher" do
-  let(:tmpdir) { Dir.mktmpdir("clacky-codex-launcher") }
+RSpec.describe "Codex CLI App Server launcher" do
+  let(:tmpdir) { Dir.mktmpdir("clacky-codex-cli-launcher") }
   let(:codex_home) { File.join(tmpdir, "codex-home") }
-  let(:missing) { File.join(tmpdir, "missing") }
 
   after do
     FileUtils.remove_entry(tmpdir) if Dir.exist?(tmpdir)
   end
 
   def launcher_class
-    path = File.join(
-      Clacky::ExtensionLoader::BUILTIN_DIR,
-      "codex",
-      "launcher.rb"
-    )
-    expect(File.file?(path)).to be(true), "expected bundled Codex launcher at #{path}"
-    require path
     Clacky::DefaultExtensions::Codex::Launcher
   end
 
-  def write_executable(path)
-    FileUtils.mkdir_p(File.dirname(path))
-    File.write(path, "#!/bin/sh\nexit 0\n")
-    File.chmod(0o700, path)
-    path
+  def executable(name = "codex")
+    filename = File.join(tmpdir, "bin", name)
+    FileUtils.mkdir_p(File.dirname(filename))
+    File.write(filename, "#!/bin/sh\nexit 0\n")
+    File.chmod(0o700, filename)
+    filename
   end
 
-  def build_launcher(**options)
-    if options[:explicit_path] && !options.key?(:path)
-      node_dir = File.join(tmpdir, "explicit-node")
-      node = write_executable(File.join(node_dir, "node"))
-      previous_probe = options[:version_probe]
-      options[:path] = node_dir
-      options[:version_probe] = lambda do |path|
-        path == node ? "v20.11.1" : previous_probe&.call(path)
-      end
-    end
+  def build_cli_launcher(**options)
     launcher_class.new(
       **{
         codex_home: codex_home,
-        packaged_node: missing,
-        packaged_entrypoint: missing,
         path: "",
-      base_env: {},
-        adapter_digest: ->(_path) { launcher_class::ADAPTER_SOURCE_SHA256 },
-        codex_package_probe: ->(_path) { launcher_class::CODEX_VERSION }
+        base_env: { "PATH" => "/safe/bin", "OPENAI_API_KEY" => "secret" },
+        known_candidates: [],
+        version_probe: ->(_path) { "codex-cli 0.154.0" },
+        app_server_probe: ->(_path) { true }
       }.merge(options)
     )
   end
 
-  it "prefers a verified explicit executable" do
-    explicit = write_executable(File.join(tmpdir, "custom-codex-acp"))
+  it "launches App Server directly from an explicitly configured Codex CLI" do
+    codex = executable
+    result = build_cli_launcher(codex_path: codex).resolve
 
-    result = build_launcher(explicit_path: explicit).resolve
-
-    expect(result.available?).to be true
-    expect(result.source).to eq(:explicit)
-    expect(result.argv).to eq([
-      File.join(tmpdir, "explicit-node", "node"),
-      launcher_class::ADAPTER_BOOTSTRAP,
-      launcher_class::BOOTSTRAP_RUN_ARG,
-      File.realpath(explicit)
-    ])
+    expect(result.available?).to be(true)
+    expect(result.argv).to eq([File.realpath(codex), "app-server", "--stdio"])
+    expect(result.source).to eq(:configured)
+    expect(result.version).to eq("0.154.0")
+    expect(result.env).to include("CODEX_HOME" => File.expand_path(codex_home))
+    expect(result.env).not_to have_key("OPENAI_API_KEY")
   end
 
-  it "rejects an invalid explicit executable instead of silently falling back" do
-    result = build_launcher(explicit_path: File.join(tmpdir, "not-executable")).resolve
+  it "finds Codex on PATH without requiring Node or npx" do
+    codex = executable
+    result = build_cli_launcher(path: File.dirname(codex)).resolve
 
-    expect(result.available?).to be false
-    expect(result.error_code).to eq("invalid_explicit_path")
-    expect(result.message).to match(/executable/i)
+    expect(result.available?).to be(true)
+    expect(result.source).to eq(:path)
+    expect(result.argv.first).to eq(File.realpath(codex))
   end
 
-  it "rejects an explicit adapter whose published source digest does not match" do
-    explicit = write_executable(File.join(tmpdir, "custom-codex-acp"))
+  it "reports a CLI-only install action when Codex is absent" do
+    result = build_cli_launcher.resolve
 
-    result = build_launcher(
-      explicit_path: explicit,
-      adapter_digest: ->(_path) { "0" * 64 }
+    expect(result.available?).to be(false)
+    expect(result.error_code).to eq("codex_cli_missing")
+    expect(result.message).to include("Codex CLI")
+  end
+
+  it "rejects an old CLI that does not include App Server" do
+    result = build_cli_launcher(
+      codex_path: executable,
+      app_server_probe: ->(_path) { false }
     ).resolve
 
     expect(result.available?).to be(false)
-    expect(result.error_code).to eq("unverified_explicit_path")
-    expect(result.message).to match(/SHA-256/)
+    expect(result.error_code).to eq("codex_cli_too_old")
+  end
+end
+
+RSpec.describe "Codex CLI installer" do
+  it "allows only the public entry point and OpenAI's exact release host" do
+    expect(Clacky::DefaultExtensions::Codex::Installer::ALLOWED_HOSTS).to contain_exactly(
+      "chatgpt.com", "www.chatgpt.com", "releases.openai.com"
+    )
   end
 
-  it "uses a packaged managed Node and exact adapter entry point before PATH" do
-    node = write_executable(File.join(tmpdir, "package", "node", "bin", "node"))
-    entrypoint = File.join(tmpdir, "package", "node_modules", "@agentclientprotocol", "codex-acp", "dist", "index.js")
-    FileUtils.mkdir_p(File.dirname(entrypoint))
-    File.write(entrypoint, "// packaged adapter")
-    path_dir = File.join(tmpdir, "path-bin")
-    write_executable(File.join(path_dir, "codex-acp"))
+  it "isolates the official checksum download from POSIX shell variable leakage" do
+    installer = Clacky::DefaultExtensions::Codex::Installer.new
+    call = Clacky::DefaultExtensions::Codex::Installer::CHECKSUM_DOWNLOAD
+    script = "before\n#{call}\nafter\n"
 
-    result = build_launcher(
-      packaged_node: node,
-      packaged_entrypoint: entrypoint,
-      path: path_dir,
-      version_probe: ->(_path) { "codex-acp 1.11.0" }
-    ).resolve
+    patched = installer.send(:prepare_script, script)
 
-    expect(result.available?).to be true
-    expect(result.source).to eq(:packaged)
-    expect(result.argv).to eq([
-      File.expand_path(node),
-      launcher_class::ADAPTER_BOOTSTRAP,
-      launcher_class::BOOTSTRAP_RUN_ARG,
-      File.expand_path(entrypoint)
-    ])
-    expect(result.version).to eq("1.11.0")
+    expect(patched).to eq("before\n( #{call} )\nafter\n")
   end
 
-  it "does not automatically trust an installed codex-acp even when versions match" do
-    bin_dir = File.join(tmpdir, "bin")
-    executable = write_executable(File.join(bin_dir, "codex-acp"))
-    node = write_executable(File.join(bin_dir, "node"))
-    npx = write_executable(File.join(bin_dir, "npx"))
-
-    result = build_launcher(
-      path: bin_dir,
-      version_probe: lambda do |path|
-        path == executable ? "codex-acp 1.11.0" : "v20.11.1"
+  it "executes only the downloaded official installer after an explicit call" do
+    executed = nil
+    installer = Clacky::DefaultExtensions::Codex::Installer.new(
+      http_get: ->(_uri) { "#!/bin/sh\necho install\n" },
+      command_runner: lambda do |filename|
+        executed = File.binread(filename)
+        ["installed", "", instance_double(Process::Status, success?: true)]
       end
-    ).resolve
-
-    expect(result.available?).to be true
-    expect(result.source).to eq(:npx)
-    expect(result.argv).to eq([
-      File.expand_path(npx),
-      "-y",
-      "--package=@agentclientprotocol/codex-acp@1.11.0",
-      "--package=@openai/codex@0.153.4",
-      "--",
-      File.expand_path(node),
-      launcher_class::ADAPTER_BOOTSTRAP,
-      launcher_class::BOOTSTRAP_RUN_ARG
-    ])
-    expect(result.version).to eq("1.11.0")
-  end
-
-  it "rejects an implicitly discovered installed adapter without a package-managed fallback" do
-    package_root = File.join(tmpdir, "lib", "node_modules", "@agentclientprotocol", "codex-acp")
-    entrypoint = write_executable(File.join(package_root, "dist", "index.js"))
-    File.write(
-      File.join(package_root, "package.json"),
-      JSON.generate("name" => "@agentclientprotocol/codex-acp", "version" => "1.11.0")
-    )
-    bin_dir = File.join(tmpdir, "bin")
-    FileUtils.mkdir_p(bin_dir)
-    File.symlink(entrypoint, File.join(bin_dir, "codex-acp"))
-    node = write_executable(File.join(bin_dir, "node"))
-    File.write(node, "#!/bin/sh\nprintf 'v20.11.1\\n'\n")
-
-    result = build_launcher(path: bin_dir).resolve
-
-    expect(result.available?).to be false
-    expect(result.error_code).to eq("untrusted_installed_codex_acp")
-    expect(result.message).to match(/not automatically trusted/i)
-    expect(result.message).to match(/operator-trusted/i)
-    expect(result.message).not_to match(/audited/i)
-  end
-
-  it "skips an installed adapter with a drifted Codex dependency and uses the double-pinned fallback" do
-    bin_dir = File.join(tmpdir, "bin")
-    installed = write_executable(File.join(bin_dir, "codex-acp"))
-    node = write_executable(File.join(bin_dir, "node"))
-    npx = write_executable(File.join(bin_dir, "npx"))
-
-    result = build_launcher(
-      path: bin_dir,
-      version_probe: lambda do |path|
-        path == installed ? "codex-acp 1.11.0" : "v20.11.1"
-      end,
-      codex_package_probe: ->(_path) { "0.154.0" }
-    ).resolve
-
-    expect(result.available?).to be(true)
-    expect(result.source).to eq(:npx)
-    expect(result.argv).to eq([
-      File.expand_path(npx),
-      "-y",
-      "--package=@agentclientprotocol/codex-acp@1.11.0",
-      "--package=@openai/codex@0.153.4",
-      "--",
-      File.expand_path(node),
-      launcher_class::ADAPTER_BOOTSTRAP,
-      launcher_class::BOOTSTRAP_RUN_ARG
-    ])
-  end
-
-  it "reports an incompatible installed adapter when no safe fallback exists" do
-    bin_dir = File.join(tmpdir, "bin")
-    executable = write_executable(File.join(bin_dir, "codex-acp"))
-
-    result = build_launcher(
-      path: bin_dir,
-      version_probe: ->(path) { path == executable ? "codex-acp 1.10.0" : nil }
-    ).resolve
-
-    expect(result.available?).to be false
-    expect(result.error_code).to eq("incompatible_codex_acp")
-    expect(result.message).to include("1.11.0")
-  end
-
-  it "rejects a prerelease that only shares the pinned version prefix" do
-    bin_dir = File.join(tmpdir, "bin")
-    executable = write_executable(File.join(bin_dir, "codex-acp"))
-
-    result = build_launcher(
-      path: bin_dir,
-      version_probe: ->(path) { path == executable ? "codex-acp 1.11.0-beta.1" : nil }
-    ).resolve
-
-    expect(result.available?).to be false
-    expect(result.error_code).to eq("incompatible_codex_acp")
-  end
-
-  it "falls back to a pinned npx package only with Node.js 20 or newer" do
-    bin_dir = File.join(tmpdir, "bin")
-    node = write_executable(File.join(bin_dir, "node"))
-    npx = write_executable(File.join(bin_dir, "npx"))
-
-    result = build_launcher(
-      path: bin_dir,
-      version_probe: ->(path) { path == node ? "v20.11.1" : nil }
-    ).resolve
-
-    expect(result.available?).to be true
-    expect(result.source).to eq(:npx)
-    expect(result.argv).to eq([
-      File.expand_path(npx),
-      "-y",
-      "--package=@agentclientprotocol/codex-acp@1.11.0",
-      "--package=@openai/codex@0.153.4",
-      "--",
-      File.expand_path(node),
-      launcher_class::ADAPTER_BOOTSTRAP,
-      launcher_class::BOOTSTRAP_RUN_ARG
-    ])
-    expect(result.cwd).to eq(File.expand_path(codex_home))
-    expect(result.env).to include(
-      "NPM_CONFIG_USERCONFIG" => File::NULL,
-      "NPM_CONFIG_REGISTRY" => "https://registry.npmjs.org/",
-      "NPM_CONFIG_IGNORE_SCRIPTS" => "true"
-    )
-  end
-
-  it "ships a checksum-verified bootstrap that disables project-local Codex config" do
-    node = RbConfig.ruby.sub(/ruby\z/, "node")
-    node = `command -v node`.strip unless File.executable?(node)
-    skip "Node.js is required for the adapter bootstrap test" unless File.executable?(node)
-
-    marker = "projects: Object.fromEntries(sessionRoots.map((root) => [root, {\n" \
-             "        trust_level: \"trusted\"\n" \
-             "      }]))"
-    source = "before\n#{marker}\nafter\n"
-    digest = Digest::SHA256.hexdigest(source)
-    script = <<~JS
-      import { pathToFileURL } from "node:url";
-      const module = await import(pathToFileURL(process.argv[1]).href);
-      const source = process.argv[2];
-      process.stdout.write(module.patchAdapterSource(source, process.argv[3]));
-    JS
-
-    stdout, stderr, status = Open3.capture3(
-      node,
-      "--input-type=module",
-      "-e",
-      script,
-      launcher_class::ADAPTER_BOOTSTRAP,
-      source,
-      digest
     )
 
-    expect(status).to be_success, stderr
-    expect(stdout).to include('trust_level: "untrusted"')
-    expect(stdout).not_to include('trust_level: "trusted"')
-    expect(launcher_class::ADAPTER_SOURCE_SHA256)
-      .to eq("3527bdaf90a219175c742576963e6d9e943e4ea5fbdbc3e04e7f57f9a9e11343")
-    expect(File.read(launcher_class::ADAPTER_BOOTSTRAP))
-      .to include(launcher_class::ADAPTER_SOURCE_SHA256)
+    result = installer.install
+
+    expect(result.ok).to be(true)
+    expect(executed).to eq("#!/bin/sh\necho install\n")
   end
 
-  it "accepts only the exact pinned Codex package beside the adapter" do
-    node = RbConfig.ruby.sub(/ruby\z/, "node")
-    node = `command -v node`.strip unless File.executable?(node)
-    skip "Node.js is required for the adapter bootstrap test" unless File.executable?(node)
-
-    adapter_root = File.join(tmpdir, "node_modules", "@agentclientprotocol", "codex-acp")
-    adapter = File.join(adapter_root, "dist", "index.js")
-    codex_root = File.join(tmpdir, "node_modules", "@openai", "codex")
-    codex_bin = File.join(codex_root, "bin", "codex.js")
-    FileUtils.mkdir_p(File.dirname(adapter))
-    FileUtils.mkdir_p(File.dirname(codex_bin))
-    File.write(adapter, "// adapter")
-    File.write(codex_bin, "#!/usr/bin/env node\n")
-    File.write(
-      File.join(codex_root, "package.json"),
-      JSON.generate("name" => "@openai/codex", "version" => "0.153.4")
-    )
-    script = <<~JS
-      import { pathToFileURL } from "node:url";
-      const module = await import(pathToFileURL(process.argv[1]).href);
-      process.stdout.write(module.resolveVerifiedCodex(process.argv[2], process.argv[3]));
-    JS
-
-    stdout, stderr, status = Open3.capture3(
-      node,
-      "--input-type=module",
-      "-e",
-      script,
-      launcher_class::ADAPTER_BOOTSTRAP,
-      adapter,
-      launcher_class::CODEX_VERSION
-    )
-
-    expect(status).to be_success, stderr
-    expect(stdout).to eq(File.realpath(codex_bin))
-
-    File.write(
-      File.join(codex_root, "package.json"),
-      JSON.generate("name" => "@openai/codex", "version" => "0.153.5")
-    )
-    _stdout, mismatch_stderr, mismatch_status = Open3.capture3(
-      node,
-      "--input-type=module",
-      "-e",
-      script,
-      launcher_class::ADAPTER_BOOTSTRAP,
-      adapter,
-      launcher_class::CODEX_VERSION
-    )
-
-    expect(mismatch_status).not_to be_success
-    expect(mismatch_stderr).to match(/expected.*0\.153\.4.*0\.153\.5/i)
-  end
-
-  it "reports an actionable error for an incompatible Node.js fallback" do
-    bin_dir = File.join(tmpdir, "bin")
-    node = write_executable(File.join(bin_dir, "node"))
-    write_executable(File.join(bin_dir, "npx"))
-
-    result = build_launcher(
-      path: bin_dir,
-      version_probe: ->(path) { path == node ? "v18.20.0" : nil }
-    ).resolve
-
-    expect(result.available?).to be false
-    expect(result.error_code).to eq("incompatible_node")
-    expect(result.message).to match(/Node\.js 20/)
-  end
-
-  it "reports missing launch dependencies without invoking an unpinned package" do
-    result = build_launcher.resolve
-
-    expect(result.available?).to be false
-    expect(result.argv).to be_nil
-    expect(result.error_code).to eq("missing_dependencies")
-    expect(result.message).to include("Node.js 20+")
-    expect(result.message).to include("CLACKY_CODEX_ACP_PATH")
-    expect(result.message).not_to match(/Install codex-acp/i)
-  end
-
-  it "reports the prototype as unavailable on Windows until process-tree cleanup is supported" do
-    result = build_launcher(platform: "x64-mingw32").resolve
-
-    expect(result.available?).to be(false)
-    expect(result.error_code).to eq("unsupported_platform")
-  end
-
-  it "sanitizes credentials and fixes the managed runtime environment" do
-    explicit = write_executable(File.join(tmpdir, "custom-codex-acp"))
-    codex = write_executable(File.join(tmpdir, "codex"))
-    result = build_launcher(
-      explicit_path: explicit,
-      codex_path: codex,
-      base_env: {
-        "PATH" => "/safe/bin",
-        "OPENAI_API_KEY" => "openai-secret",
-        "OPENAI_BASE_URL" => "https://unsafe.example",
-        "CODEX_API_KEY" => "codex-secret",
-        "CODEX_ACCESS_TOKEN" => "access-secret",
-        "CODEX_HOME" => "/unmanaged",
-        "CODEX_PATH" => "/unverified/codex",
-        "CODEX_CONFIG" => "unsafe-config",
-        "CODEX_SQLITE_HOME" => "/unmanaged-state",
-        "DEFAULT_AUTH_REQUEST" => "unsafe-auth",
-        "MODEL_PROVIDER" => "unsafe-provider",
-        "APP_SERVER_LOGS" => "/unmanaged-logs",
-        "DISABLE_MCP_CONFIG_FILTERING" => "true",
-        "INITIAL_AGENT_MODE" => "agent-full-access",
-        "NPM_TOKEN" => "npm-secret",
-        "AWS_SECRET_ACCESS_KEY" => "aws-secret",
-        "GITHUB_TOKEN" => "github-secret",
-        "SSH_AUTH_SOCK" => "/private/ssh-agent.sock",
-        "NODE_OPTIONS" => "--require /private/inject.js",
-        "HTTP_PROXY" => "http://proxy-user:proxy-password@proxy.example",
-        "HTTPS_PROXY" => "http://proxy-user:proxy-password@proxy.example",
-        "ALL_PROXY" => "socks5://proxy-user:proxy-password@proxy.example",
-        "NO_PROXY" => "localhost",
-        "http_proxy" => "http://lower-user:lower-password@proxy.example",
-        "https_proxy" => "http://lower-user:lower-password@proxy.example",
-        "all_proxy" => "socks5://lower-user:lower-password@proxy.example",
-        "no_proxy" => "localhost",
-        "DISPLAY" => ":0",
-        "WAYLAND_DISPLAY" => "wayland-0",
-        "DBUS_SESSION_BUS_ADDRESS" => "unix:path=/run/user/1000/bus",
-        "XDG_RUNTIME_DIR" => "/run/user/1000"
-      }
-    ).resolve
-
-    expect(result.env).to include(
-      "PATH" => "/safe/bin",
-      "CODEX_HOME" => File.expand_path(codex_home),
-      "CODEX_PATH" => File.expand_path(codex),
-      "INITIAL_AGENT_MODE" => "read-only",
-      "DISPLAY" => ":0",
-      "WAYLAND_DISPLAY" => "wayland-0",
-      "DBUS_SESSION_BUS_ADDRESS" => "unix:path=/run/user/1000/bus",
-      "XDG_RUNTIME_DIR" => "/run/user/1000"
-    )
-    protected_config = JSON.parse(result.env.fetch("CODEX_CONFIG"))
-    profile = protected_config.fetch("default_permissions")
-    expect(profile).to start_with("openclacky-protected-")
-    expect(protected_config).to include("allow_login_shell" => false)
-    expect(protected_config.dig(
-      "permissions", profile, "filesystem",
-      File.join(File.expand_path(codex_home), "auth.json")
-    )).to eq("deny")
-    expect(protected_config.dig("shell_environment_policy", "exclude")).to include(
-      "CODEX_HOME", "CODEX_CONFIG",
-      "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
-      "http_proxy", "https_proxy", "all_proxy", "no_proxy",
-      "DISPLAY", "WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS",
-      "XDG_RUNTIME_DIR"
-    )
-    expect(result.env).to include(
-      "HTTP_PROXY" => "http://proxy-user:proxy-password@proxy.example",
-      "https_proxy" => "http://lower-user:lower-password@proxy.example"
-    )
-    expect(result.env.keys).not_to include(
-      "OPENAI_API_KEY",
-      "OPENAI_BASE_URL",
-      "CODEX_API_KEY",
-      "CODEX_ACCESS_TOKEN",
-      "CODEX_SQLITE_HOME",
-      "DEFAULT_AUTH_REQUEST",
-      "MODEL_PROVIDER",
-      "APP_SERVER_LOGS",
-      "DISABLE_MCP_CONFIG_FILTERING",
-      "NPM_TOKEN",
-      "AWS_SECRET_ACCESS_KEY",
-      "GITHUB_TOKEN",
-      "SSH_AUTH_SOCK",
-      "NODE_OPTIONS"
-    )
-    expect(result.env.values).not_to include("/unverified/codex", "agent-full-access")
-  end
-
-  it "forces an adapter-level permission profile that hides every auth path" do
-    explicit = write_executable(File.join(tmpdir, "custom-codex-acp"))
-    source_auth = File.join(tmpdir, "source", "auth.json")
-    result = build_launcher(
-      explicit_path: explicit,
-      protected_auth_paths: [source_auth, source_auth, ""]
-    ).resolve
-
-    config = JSON.parse(result.env.fetch("CODEX_CONFIG"))
-    profile = config.fetch("default_permissions")
-    filesystem = config.dig("permissions", profile, "filesystem")
-
-    expect(filesystem).to eq(
-      File.join(File.expand_path(codex_home), "auth.json") => "deny",
-      File.expand_path(source_auth) => "deny"
-    )
-    expect(config.dig("permissions", profile, "extends"))
-      .to eq(":workspace")
-  end
-
-  it "uses an unpredictable permission profile name per launcher" do
-    explicit = write_executable(File.join(tmpdir, "custom-codex-acp"))
-
-    first = build_launcher(explicit_path: explicit).resolve
-    second = build_launcher(explicit_path: explicit).resolve
-    first_profile = JSON.parse(first.env.fetch("CODEX_CONFIG"))
-      .fetch("default_permissions")
-    second_profile = JSON.parse(second.env.fetch("CODEX_CONFIG"))
-      .fetch("default_permissions")
-
-    expect(first_profile).to start_with("openclacky-protected-")
-    expect(second_profile).to start_with("openclacky-protected-")
-    expect(first_profile).not_to eq(second_profile)
-  end
-
-  it "does not propagate an unverified CODEX_PATH" do
-    explicit = write_executable(File.join(tmpdir, "custom-codex-acp"))
-
-    result = build_launcher(
-      explicit_path: explicit,
-      base_env: { "CODEX_PATH" => "/unverified/codex" }
-    ).resolve
-
-    expect(result.env["CODEX_PATH"]).to be_nil
-  end
-
-  it "does not override the adapter's bundled Codex executable from PATH" do
-    bin_dir = File.join(tmpdir, "bin")
-    explicit = write_executable(File.join(tmpdir, "custom-codex-acp"))
-    codex = write_executable(File.join(bin_dir, "codex"))
-    node = write_executable(File.join(bin_dir, "node"))
-
-    result = build_launcher(
-      explicit_path: explicit,
-      path: bin_dir,
-      version_probe: ->(path) { path == node ? "v20.11.1" : nil }
-    ).resolve
-
-    expect(result.available?).to be(true)
-    expect(File).to exist(codex)
-    expect(result.env["CODEX_PATH"]).to be_nil
-  end
-
-  it "actually removes parent credentials and adapter overrides from the child process" do
-    fake_agent = File.expand_path("../support/fake_acp_agent.rb", __dir__)
-    transport = nil
-
-    ClimateControl.modify(
-      "OPENAI_API_KEY" => "parent-openai-secret",
-      "CODEX_PATH" => "/parent/unverified-codex",
-      "DEFAULT_AUTH_REQUEST" => "parent-unsafe-auth"
-    ) do
-      launch = build_launcher(
-        explicit_path: RbConfig.ruby,
-        base_env: ENV.to_h
-      ).resolve
-      events = Queue.new
-      transport = Clacky::Acp::ProcessTransport.new(
-        name: "codex-env-probe",
-        argv: [RbConfig.ruby, fake_agent],
-        env: launch.env,
-        max_message_bytes: 4096,
-        stderr_bytes: 1024
-      )
-      transport.on_message { |message| events << message }
-      transport.start
-      transport.send_message(
-        "jsonrpc" => "2.0",
-        "id" => 1,
-        "method" => "fake/inspect",
-        "params" => {
-          "env_keys" => %w[OPENAI_API_KEY CODEX_PATH DEFAULT_AUTH_REQUEST CODEX_HOME]
-        }
-      )
-      response = Timeout.timeout(3) do
-        loop do
-          message = events.pop
-          break message if message["id"] == 1
-        end
+  it "returns a bounded public error when installation fails" do
+    installer = Clacky::DefaultExtensions::Codex::Installer.new(
+      http_get: ->(_uri) { "#!/bin/sh\nexit 1\n" },
+      command_runner: lambda do |_filename|
+        ["", "download failed", instance_double(Process::Status, success?: false)]
       end
+    )
 
-      expect(response.dig("result", "env")).to eq(
-        "OPENAI_API_KEY" => nil,
-        "CODEX_PATH" => nil,
-        "DEFAULT_AUTH_REQUEST" => nil,
-        "CODEX_HOME" => File.expand_path(codex_home)
-      )
-    end
-  ensure
-    transport&.stop
+    result = installer.install
+
+    expect(result.ok).to be(false)
+    expect(result.error_code).to eq("installer_failed")
+    expect(result.message).to include("download failed")
   end
 end
 
@@ -1238,10 +774,10 @@ RSpec.describe "Codex extension status shell" do
     )
     launcher_result = OpenStruct.new(
       available?: true,
-      argv: ["npx", "secret-argument"],
+      argv: ["codex", "app-server", "secret-argument"],
       env: { "OPENAI_API_KEY" => "api-key-secret" },
-      source: :npx,
-      version: "1.11.0",
+      source: :path,
+      version: "0.154.0",
       error_code: nil,
       message: nil
     )
@@ -1258,8 +794,8 @@ RSpec.describe "Codex extension status shell" do
       authenticated: nil,
       auth_reused: true,
       auth_reason: "reused",
-      launcher: "npx",
-      version: "1.11.0"
+      launcher: "path",
+      version: "0.154.0"
     )
     expect(serialized).not_to include(
       "refresh-token-secret",
@@ -1281,6 +817,9 @@ RSpec.describe "Codex extension status shell" do
     allow(runtime).to receive(:authenticate_async).and_return(
       ok: true, started: true, status: "authenticating"
     )
+    allow(runtime).to receive(:install_cli).and_return(
+      ok: true, status: "not_connected", installed: true
+    )
     allow(runtime).to receive(:discover_models).and_return(
       ok: true,
       status: "connected",
@@ -1291,17 +830,17 @@ RSpec.describe "Codex extension status shell" do
 
     status_route = klass.routes.find { |route| route.method == :get && route.pattern == "/status" }
     connect_route = klass.routes.find { |route| route.method == :post && route.pattern == "/connect" }
+    install_route = klass.routes.find { |route| route.method == :post && route.pattern == "/install" }
     auth_route = klass.routes.find { |route| route.method == :post && route.pattern == "/authenticate" }
     discover_route = klass.routes.find { |route| route.method == :post && route.pattern == "/discover" }
     expect(status_route).not_to be_nil
     expect(connect_route).not_to be_nil
+    expect(install_route).not_to be_nil
     expect(auth_route).not_to be_nil
     expect(discover_route).not_to be_nil
-    expect(status_route.options).to include(timeout: 10, same_origin: true)
-    expect(connect_route.options).to include(same_origin: true)
-    expect(auth_route.options).to include(same_origin: true)
-    expect(discover_route.options).to include(same_origin: true)
+    expect(status_route.options).to include(timeout: 10)
     expect(connect_route.options[:timeout]).to eq(310)
+    expect(install_route.options[:timeout]).to eq(310)
     expect(auth_route.options[:timeout]).to eq(310)
     expect(discover_route.options[:timeout]).to eq(310)
 

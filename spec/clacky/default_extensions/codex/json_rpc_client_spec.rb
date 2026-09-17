@@ -1,9 +1,10 @@
 # frozen_string_literal: true
 
 require "spec_helper"
+require "clacky/default_extensions/codex/json_rpc_client"
 
-RSpec.describe Clacky::Acp::Client do
-  class FakeAcpTransport
+RSpec.describe Clacky::DefaultExtensions::Codex::JsonRpcClient do
+  class FakeCodexTransport
     attr_reader :sent
 
     def initialize
@@ -48,7 +49,7 @@ RSpec.describe Clacky::Acp::Client do
     end
   end
 
-  let(:transport) { FakeAcpTransport.new }
+  let(:transport) { FakeCodexTransport.new }
 
   def initialized_client
     transport.on_send do |message|
@@ -58,15 +59,7 @@ RSpec.describe Clacky::Acp::Client do
       transport.emit(
         "jsonrpc" => "2.0",
         "id" => id,
-        "result" => {
-          "protocolVersion" => 1,
-          "agentCapabilities" => {
-            "loadSession" => true,
-            "promptCapabilities" => { "image" => true }
-          },
-          "authMethods" => [{ "id" => "chat-gpt", "name" => "ChatGPT" }],
-          "agentInfo" => { "name" => "codex-acp", "version" => "1.11.0" }
-        }
+        "result" => { "userAgent" => "codex-cli/test" }
       )
     end
 
@@ -76,28 +69,33 @@ RSpec.describe Clacky::Acp::Client do
     )
   end
 
-  it "initializes ACP version 1 and exposes the negotiated result" do
-    client = initialized_client
+  it "initializes the Codex App Server protocol" do
+    transport.on_send do |message|
+      next unless message[:method] == "initialize"
 
-    initialize_message = transport.sent.first
-    expect(initialize_message).to eq(
-      jsonrpc: "2.0",
-      id: 1,
+      transport.emit(
+        "id" => message[:id],
+        "result" => { "userAgent" => "codex-cli/0.154.0" }
+      )
+    end
+
+    client = described_class.new(transport: transport)
+    client.start(
+      client_info: { "name" => "openclacky", "version" => "test" },
+      capabilities: { "experimentalApi" => true }
+    )
+
+    expect(transport.sent[0]).to include(
       method: "initialize",
       params: {
-        protocolVersion: 1,
-        clientCapabilities: { "_meta" => { "authStatus" => true } },
-        clientInfo: { "name" => "openclacky", "version" => "test" }
+        clientInfo: { "name" => "openclacky", "version" => "test" },
+        capabilities: { "experimentalApi" => true }
       }
     )
-    expect(client.initialized?).to be(true)
-    expect(client.alive?).to be(true)
-    expect(client.agent_info).to eq("name" => "codex-acp", "version" => "1.11.0")
-    expect(client.agent_capabilities.dig("promptCapabilities", "image")).to be(true)
-    expect(client.auth_methods.first["id"]).to eq("chat-gpt")
+    expect(transport.sent[1]).to eq(method: "initialized", params: {})
+    expect(client.initialize_result).to include("userAgent" => "codex-cli/0.154.0")
   ensure
     client&.stop
-    expect(client.alive?).to be(false) if client
   end
 
   it "brackets the transport write with request visibility callbacks" do
@@ -142,7 +140,7 @@ RSpec.describe Clacky::Acp::Client do
         before_send: -> { events << :visible },
         on_send_error: -> { events << :rolled_back }
       )
-    end.to raise_error(Clacky::Acp::Client::TransportError)
+    end.to raise_error(described_class::TransportError)
 
     expect(events).to eq(%i[visible rolled_back])
   ensure
@@ -325,7 +323,7 @@ RSpec.describe Clacky::Acp::Client do
 
     expect do
       client.request("session/new", {}, timeout: 1)
-    end.to raise_error(Clacky::Acp::Client::ProtocolError) do |error|
+    end.to raise_error(described_class::ProtocolError) do |error|
       expect(error.message).to include("session/new", "-32603")
       expect(error.message).not_to include("Internal error", "private remote details")
       expect(error.code).to eq(-32_603)
@@ -347,7 +345,7 @@ RSpec.describe Clacky::Acp::Client do
 
     expect do
       client.request("session/new", {}, timeout: 1)
-    end.to raise_error(Clacky::Acp::Client::ProtocolError, /invalid ACP response/i)
+    end.to raise_error(described_class::ProtocolError, /invalid Codex App Server response/i)
     expect(client.pending_request_count).to eq(0)
   ensure
     client&.stop
@@ -366,7 +364,7 @@ RSpec.describe Clacky::Acp::Client do
 
     transport.emit(["not", "an", "object"])
 
-    expect(pending.value).to be_a(Clacky::Acp::Client::ProtocolError)
+    expect(pending.value).to be_a(described_class::ProtocolError)
     expect(client.alive?).to be(false)
   ensure
     client&.stop
@@ -385,7 +383,7 @@ RSpec.describe Clacky::Acp::Client do
 
     transport.emit("jsonrpc" => "2.0", "id" => 999_999, "result" => {})
 
-    expect(pending.value).to be_a(Clacky::Acp::Client::ProtocolError)
+    expect(pending.value).to be_a(described_class::ProtocolError)
     expect(client.alive?).to be(false)
   ensure
     client&.stop
@@ -397,7 +395,7 @@ RSpec.describe Clacky::Acp::Client do
 
     expect do
       client.request("session/set_config_option", {}, timeout: 0.01)
-    end.to raise_error(Clacky::Acp::Client::RequestTimeout, /session\/set_config_option/)
+    end.to raise_error(described_class::RequestTimeout, /session\/set_config_option/)
 
     expect(client.pending_request_count).to eq(0)
   ensure
@@ -410,7 +408,7 @@ RSpec.describe Clacky::Acp::Client do
 
     expect do
       client.request("session/set_config_option", {}, timeout: 0.01)
-    end.to raise_error(Clacky::Acp::Client::RequestTimeout)
+    end.to raise_error(described_class::RequestTimeout)
     timed_out_id = transport.sent.last[:id]
     transport.emit("jsonrpc" => "2.0", "id" => timed_out_id, "result" => {})
 
@@ -435,13 +433,13 @@ RSpec.describe Clacky::Acp::Client do
     transport.emit("__transport_closed__" => true, "error" => "adapter exited")
 
     error = pending.value
-    expect(error).to be_a(Clacky::Acp::Client::TransportError)
+    expect(error).to be_a(described_class::TransportError)
     expect(error.message).to include("adapter exited")
     expect(client.pending_request_count).to eq(0)
     expect(client.alive?).to be(false)
     expect do
       client.request("session/prompt", {}, timeout: nil)
-    end.to raise_error(Clacky::Acp::Client::TransportError, /not initialized/)
+    end.to raise_error(described_class::TransportError, /not initialized/)
   ensure
     client&.stop
   end

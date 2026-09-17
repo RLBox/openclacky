@@ -507,7 +507,7 @@ RSpec.describe Clacky::RuntimeSession do
   end
 
 
-  it "accepts structured ACP cost without leaking the runtime event type to the UI" do
+  it "accepts structured runtime cost without leaking the event type to the UI" do
     session = build_session
     session.begin_generation(4)
 

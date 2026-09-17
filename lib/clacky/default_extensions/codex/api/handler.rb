@@ -3,7 +3,7 @@
 require_relative "../runtime"
 
 # Safe readiness endpoint for the bundled Codex provider. Authentication and
-# ACP session actions are added by the runtime implementation slice.
+# Codex session actions are added by the runtime implementation slice.
 class CodexExt < Clacky::ApiExtension
   class << self
     def status_payload(home_result:, launcher_result:)
@@ -22,20 +22,25 @@ class CodexExt < Clacky::ApiExtension
     end
   end
 
-  get "/status", timeout: 10, same_origin: true do
+  get "/status", timeout: 10 do
     json(Clacky::DefaultExtensions::Codex::Runtime.passive_status)
   end
 
-  post "/connect", timeout: 310, same_origin: true do
+  post "/connect", timeout: 310 do
     json(Clacky::DefaultExtensions::Codex::Runtime.status)
   end
 
-  post "/authenticate", timeout: 310, same_origin: true do
+  post "/install", timeout: 310 do
+    result = Clacky::DefaultExtensions::Codex::Runtime.install_cli
+    json(result, status: result[:ok] ? 200 : 422)
+  end
+
+  post "/authenticate", timeout: 310 do
     result = Clacky::DefaultExtensions::Codex::Runtime.authenticate_async
     json(result, status: result[:started] ? 202 : 200)
   end
 
-  post "/discover", timeout: 310, same_origin: true do
+  post "/discover", timeout: 310 do
     json(Clacky::DefaultExtensions::Codex::Runtime.discover_models)
   end
 end

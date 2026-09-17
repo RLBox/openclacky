@@ -70,7 +70,7 @@ module Clacky
       end
 
       # Resolve every outstanding confirmation without waiting for its normal
-      # browser timeout. Runtime cancellation uses this to ensure an ACP
+      # browser timeout. Runtime cancellation uses this to ensure a provider
       # permission request cannot keep the cancelled turn alive.
       def cancel_pending_confirmations(result: false)
         @mutex.synchronize do

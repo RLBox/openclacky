@@ -2,12 +2,13 @@
 
 require "json"
 require "open3"
-require_relative "../thread_registry"
+require_relative "../../thread_registry"
 
 module Clacky
-  module Acp
-    # Owns one newline-delimited JSON subprocess and its complete process tree.
-    class ProcessTransport
+  module DefaultExtensions
+    module Codex
+      # Owns the Codex App Server subprocess and its complete process tree.
+      class ProcessTransport
       class Error < StandardError; end
 
       STDIN_CLOSE_GRACE = 2.25
@@ -54,7 +55,7 @@ module Clacky
       def start
         @stop_mutex.synchronize do
           @state_mutex.synchronize do
-            raise Error, "ACP process '#{@name}' is already running" if process_alive_unlocked?
+            raise Error, "Codex process '#{@name}' is already running" if process_alive_unlocked?
 
             environment = @env.dup
             options = { pgroup: true, close_others: true, unsetenv_others: true }
@@ -79,10 +80,10 @@ module Clacky
             stdout = @stdout
             stderr = @stderr
             wait_thread = @wait_thread
-            @reader_thread = spawn_thread("acp-reader:#{@name}") do
+            @reader_thread = spawn_thread("codex-reader:#{@name}") do
               read_stdout(stdout, wait_thread, generation)
             end
-            @stderr_thread = spawn_thread("acp-stderr:#{@name}") do
+            @stderr_thread = spawn_thread("codex-stderr:#{@name}") do
               read_stderr(stderr, generation)
             end
           end
@@ -92,19 +93,19 @@ module Clacky
         raise
       rescue StandardError => e
         close_streams
-        raise Error, "failed to start ACP process '#{@name}': #{e.class}: #{e.message}"
+        raise Error, "failed to start Codex process '#{@name}': #{e.class}: #{e.message}"
       end
 
       def send_message(payload)
         line = JSON.generate(payload) + "\n"
         if line.bytesize - 1 > @max_message_bytes
           raise Error,
-                "ACP message for '#{@name}' exceeds #{@max_message_bytes} bytes"
+                "Codex message for '#{@name}' exceeds #{@max_message_bytes} bytes"
         end
 
         stream = @state_mutex.synchronize do
           unless process_alive_unlocked? && @stdin && !@stdin.closed?
-            raise Error, "ACP process '#{@name}' stdin is closed"
+            raise Error, "Codex process '#{@name}' stdin is closed"
           end
           @stdin
         end
@@ -112,9 +113,9 @@ module Clacky
         @write_mutex.synchronize { stream.write(line) }
         nil
       rescue JSON::GeneratorError => e
-        raise Error, "failed to encode ACP message for '#{@name}': #{e.message}"
+        raise Error, "failed to encode Codex message for '#{@name}': #{e.message}"
       rescue Errno::EPIPE, IOError => e
-        raise Error, "failed to write ACP message for '#{@name}': #{e.message}"
+        raise Error, "failed to write Codex message for '#{@name}': #{e.message}"
       end
 
       def alive?
@@ -228,7 +229,7 @@ module Clacky
       rescue JSON::ParserError, EncodingError
         emit_transport_error(
           "malformed_json",
-          "invalid JSON received from ACP process '#{@name}'",
+          "invalid JSON received from Codex process '#{@name}'",
           {},
           generation
         )
@@ -237,7 +238,7 @@ module Clacky
       private def emit_message_too_large(generation)
         emit_transport_error(
           "message_too_large",
-          "ACP process '#{@name}' emitted a message larger than #{@max_message_bytes} bytes",
+          "Codex process '#{@name}' emitted a message larger than #{@max_message_bytes} bytes",
           { "max_bytes" => @max_message_bytes },
           generation
         )
@@ -315,11 +316,11 @@ module Clacky
         exit_status = status && status.exitstatus
         term_signal = status && status.termsig
         error = if exit_status
-                  "ACP process '#{@name}' exited with status #{exit_status}"
+                  "Codex process '#{@name}' exited with status #{exit_status}"
                 elsif term_signal
-                  "ACP process '#{@name}' exited from signal #{term_signal}"
+                  "Codex process '#{@name}' exited from signal #{term_signal}"
                 else
-                  "ACP process '#{@name}' closed"
+                  "Codex process '#{@name}' closed"
                 end
         emit(
           {
@@ -377,6 +378,7 @@ module Clacky
         stream&.close unless stream&.closed?
       rescue IOError
         nil
+      end
       end
     end
   end

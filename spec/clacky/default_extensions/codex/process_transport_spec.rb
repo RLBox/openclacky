@@ -3,12 +3,12 @@
 require "spec_helper"
 require "timeout"
 require "rbconfig"
-require "clacky/acp/process_transport"
+require "clacky/default_extensions/codex/process_transport"
 
-RSpec.describe Clacky::Acp::ProcessTransport do
-  FAKE_AGENT = File.expand_path("../../support/fake_acp_agent.rb", __dir__)
+RSpec.describe Clacky::DefaultExtensions::Codex::ProcessTransport do
+  FAKE_AGENT = File.expand_path("../../../support/fake_codex_server.rb", __dir__)
 
-  let(:tmpdir) { Dir.mktmpdir("acp-process-transport") }
+  let(:tmpdir) { Dir.mktmpdir("codex-process-transport") }
   let(:events) { Queue.new }
 
   after do
@@ -59,21 +59,21 @@ RSpec.describe Clacky::Acp::ProcessTransport do
     literal_arg = "literal value; touch #{marker}"
 
     ClimateControl.modify(
-      "ACP_PARENT_SECRET" => "must-not-leak",
-      "ACP_PARENT_VISIBLE" => "inherited"
+      "CODEX_PARENT_SECRET" => "must-not-leak",
+      "CODEX_PARENT_VISIBLE" => "inherited"
     ) do
       start_transport(
         args: [literal_arg, "second argument"],
         env: {
-          "ACP_PARENT_SECRET" => nil,
-          "ACP_CHILD_VALUE" => "configured"
+          "CODEX_PARENT_SECRET" => nil,
+          "CODEX_CHILD_VALUE" => "configured"
         },
         cwd: tmpdir
       )
       send_request(
         1,
         "fake/inspect",
-        "env_keys" => %w[ACP_PARENT_SECRET ACP_PARENT_VISIBLE ACP_CHILD_VALUE]
+        "env_keys" => %w[CODEX_PARENT_SECRET CODEX_PARENT_VISIBLE CODEX_CHILD_VALUE]
       )
       response = next_event { |event| event["id"] == 1 }
       result = response.fetch("result")
@@ -81,9 +81,9 @@ RSpec.describe Clacky::Acp::ProcessTransport do
       expect(result["argv"]).to eq([literal_arg, "second argument"])
       expect(File.realpath(result["cwd"])).to eq(File.realpath(tmpdir))
       expect(result["env"]).to eq(
-        "ACP_PARENT_SECRET" => nil,
-        "ACP_PARENT_VISIBLE" => nil,
-        "ACP_CHILD_VALUE" => "configured"
+        "CODEX_PARENT_SECRET" => nil,
+        "CODEX_PARENT_VISIBLE" => nil,
+        "CODEX_CHILD_VALUE" => "configured"
       )
       expect(result["pgid"]).to eq(result["pid"])
       expect(result["pgid"]).not_to eq(Process.getpgrp)
@@ -98,7 +98,7 @@ RSpec.describe Clacky::Acp::ProcessTransport do
     response = next_event { |event| event["id"] == 2 }
 
     expect(response.dig("result", "protocolVersion")).to eq(1)
-    expect(response.dig("result", "agentInfo", "name")).to eq("fake-acp-agent")
+    expect(response.dig("result", "agentInfo", "name")).to eq("fake-codex-server")
     expect(@transport.alive?).to be(true)
   end
 
@@ -170,8 +170,8 @@ RSpec.describe Clacky::Acp::ProcessTransport do
     marker = File.join(tmpdir, "shutdown-order")
     start_transport(
       env: {
-        "FAKE_ACP_SHUTDOWN_MARKER" => marker,
-        "FAKE_ACP_LINGER_ON_EOF" => "1"
+      "FAKE_CODEX_SHUTDOWN_MARKER" => marker,
+      "FAKE_CODEX_LINGER_ON_EOF" => "1"
       }
     )
     send_request(7, "fake/spawn_child")
@@ -219,9 +219,9 @@ RSpec.describe Clacky::Acp::ProcessTransport do
     marker = File.join(tmpdir, "forced-shutdown")
     start_transport(
       env: {
-        "FAKE_ACP_SHUTDOWN_MARKER" => marker,
-        "FAKE_ACP_LINGER_ON_EOF" => "1",
-        "FAKE_ACP_IGNORE_TERM" => "1"
+        "FAKE_CODEX_SHUTDOWN_MARKER" => marker,
+        "FAKE_CODEX_LINGER_ON_EOF" => "1",
+        "FAKE_CODEX_IGNORE_TERM" => "1"
       }
     )
     send_request(8, "initialize")

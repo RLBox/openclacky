@@ -12,6 +12,7 @@ RSpec.describe "Runtime provider WebUI" do
   let(:sessions) { File.read(File.join(web_dir, "sessions.js")) }
   let(:skills) { File.read(File.join(web_dir, "skills.js")) }
   let(:app_css) { File.read(File.join(web_dir, "app.css")) }
+  let(:runtime_css) { File.read(File.join(web_dir, "codex-runtime.css")) }
   let(:i18n) { File.read(File.join(web_dir, "i18n.js")) }
 
   def function_source(source, name)
@@ -101,9 +102,18 @@ RSpec.describe "Runtime provider WebUI" do
       expect(onboard).to include("let _selectedProviderId")
       expect(onboard).to include("p.id === _selectedProviderId")
       expect(sync).to include("RuntimeProvider.isRuntimeProvider(provider)")
+      expect(sync).to include('const hasSelection = !!provider || _selectedProviderId === "__custom__"')
+      expect(sync).to include('modelField.style.display = hasSelection ? "" : "none"')
+      expect(sync).to include('apiFields.style.display = hasSelection && !runtime ? "" : "none"')
       expect(sync).to include('"setup-api-fields"')
       expect(sync).to include('"setup-runtime-panel"')
       expect(sync).to include("input.readOnly = true")
+    end
+
+    it "fails closed before provider selection instead of exposing stale API fields" do
+      expect(index).to include('id="setup-model-field" style="display:none"')
+      expect(index).to include('id="setup-api-fields" class="runtime-api-fields" style="display:none"')
+      expect(index).to match(/id="setup-btn-test"[^>]*disabled/)
     end
 
     it "requires a discovered default model without API credentials or the API model tester" do
@@ -390,7 +400,7 @@ RSpec.describe "Runtime provider WebUI" do
       expect(skills).to include("if (!_isEnabled())")
       expect(sessions).to include('const slashButton = $("btn-slash")')
       expect(sessions).to include("slashButton.hidden = !!s.runtime_id")
-      expect(app_css).to include('#btn-slash[hidden], #ns-btn-slash[hidden]')
+      expect(runtime_css).to include('#btn-slash[hidden], #ns-btn-slash[hidden]')
     end
 
     it "blocks creation until the selected model kind is known and retries failed model loads" do

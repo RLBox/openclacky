@@ -18,7 +18,7 @@ def respond(id, result)
 end
 
 def append_shutdown_marker(value)
-  path = ENV["FAKE_ACP_SHUTDOWN_MARKER"]
+  path = ENV["FAKE_CODEX_SHUTDOWN_MARKER"]
   return unless path && !path.empty?
 
   File.open(path, "a") { |file| file.puts(value) }
@@ -54,7 +54,7 @@ STDIN.each_line do |line|
         "promptCapabilities" => { "image" => true }
       },
       "authMethods" => [{ "id" => "chat-gpt", "name" => "ChatGPT" }],
-      "agentInfo" => { "name" => "fake-acp-agent", "version" => "1.0.0" }
+      "agentInfo" => { "name" => "fake-codex-server", "version" => "1.0.0" }
     )
   when "session/prompt"
     emit(
@@ -136,14 +136,14 @@ end
 
 append_shutdown_marker("stdin_closed")
 
-if ENV["FAKE_ACP_LINGER_ON_EOF"] == "1"
+if ENV["FAKE_CODEX_LINGER_ON_EOF"] == "1"
   loop do
     if term_received && !term_recorded
       append_shutdown_marker("term")
       term_recorded = true
     end
 
-    if term_received && ENV["FAKE_ACP_IGNORE_TERM"] != "1"
+    if term_received && ENV["FAKE_CODEX_IGNORE_TERM"] != "1"
       child_pids.each do |pid|
         begin
           Process.wait(pid)

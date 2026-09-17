@@ -1,12 +1,13 @@
 # frozen_string_literal: true
 
 require "timeout"
-require_relative "../thread_registry"
+require_relative "../../thread_registry"
 
 module Clacky
-  module Acp
-    # Concurrent JSON-RPC client for ACP v1 transports.
-    class Client
+  module DefaultExtensions
+    module Codex
+      # Concurrent JSON-RPC client for the Codex App Server protocol.
+      class JsonRpcClient
       class Error < StandardError; end
       class TransportError < Error; end
       class ProtocolError < Error
@@ -23,7 +24,6 @@ module Clacky
       end
       class RequestTimeout < Error; end
 
-      PROTOCOL_VERSION = 1
       INITIALIZE_TIMEOUT = 15
       MAX_REVERSE_REQUESTS = 16
       MAX_RETIRED_REQUEST_IDS = 128
@@ -53,20 +53,13 @@ module Clacky
         @transport.start
         result = raw_request(
           "initialize",
-          {
-            protocolVersion: PROTOCOL_VERSION,
-            clientCapabilities: capabilities,
-            clientInfo: client_info
-          },
+          { clientInfo: client_info, capabilities: capabilities },
           timeout: timeout
         )
-        unless result["protocolVersion"].to_i == PROTOCOL_VERSION
-          raise ProtocolError,
-                "ACP initialize returned unsupported protocol version #{result['protocolVersion'].inspect}"
-        end
+        @transport.send_message(method: "initialized", params: {})
 
         @lock.synchronize do
-          @initialize_result = result
+          @initialize_result = result || {}
           @started = true
         end
         self
@@ -77,7 +70,7 @@ module Clacky
 
       def stop
         @lock.synchronize { @started = false }
-        fail_pending("ACP client stopped")
+        fail_pending("Codex App Server client stopped")
         @transport.stop
         self
       rescue StandardError
@@ -90,18 +83,6 @@ module Clacky
 
       def alive?
         initialized? && @transport.alive?
-      end
-
-      def agent_info
-        @lock.synchronize { deep_copy(@initialize_result["agentInfo"] || {}) }
-      end
-
-      def agent_capabilities
-        @lock.synchronize { deep_copy(@initialize_result["agentCapabilities"] || {}) }
-      end
-
-      def auth_methods
-        @lock.synchronize { deep_copy(@initialize_result["authMethods"] || []) }
       end
 
       def request(method, params = {}, timeout: nil, before_send: nil,
@@ -194,7 +175,7 @@ module Clacky
         if (remote_error = response["error"])
           code = remote_error["code"]
           raise ProtocolError.new(
-            "ACP request '#{method}' failed (code #{code})",
+            "Codex App Server request '#{method}' failed (code #{code})",
             code: code,
             method: method,
             remote_message: remote_error["message"],
@@ -205,39 +186,39 @@ module Clacky
         response["result"]
       rescue Timeout::Error
         retire_request_id(id) if id
-        raise RequestTimeout, "ACP request '#{method}' timed out"
+        raise RequestTimeout, "Codex App Server request '#{method}' timed out"
       ensure
         @lock.synchronize { @pending.delete(id) } if id
       end
 
       private def handle_message(message)
         unless message.is_a?(Hash)
-          return protocol_failure("ACP emitted a non-object message")
+          return protocol_failure("Codex App Server emitted a non-object message")
         end
 
         if message["__transport_closed__"]
           @lock.synchronize { @started = false }
-          fail_pending(message["error"].to_s.empty? ? "ACP transport closed" : message["error"])
+          fail_pending(message["error"].to_s.empty? ? "Codex App Server transport closed" : message["error"])
           return
         end
 
         if message["__transport_error__"]
-          fail_pending(message["error"].to_s.empty? ? "ACP transport failed" : message["error"])
+          fail_pending(message["error"].to_s.empty? ? "Codex App Server transport failed" : message["error"])
           return
         end
 
-        unless message["jsonrpc"] == "2.0"
-          return protocol_failure("ACP emitted a message without JSON-RPC 2.0")
+        unless message["jsonrpc"].nil? || message["jsonrpc"] == "2.0"
+          return protocol_failure("Codex App Server emitted an invalid JSON-RPC version")
         end
 
         if message.key?("id") && !message.key?("method")
           has_result = message.key?("result")
           has_error = message.key?("error")
           unless has_result ^ has_error
-            return protocol_failure("invalid ACP response: expected exactly one of result or error")
+            return protocol_failure("invalid Codex App Server response: expected exactly one of result or error")
           end
           if has_error && !message["error"].is_a?(Hash)
-            return protocol_failure("invalid ACP response: error must be an object")
+            return protocol_failure("invalid Codex App Server response: error must be an object")
           end
 
           pending, retired = @lock.synchronize do
@@ -249,7 +230,7 @@ module Clacky
           if pending
             pending[:queue] << message
           elsif !retired
-            protocol_failure("ACP emitted a response for an unknown request id")
+            protocol_failure("Codex App Server emitted a response for an unknown request id")
           end
           return
         end
@@ -257,7 +238,7 @@ module Clacky
         if message.key?("id") && message["method"]
           unless message["method"].is_a?(String) &&
                  (message["params"].nil? || message["params"].is_a?(Hash))
-            return protocol_failure("ACP emitted an invalid reverse request")
+            return protocol_failure("Codex App Server emitted an invalid reverse request")
           end
           dispatch_reverse_request(message)
           return
@@ -266,12 +247,12 @@ module Clacky
         if message["method"]
           unless message["method"].is_a?(String) &&
                  (message["params"].nil? || message["params"].is_a?(Hash))
-            return protocol_failure("ACP emitted an invalid notification")
+            return protocol_failure("Codex App Server emitted an invalid notification")
           end
           return dispatch_notification(message)
         end
 
-        protocol_failure("ACP emitted an unrecognized JSON-RPC message")
+        protocol_failure("Codex App Server emitted an unrecognized JSON-RPC message")
       end
 
       private def dispatch_notification(message)
@@ -287,7 +268,7 @@ module Clacky
           subscription.handler.call(params)
         rescue StandardError => e
           Clacky::Logger.warn(
-            "[ACP] notification handler failed",
+            "[Codex App Server] notification handler failed",
             method: method,
             error: e.class.name
           ) if defined?(Clacky::Logger)
@@ -315,7 +296,7 @@ module Clacky
           @transport.send_message(
             jsonrpc: "2.0",
             id: id,
-            error: { code: -32_603, message: "Too many active ACP requests" }
+            error: { code: -32_603, message: "Too many active Codex App Server requests" }
           )
           return
         end
@@ -327,7 +308,7 @@ module Clacky
             @transport.send_message(jsonrpc: "2.0", id: id, result: result)
           rescue StandardError => e
             Clacky::Logger.warn(
-              "[ACP] request handler failed",
+              "[Codex App Server] request handler failed",
               method: method,
               error: e.class.name
             ) if defined?(Clacky::Logger)
@@ -344,7 +325,7 @@ module Clacky
       rescue StandardError => e
         release_reverse_request_slot if reserved && !spawned
         Clacky::Logger.warn(
-          "[ACP] failed to dispatch reverse request",
+          "[Codex App Server] failed to dispatch reverse request",
           method: method,
           error: e.class.name
         ) if defined?(Clacky::Logger)
@@ -367,7 +348,7 @@ module Clacky
 
       private def spawn_handler_thread(method, &block)
         Clacky::ThreadRegistry.spawn(
-          name: "acp-request:#{method}", daemon: true, &block
+          name: "codex-app-server-request:#{method}", daemon: true, &block
         )
       end
 
@@ -404,14 +385,14 @@ module Clacky
       end
 
       private def ensure_started!
-        raise TransportError, "ACP client is not initialized" unless initialized?
-        raise TransportError, "ACP transport is not running" unless @transport.alive?
+        raise TransportError, "Codex App Server client is not initialized" unless initialized?
+        raise TransportError, "Codex App Server transport is not running" unless @transport.alive?
       end
 
       private def raise_transport_error(error)
         raise error if error.is_a?(Error)
 
-        raise TransportError, "ACP transport error: #{error.class}: #{error.message}"
+        raise TransportError, "Codex App Server transport error: #{error.class}: #{error.message}"
       end
 
       private def deep_copy(value)
@@ -429,6 +410,7 @@ module Clacky
             value
           end
         end
+      end
       end
     end
   end

@@ -105,7 +105,7 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Connection do
   let(:launcher_result) do
     OpenStruct.new(
       available?: true,
-      argv: ["codex-acp"],
+      argv: ["codex", "app-server", "--stdio"],
       env: { "CODEX_HOME" => "/managed/codex" },
       cwd: "/managed/codex",
       source: :installed,
@@ -134,7 +134,20 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Connection do
     end
   end
 
-  it "reports passive status without preparing or starting the ACP client" do
+  it "keeps App Server account emails out of runtime status metadata" do
+    adapter = Clacky::DefaultExtensions::Codex::AppServerClient.allocate
+    status = adapter.send(
+      :account_to_auth_status,
+      "type" => "chatgpt",
+      "email" => "private@example.com",
+      "planType" => "plus"
+    )
+
+    expect(status).to eq("type" => "chatgpt", "label" => "plus")
+    expect(JSON.generate(status)).not_to include("private@example.com")
+  end
+
+  it "reports passive status without preparing or starting App Server" do
     connection = build_connection
 
     expect(connection.passive_status).to include(
@@ -264,14 +277,15 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Connection do
     connection&.close
   end
 
-  it "always launches the ACP transport from the isolated managed home" do
+  it "always launches the App Server transport from the isolated managed home" do
     connection = build_connection
-    acp_client = connection.send(:build_client, launcher_result)
-    transport = acp_client.instance_variable_get(:@transport)
+    app_server_client = connection.send(:build_client, launcher_result)
+    rpc_client = app_server_client.instance_variable_get(:@rpc)
+    transport = rpc_client.instance_variable_get(:@transport)
 
     expect(transport.instance_variable_get(:@cwd)).to eq("/managed/codex")
   ensure
-    acp_client&.stop
+    app_server_client&.stop
     connection&.close
   end
 
@@ -294,7 +308,7 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Connection do
       if method == "authentication/status"
         { "type" => "unauthenticated" }
       elsif method == "authenticate"
-        raise Clacky::Acp::Client::RequestTimeout, "login timed out"
+        raise Clacky::DefaultExtensions::Codex::JsonRpcClient::RequestTimeout, "login timed out"
       else
         {}
       end
@@ -347,8 +361,7 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Connection do
   end
 
 
-  it "allows the pinned npx fallback enough time for its first package resolution" do
-    allow(launcher_result).to receive(:source).and_return(:npx)
+  it "uses a bounded startup timeout for App Server" do
     client.request_handler = lambda do |method, _params, _timeout|
       method == "authentication/status" ? { "type" => "unauthenticated" } : {}
     end
@@ -356,7 +369,7 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Connection do
 
     connection.status
 
-    expect(client.start_arguments[:timeout]).to eq(300)
+    expect(client.start_arguments[:timeout]).to eq(15)
   ensure
     connection&.close
   end
@@ -430,6 +443,76 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Connection do
     connection&.close
   end
 
+  it "drops an expired App Server login URL when authentication settles unauthenticated" do
+    client.agent_capabilities = { "_meta" => { "authStatus" => {} } }
+    client.auth_methods = [{ "id" => "chat-gpt" }]
+    client.on_start = lambda do |started_client|
+      started_client.emit(
+        "_auth/status_update",
+        "authStatus" => { "kind" => "unauthenticated" }
+      )
+    end
+    observed_timeout = nil
+    client.define_singleton_method(:start_chatgpt_login) do |timeout:|
+      observed_timeout = timeout
+      { "authUrl" => "https://example.invalid/expired", "loginId" => "login-1" }
+    end
+    connection = build_connection
+
+    expect(connection.authenticate_async).to include(
+      started: true,
+      auth_url: "https://example.invalid/expired"
+    )
+    expect(observed_timeout).to eq(described_class::CONTROL_TIMEOUT)
+    expect(connection.status[:auth_url]).to eq("https://example.invalid/expired")
+
+    client.emit(
+      "_auth/status_update",
+      "authStatus" => { "kind" => "unauthenticated" }
+    )
+
+    expect(connection.status).to include(status: "not_connected", authenticated: false)
+    expect(connection.status).not_to have_key(:auth_url)
+  ensure
+    connection&.close
+  end
+
+  it "rechecks App Server account state after browser login without a completion notification" do
+    current_status = { "type" => "unauthenticated" }
+    client.define_singleton_method(:account_status) do |timeout:|
+      raise "unexpected account timeout" unless timeout == 5
+      current_status
+    end
+    client.define_singleton_method(:start_chatgpt_login) do |timeout:|
+      raise "unexpected login timeout" unless timeout == 5
+      { "authUrl" => "https://example.invalid/login", "loginId" => "login-1" }
+    end
+    connection = build_connection
+
+    expect(connection.status).to include(status: "not_connected", authenticated: false)
+    expect(connection.authenticate_async).to include(
+      status: "authenticating",
+      auth_url: "https://example.invalid/login"
+    )
+
+    # account/read can still report unauthenticated while the browser is open.
+    expect(connection.passive_status).to include(
+      status: "authenticating",
+      auth_url: "https://example.invalid/login"
+    )
+
+    # The credential file is now live even if account/login/completed was lost.
+    current_status = { "type" => "account", "label" => "ChatGPT Plus" }
+    expect(connection.passive_status).to include(
+      status: "connected",
+      authenticated: true,
+      auth_kind: "account"
+    )
+    expect(connection.passive_status).not_to have_key(:auth_url)
+  ensure
+    connection&.close
+  end
+
   it "cleans up a failed login so a later attempt can retry" do
     attempts = 0
     client.auth_methods = [{ "id" => "chat-gpt" }]
@@ -438,7 +521,7 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Connection do
         { "type" => "unauthenticated" }
       elsif method == "authenticate"
         attempts += 1
-        raise Clacky::Acp::Client::ProtocolError, "private remote details"
+        raise Clacky::DefaultExtensions::Codex::JsonRpcClient::ProtocolError, "private remote details"
       else
         {}
       end
@@ -753,7 +836,7 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Runtime do
     turn&.value
   end
 
-  it "creates an ACP session, streams a turn, and completes only on the prompt response" do
+  it "creates a Codex session, streams a turn, and completes only on the prompt response" do
     release = Queue.new
     prompt_seen = Queue.new
     install_new_session_handler do |params|
@@ -801,7 +884,7 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Runtime do
     agent&.close
   end
 
-  it "exposes ACP model options and switches the open session model" do
+  it "exposes Codex model options and switches the open session model" do
     dynamic_options = Marshal.load(Marshal.dump(config_options))
     model_option = dynamic_options.find { |option| option["id"] == "model" }
     model_option["options"] = [
@@ -900,7 +983,7 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Runtime do
     agent&.close
   end
 
-  it "rejects unknown model choices without sending them to ACP" do
+  it "rejects unknown model choices without sending them to Codex" do
     install_new_session_handler
     agent = runtime
     agent.run(input, generation: 73)
@@ -948,7 +1031,7 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Runtime do
     agent&.close
   end
 
-  it "does not open an ACP session for a protected workspace" do
+  it "does not open a Codex session for a protected workspace" do
     connection.workspace_allowed = false
     agent = runtime
 
@@ -1031,12 +1114,12 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Runtime do
     agent&.close
   end
 
-  it "does not start ACP merely to close a restored session that was never bound" do
+  it "does not start App Server merely to close a restored session that was never bound" do
     dormant_connection = Class.new do
       attr_reader :unbound
 
       def client_with_generation
-        raise "closing a dormant session must not start ACP"
+        raise "closing a dormant session must not start App Server"
       end
 
       def unbind_session(runtime, session_id: nil)
@@ -1135,11 +1218,11 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Runtime do
     second&.close
   end
 
-  it "falls back to a new ACP session with an explicit warning when resume is missing" do
+  it "falls back to a new Codex session with an explicit warning when resume is missing" do
     client.request_handler = lambda do |method, _params, _timeout|
       case method
       when "session/resume"
-        raise Clacky::Acp::Client::ProtocolError.new(
+        raise Clacky::DefaultExtensions::Codex::JsonRpcClient::ProtocolError.new(
           "unknown session", code: -32_002, method: "session/resume"
         )
       when "session/new"
@@ -1175,8 +1258,8 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Runtime do
     client.request_handler = lambda do |method, _params, _timeout|
       case method
       when "session/resume"
-        raise Clacky::Acp::Client::ProtocolError.new(
-          "ACP request 'session/resume' failed (code -32603)",
+        raise Clacky::DefaultExtensions::Codex::JsonRpcClient::ProtocolError.new(
+          "Codex App Server request 'session/resume' failed (code -32603)",
           code: -32_603,
           method: "session/resume",
           remote_message: "Internal error",
@@ -1216,8 +1299,8 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Runtime do
   it "does not swallow unrelated adapter internal errors while resuming" do
     client.request_handler = lambda do |method, _params, _timeout|
       if method == "session/resume"
-        raise Clacky::Acp::Client::ProtocolError.new(
-          "ACP request 'session/resume' failed (code -32603)",
+        raise Clacky::DefaultExtensions::Codex::JsonRpcClient::ProtocolError.new(
+          "Codex App Server request 'session/resume' failed (code -32603)",
           code: -32_603,
           method: "session/resume",
           remote_message: "Internal error",
@@ -1225,7 +1308,7 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Runtime do
         )
       end
 
-      raise "unexpected ACP request: #{method}"
+      raise "unexpected Codex request: #{method}"
     end
     agent = described_class.new(
       context: context,
@@ -1234,7 +1317,7 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Runtime do
     )
 
     expect { agent.run(input, generation: 92) }
-      .to raise_error(Clacky::Acp::Client::ProtocolError)
+      .to raise_error(Clacky::DefaultExtensions::Codex::JsonRpcClient::ProtocolError)
     expect(client.requests.map(&:first)).to eq(["session/resume"])
   ensure
     agent&.close
@@ -1243,8 +1326,8 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Runtime do
   it "does not treat another thread id's missing-rollout error as the restored session" do
     client.request_handler = lambda do |method, _params, _timeout|
       if method == "session/resume"
-        raise Clacky::Acp::Client::ProtocolError.new(
-          "ACP request 'session/resume' failed (code -32603)",
+        raise Clacky::DefaultExtensions::Codex::JsonRpcClient::ProtocolError.new(
+          "Codex App Server request 'session/resume' failed (code -32603)",
           code: -32_603,
           method: "session/resume",
           remote_message: "Internal error",
@@ -1254,7 +1337,7 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Runtime do
         )
       end
 
-      raise "unexpected ACP request: #{method}"
+      raise "unexpected Codex request: #{method}"
     end
     agent = described_class.new(
       context: context,
@@ -1263,7 +1346,7 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Runtime do
     )
 
     expect { agent.run(input, generation: 93) }
-      .to raise_error(Clacky::Acp::Client::ProtocolError)
+      .to raise_error(Clacky::DefaultExtensions::Codex::JsonRpcClient::ProtocolError)
     expect(client.requests.map(&:first)).to eq(["session/resume"])
   ensure
     agent&.close
@@ -1340,7 +1423,7 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Runtime do
     unsupported&.close
   end
 
-  it "sends ordinary files and directories as ACP resource links" do
+  it "sends ordinary files and directories as Codex resource links" do
     install_new_session_handler
     agent = runtime
 
@@ -1454,7 +1537,7 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Runtime do
     agent&.close
   end
 
-  it "restarts the matching ACP generation only when a cancelled prompt stays pending" do
+  it "restarts the matching Codex generation only when a cancelled prompt stays pending" do
     stub_const("#{described_class}::CANCEL_GRACE", 0.03)
     release = Queue.new
     started = Queue.new
@@ -1464,7 +1547,7 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Runtime do
       raise outcome if outcome.is_a?(Exception)
     end
     connection.on_restart = lambda do
-      release << Clacky::Acp::Client::TransportError.new("generation restarted")
+      release << Clacky::DefaultExtensions::Codex::JsonRpcClient::TransportError.new("generation restarted")
     end
     agent = runtime
     turn = Thread.new { agent.run(input, generation: 140) }
@@ -1482,7 +1565,7 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Runtime do
     agent&.close
   end
 
-  it "does not restart ACP merely because an uncancelled prompt is long-running" do
+  it "does not restart Codex merely because an uncancelled prompt is long-running" do
     stub_const("#{described_class}::CANCEL_GRACE", 0.01)
     release = Queue.new
     started = Queue.new
@@ -1555,7 +1638,7 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Runtime do
         { "sessionId" => "config-retry", "configOptions" => config_options }
       when "session/set_config_option"
         attempts += 1
-        raise Clacky::Acp::Client::RequestTimeout, "first configuration stalled" if attempts == 1
+        raise Clacky::DefaultExtensions::Codex::JsonRpcClient::RequestTimeout, "first configuration stalled" if attempts == 1
 
         { "configOptions" => configured_options }
       when "session/prompt"
@@ -1571,7 +1654,7 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Runtime do
 
     expect do
       agent.run(input, generation: 143)
-    end.to raise_error(Clacky::Acp::Client::RequestTimeout)
+    end.to raise_error(Clacky::DefaultExtensions::Codex::JsonRpcClient::RequestTimeout)
     expect(agent.run(input, generation: 144)).to include(stop_reason: "end_turn")
 
     expect(attempts).to eq(2)
@@ -1700,7 +1783,7 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Runtime do
     agent&.close
   end
 
-  it "maps ACP plan content to the host todo task field" do
+  it "maps Codex plan content to the host todo task field" do
     install_new_session_handler
     agent = runtime
     agent.run(input, generation: 17)
@@ -1761,7 +1844,7 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Runtime do
     agent&.close
   end
 
-  it "normalizes codex-acp command output and preserves failed exit metadata" do
+  it "normalizes Codex command output and preserves failed exit metadata" do
     install_new_session_handler
     agent = runtime
     agent.run(input, generation: 181)
@@ -1942,7 +2025,7 @@ RSpec.describe Clacky::DefaultExtensions::Codex::Runtime do
     agent&.close
   end
 
-  it "maps a cancelled host confirmation to ACP cancellation" do
+  it "maps a cancelled host confirmation to Codex cancellation" do
     cancelled_ui = Class.new do
       def request_confirmation(_message, default: false)
         "cancelled"
