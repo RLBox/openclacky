@@ -247,6 +247,7 @@ RSpec.describe Clacky::Server::HttpServer, "enterprise device onboarding" do
       "base_url" => "https://models.enterprise.example.com",
       "api_key" => "clacky-dt-secret",
       "enterprise_managed" => true,
+      "allow_personal_byok" => true,
       "managed_models" => %w[
         or-gemini-3-5-flash
         abs-claude-sonnet-5
@@ -383,7 +384,8 @@ RSpec.describe Clacky::Server::HttpServer, "enterprise device onboarding" do
         "active" => true,
         "gateway_url" => "https://new-gateway.example.com",
         "default_model" => "abs-claude-sonnet-5",
-        "allowed_models" => ["abs-claude-sonnet-5", "dsk-deepseek-v4-pro"]
+        "allowed_models" => ["abs-claude-sonnet-5", "dsk-deepseek-v4-pro"],
+        "allow_personal_byok" => false
       }
     )
     expect(agent_config).to receive(:save).once.and_call_original
@@ -405,6 +407,7 @@ RSpec.describe Clacky::Server::HttpServer, "enterprise device onboarding" do
       "base_url" => "https://new-gateway.example.com",
       "api_key" => "clacky-dt-secret",
       "enterprise_managed" => true,
+      "allow_personal_byok" => false,
       "managed_models" => ["abs-claude-sonnet-5", "dsk-deepseek-v4-pro"]
     )
   end

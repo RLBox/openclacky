@@ -514,6 +514,13 @@ module Clacky
       return goal_intercept[:result] if goal_intercept[:handled]
       user_input = goal_intercept[:user_input] if goal_intercept[:user_input]
 
+      # An enterprise policy can change while this session is still open. A
+      # stale session may therefore still point at a personal model even after
+      # personal API keys have been disabled. Enforce the policy at the actual
+      # execution boundary so web, channel, scheduler, and CLI turns all use an
+      # enterprise-managed model.
+      enforce_enterprise_model_policy!
+
       # Auto-clear a finished/paused goal when the user starts a new non-goal
       # task. /goal <text> already replaced the goal above; control commands
       # returned early. The "✓ Goal achieved" line stays in the thread.
@@ -1029,6 +1036,18 @@ module Clacky
       # Guarded by run_turn_started so goal control commands (which return
       # before the task turn) are not counted as agent runs.
       Clacky::Telemetry.task!(result: result) if run_turn_started
+    end
+
+    private def enforce_enterprise_model_policy!
+      return if @config.personal_byok_allowed?
+
+      current = @config.models.find { |model| model["id"] == @config.current_model_id }
+      return if current&.dig("enterprise_managed") == true
+
+      managed = @config.models.find { |model| model["enterprise_managed"] == true }
+      raise "No enterprise-managed model is available" unless managed
+
+      switch_model_by_id(managed["id"])
     end
 
     private def think

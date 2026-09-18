@@ -21,4 +21,11 @@ RSpec.describe "Enterprise model refresh UI" do
     expect(refresh_client).to include('document.addEventListener("visibilitychange"')
     expect(app).to include("EnterpriseModels.start()")
   end
+
+  it "renders a read-only enterprise-only model experience" do
+    expect(index).to include('id="personal-byok-policy-notice"')
+    expect(settings).to include('configData.personal_byok_allowed !== false')
+    expect(settings).to include('model.enterprise_managed === true')
+    expect(settings).to include('src === "custom" && !_personalByokAllowed')
+  end
 end

@@ -66,6 +66,45 @@ RSpec.describe Clacky::Server::HttpServer, "media routes" do
     end
   end
 
+  describe "enterprise personal BYOK media policy" do
+    let(:managed_config) do
+      cfg = Clacky::AgentConfig.new(
+        models: [{
+          "model" => "managed-model",
+          "api_key" => "clacky-device-token",
+          "base_url" => "https://gateway.example.com",
+          "type" => "default",
+          "enterprise_managed" => true,
+          "enterprise_source" => "https://enterprise.example.com",
+          "allow_personal_byok" => false
+        }],
+        clacky_license_server: "https://enterprise.example.com"
+      )
+      stub_const("Clacky::AgentConfig::CONFIG_FILE", config_file)
+      cfg
+    end
+
+    it "rejects custom media credentials" do
+      with_server(agent_config: managed_config) do |server|
+        req = fake_req(
+          method: "PATCH",
+          path: "/api/config/media/image",
+          body: {
+            source: "custom",
+            model: "personal-image",
+            base_url: "https://personal.example.com",
+            api_key: "sk-personal"
+          }
+        )
+        res = fake_res
+        dispatch(server, req, res)
+
+        expect(res.status).to eq(403)
+        expect(parsed_body(res)["error"]).to eq("personal_byok_disabled")
+      end
+    end
+  end
+
   describe "POST /api/media/image" do
     let(:image_models) do
       [

@@ -146,4 +146,52 @@ RSpec.describe "CLI client staleness regression (DSK → Opus → /clear)" do
     expect(fresh_client.instance_variable_get(:@model)).to eq("dsk-chat")
     expect(fresh_client.instance_variable_get(:@use_bedrock)).to eq(false)
   end
+
+  it "moves a stale personal session to the enterprise model before execution" do
+    source = "https://enterprise.example.test"
+    config = Clacky::AgentConfig.new
+    config.instance_variable_set(:@clacky_license_server, source)
+    config.instance_variable_set(:@models, [
+      {
+        "id" => "personal-model",
+        "model" => "personal-chat",
+        "api_key" => "personal-key",
+        "base_url" => "https://personal.example.test/v1",
+        "type" => "default"
+      },
+      {
+        "id" => "enterprise-model",
+        "model" => "managed-chat",
+        "api_key" => "device-token",
+        "base_url" => "https://gateway.example.test/v1",
+        "enterprise_managed" => true,
+        "enterprise_source" => source,
+        "allow_personal_byok" => false
+      }
+    ])
+    config.switch_model_by_id("personal-model")
+    client = Clacky::Client.new(
+      config.api_key,
+      base_url: config.base_url,
+      model: config.model_name
+    )
+    agent = Clacky::Agent.new(
+      client,
+      config,
+      working_dir: Dir.pwd,
+      ui: nil,
+      profile: "coding",
+      session_id: Clacky::SessionManager.generate_id,
+      source: :manual
+    )
+
+    agent.send(:enforce_enterprise_model_policy!)
+
+    expect(agent.current_model_info).to include(
+      id: "enterprise-model",
+      model: "managed-chat",
+      enterprise_managed: true
+    )
+    expect(agent.instance_variable_get(:@client).instance_variable_get(:@api_key)).to eq("device-token")
+  end
 end

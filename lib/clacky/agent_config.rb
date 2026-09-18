@@ -692,7 +692,8 @@ module Clacky
       if Clacky::Providers::MEDIA_KINDS.include?(kind)
         entry = @models.find { |m| m["type"] == kind }
         return nil if entry && entry["disabled"]
-        if entry && entry["base_url"].to_s.strip != "" && entry["api_key"].to_s.strip != ""
+        if entry && personal_byok_allowed? &&
+            entry["base_url"].to_s.strip != "" && entry["api_key"].to_s.strip != ""
           return entry
         end
         return derive_media_model(kind, model_override: entry && entry["model"])
@@ -700,12 +701,21 @@ module Clacky
       if kind == "ocr"
         entry = @models.find { |m| m["type"] == "ocr" }
         return nil if entry && entry["disabled"]
-        if entry && entry["base_url"].to_s.strip != "" && entry["api_key"].to_s.strip != ""
+        if entry && personal_byok_allowed? &&
+            entry["base_url"].to_s.strip != "" && entry["api_key"].to_s.strip != ""
           return entry
         end
         return derive_ocr_model(model_override: entry && entry["model"])
       end
       @models.find { |m| m["type"] == type }
+    end
+
+    def personal_byok_allowed?
+      policy_model = @models.find do |model|
+        model["enterprise_managed"] == true &&
+          model["enterprise_source"] == @clacky_license_server
+      end
+      policy_model.nil? || policy_model.fetch("allow_personal_byok", true) != false
     end
 
     # Resolve the provider id for a model entry. An explicit `provider_id`
@@ -763,7 +773,7 @@ module Clacky
     end
 
     private def sidecar_custom?(entry)
-      entry &&
+      personal_byok_allowed? && entry &&
         entry["base_url"].to_s.strip != "" &&
         entry["api_key"].to_s.strip != "" &&
         entry["mode"] != "auto"

@@ -1357,6 +1357,34 @@ RSpec.describe Clacky::AgentConfig do
       expect(result["base_url"]).to eq("https://api.openai.com/v1")
     end
 
+    it "ignores a personal custom sidecar when enterprise BYOK is disabled" do
+      managed_anchor = default_anchor.merge(
+        "enterprise_managed" => true,
+        "enterprise_source" => "https://enterprise.example.com",
+        "allow_personal_byok" => false
+      )
+      config = described_class.new(
+        models: [managed_anchor, custom_media_entry],
+        clacky_license_server: "https://enterprise.example.com"
+      )
+      allow(Clacky::Providers).to receive(:resolve_provider)
+        .with(base_url: managed_anchor["base_url"], api_key: managed_anchor["api_key"])
+        .and_return("anthropic")
+      allow(Clacky::Providers).to receive(:media_models)
+        .with("anthropic", "image").and_return(["managed-image"])
+      allow(Clacky::Providers).to receive(:default_media_model)
+        .with("anthropic", "image").and_return("managed-image")
+
+      result = config.effective_media_entry("image")
+
+      expect(result).to include(
+        "model" => "managed-image",
+        "base_url" => managed_anchor["base_url"],
+        "api_key" => managed_anchor["api_key"]
+      )
+      expect(result["base_url"]).not_to eq(custom_media_entry["base_url"])
+    end
+
     it "returns the raw entry for a legacy entry without mode but with credentials" do
       legacy = custom_media_entry.reject { |k, _| k == "mode" }
       config = described_class.new(models: [default_anchor, legacy])
