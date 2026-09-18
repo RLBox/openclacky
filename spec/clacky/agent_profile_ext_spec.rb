@@ -50,6 +50,48 @@ RSpec.describe Clacky::AgentProfile, "with extension-contributed agents" do
     expect(profile.name).to eq("support")
     expect(profile.description).to eq("Customer support agent")
     expect(profile.system_prompt).to eq("You handle inbound tickets.")
+    expect(profile.enterprise_application_id).to be_nil
+  end
+
+  it "exposes the owning container id for an enterprise-delivered agent" do
+    manifest = <<~YAML
+      id: feishu-task-bridge
+      origin: enterprise
+      contributes:
+        agents:
+          - id: feishu-project
+            prompt: prompts/feishu.md
+            description: Feishu assistant
+    YAML
+    make_ext(installed, "feishu-task-bridge", manifest, "prompts/feishu.md" => "Feishu agent.")
+
+    reload_layers
+
+    expect(described_class.load("feishu-project").enterprise_application_id).to eq("feishu-task-bridge")
+  end
+
+  it "does not attribute a user override to the enterprise container it replaces" do
+    manifest = <<~YAML
+      id: feishu-task-bridge
+      origin: enterprise
+      contributes:
+        agents:
+          - id: feishu-project
+            description: Enterprise Feishu agent
+            prompt: prompts/feishu.md
+    YAML
+    make_ext(installed, "feishu-task-bridge", manifest, "prompts/feishu.md" => "Enterprise Feishu agent.")
+    user_agent = File.join(Clacky::AgentProfile::USER_AGENTS_DIR, "feishu-project")
+    FileUtils.mkdir_p(user_agent)
+    begin
+      File.write(File.join(user_agent, "profile.yml"), "description: User override\n")
+
+      reload_layers
+
+      expect(described_class.load("feishu-project").enterprise_application_id).to be_nil
+    ensure
+      FileUtils.remove_entry(user_agent) if Dir.exist?(user_agent)
+    end
   end
 
   it "raises when neither physical dir nor ext unit exists" do

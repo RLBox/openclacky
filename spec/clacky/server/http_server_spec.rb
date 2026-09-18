@@ -780,6 +780,103 @@ RSpec.describe Clacky::Server::HttpServer do
     end
   end
 
+  describe "enterprise personal BYOK policy" do
+    let(:enterprise_policy_config) do
+      cfg = Clacky::AgentConfig.new(
+        models: [
+          {
+            "id" => "personal-model",
+            "model" => "personal-model",
+            "api_key" => "sk-personal",
+            "base_url" => "https://personal.example.com"
+          },
+          {
+            "id" => "enterprise-model",
+            "model" => "managed-model",
+            "api_key" => "clacky-dt-enterprise",
+            "base_url" => "https://gateway.example.com",
+            "enterprise_managed" => true,
+            "enterprise_source" => "https://enterprise.example.com",
+            "allow_personal_byok" => false,
+            "managed_models" => ["managed-model"],
+            "type" => "default"
+          }
+        ],
+        clacky_license_server: "https://enterprise.example.com"
+      )
+      stub_const("Clacky::AgentConfig::CONFIG_FILE", config_file)
+      cfg
+    end
+
+    it "hides personal models and reports the managed policy" do
+      with_server(agent_config: enterprise_policy_config) do |server|
+        req = fake_req(method: "GET", path: "/api/config")
+        res = fake_res
+        dispatch(server, req, res)
+
+        expect(res.status).to eq(200)
+        expect(parsed_body(res)).to include("personal_byok_allowed" => false)
+        expect(parsed_body(res).fetch("models").map { |model| model["id"] })
+          .to eq(["enterprise-model"])
+      end
+    end
+
+    it "rejects personal model creation and selection" do
+      with_server(agent_config: enterprise_policy_config) do |server|
+        add_req = fake_req(
+          method: "POST",
+          path: "/api/config/models",
+          body: { model: "new", base_url: "https://api.example.com", api_key: "sk-new" }
+        )
+        add_res = fake_res
+        dispatch(server, add_req, add_res)
+        expect(add_res.status).to eq(403)
+        expect(parsed_body(add_res)["error"]).to eq("personal_byok_disabled")
+
+        session_req = fake_req(
+          method: "POST",
+          path: "/api/sessions",
+          body: { name: "blocked", model_id: "personal-model" }
+        )
+        session_res = fake_res
+        dispatch(server, session_req, session_res)
+        expect(session_res.status).to eq(403)
+      end
+    end
+
+    it "uses the managed model when a new session omits a model" do
+      with_server(agent_config: enterprise_policy_config) do |server|
+        req = fake_req(method: "POST", path: "/api/sessions", body: { name: "managed" })
+        res = fake_res
+        dispatch(server, req, res)
+
+        expect(res.status).to eq(201)
+        session_id = parsed_body(res).dig("session", "id")
+        agent = nil
+        server.instance_variable_get(:@registry).with_session(session_id) do |state|
+          agent = state[:agent]
+        end
+        expect(agent.current_model_info[:id]).to eq("enterprise-model")
+      end
+    end
+
+    it "keeps enterprise-managed model cards read-only" do
+      with_server(agent_config: enterprise_policy_config) do |server|
+        req = fake_req(
+          method: "PATCH",
+          path: "/api/config/models/enterprise-model",
+          body: { model: "tampered" }
+        )
+        res = fake_res
+        dispatch(server, req, res)
+
+        expect(res.status).to eq(403)
+        expect(parsed_body(res)["error"]).to eq("enterprise_model_managed")
+        expect(enterprise_policy_config.models.last["model"]).to eq("managed-model")
+      end
+    end
+  end
+
   # ── Single-item model CRUD APIs ───────────────────────────────────────────
   # These replace the old bulk POST /api/config. Each endpoint touches
   # exactly ONE model, so a bug in one save path cannot corrupt other rows.

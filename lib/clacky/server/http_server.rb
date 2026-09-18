@@ -249,6 +249,7 @@ module Clacky
         # Version cache: { latest: "x.y.z", checked_at: Time }
         @version_cache   = nil
         @version_mutex   = Mutex.new
+        @enterprise_models_refresh_mutex = Mutex.new
         @scheduler       = Scheduler.new(
           session_registry: @registry,
           session_builder:  method(:build_session),
@@ -711,6 +712,7 @@ module Clacky
         when ["DELETE", "/api/store/extension"]         then api_store_extension_uninstall(req, res)
         when ["GET",    "/api/brand/status"]      then api_brand_status(res)
         when ["GET",    "/api/enterprise/license"] then api_enterprise_license(res)
+        when ["POST",   "/api/enterprise/models/refresh"] then api_refresh_enterprise_models(res)
         when ["POST",   "/api/brand/activate"]    then api_brand_activate(req, res)
         when ["DELETE", "/api/brand/license"]     then api_brand_deactivate(res)
         when ["GET",    "/api/brand/skills"]      then api_brand_skills(res)
@@ -1011,8 +1013,20 @@ module Clacky
         model_id_override = body["model_id"].to_s.strip
         model_id_override = nil if model_id_override.empty?
 
+        unless personal_byok_allowed?
+          managed_default = @agent_config.models.find do |model|
+            model["enterprise_managed"] == true && model["type"] == "default"
+          end
+          managed_default ||= @agent_config.models.find { |model| model["enterprise_managed"] == true }
+          model_id_override ||= managed_default&.dig("id")
+        end
+
         if model_id_override && !@agent_config.models.any? { |m| m["id"] == model_id_override }
           return json_response(res, 400, { error: "Model not found in configuration" })
+        end
+        if model_id_override
+          target_model = @agent_config.models.find { |model| model["id"] == model_id_override }
+          return reject_personal_byok(res) unless model_allowed_by_enterprise_policy?(target_model)
         end
 
         # Optional project association — validate the project exists if provided
@@ -1259,6 +1273,7 @@ module Clacky
           managed_models = if explicit_source
             normalize_managed_models(data["models"], default_model: data["default_model"])
           end
+          allow_personal_byok = data.fetch("allow_personal_byok", true) == true
           source_changed = platform_source != effective_clacky_license_server
           Clacky::Identity.load.bind!(
             device_token: data["device_token"],
@@ -1271,6 +1286,7 @@ module Clacky
             model:    data["default_model"],
             managed_models: managed_models,
             enterprise_source: explicit_source ? platform_source : nil,
+            allow_personal_byok: allow_personal_byok,
             save:     false
           )
           @agent_config.clacky_license_server = platform_source
@@ -1318,7 +1334,8 @@ module Clacky
 
       # Persist a device-flow-issued model as the default and re-anchor current_*.
       private def persist_onboard_model(api_key:, base_url:, model:, managed_models: nil,
-                                        enterprise_source: nil, save: true)
+                                        enterprise_source: nil, allow_personal_byok: true,
+                                        save: true)
         if enterprise_source
           @agent_config.models.reject! do |entry|
             entry["enterprise_managed"] &&
@@ -1338,6 +1355,7 @@ module Clacky
           entry["enterprise_managed"] = true
           entry["enterprise_source"] = enterprise_source
           entry["managed_models"] = normalize_managed_models(managed_models, default_model: model)
+          entry["allow_personal_byok"] = allow_personal_byok == true
         end
         @agent_config.models << entry
         @agent_config.current_model_id    = entry["id"]
@@ -2086,6 +2104,8 @@ module Clacky
       # auth, and that the requested model is exposed by the endpoint.
       # No image is generated — zero cost, sub-second.
       def api_test_media_config(req, res)
+        return reject_personal_byok(res) unless personal_byok_allowed?
+
         body = parse_json_body(req) || {}
         kind = body["kind"].to_s
         return json_response(res, 422, { error: "invalid kind" }) unless %w[image video audio].include?(kind)
@@ -2168,6 +2188,7 @@ module Clacky
         unless %w[off auto custom].include?(source)
           return json_response(res, 422, { error: "invalid source" })
         end
+        return reject_personal_byok(res) if source == "custom" && !personal_byok_allowed?
 
         existing = @agent_config.models.find { |m| m["type"] == kind }
 
@@ -2288,6 +2309,8 @@ module Clacky
       # POST /api/config/ocr/test
       # Reuses the media preflight (GET /models) — same connectivity check.
       def api_test_ocr_config(req, res)
+        return reject_personal_byok(res) unless personal_byok_allowed?
+
         body = parse_json_body(req) || {}
         api_key = body["api_key"].to_s
         if api_key.empty? || api_key.include?("****")
@@ -2572,6 +2595,112 @@ module Clacky
 
       private def api_enterprise_license(res)
         json_response(res, 200, enterprise_license_status)
+      end
+
+      private def api_refresh_enterprise_models(res)
+        @enterprise_models_refresh_mutex.synchronize do
+          identity = Clacky::Identity.load
+          source = effective_clacky_license_server
+          unless identity.bound? && identity.platform_source == source
+            return json_response(res, 200, { ok: true, bound: false, changed: false })
+          end
+
+          result = Clacky::PlatformHttpClient.new(host: source).post(
+            "/api/v1/model_gateway/introspect",
+            {},
+            headers: { "Authorization" => "Bearer #{identity.device_token}" }
+          )
+          unless result[:success]
+            return json_response(res, 502, {
+              ok: false,
+              bound: true,
+              error: "enterprise_models_unavailable"
+            })
+          end
+
+          data = result[:data] || {}
+          unless data["active"] == true
+            return json_response(res, 409, {
+              ok: false,
+              bound: true,
+              error: "enterprise_access_inactive",
+              reason: data["reason"]
+            })
+          end
+
+          entry = @agent_config.models.find do |model|
+            model["enterprise_managed"] == true && model["enterprise_source"] == source
+          end
+          unless entry
+            return json_response(res, 409, {
+              ok: false,
+              bound: true,
+              error: "enterprise_model_missing"
+            })
+          end
+
+          default_model = data["default_model"].to_s
+          raw_models = Array(data["allowed_models"]).map(&:to_s)
+          unless raw_models.include?(default_model)
+            raise ArgumentError, "enterprise default model is not allowed"
+          end
+          managed_models = normalize_managed_models(raw_models, default_model: default_model)
+          gateway_url = data["gateway_url"].to_s.strip
+          gateway_url = normalize_http_origin(gateway_url) unless gateway_url.empty?
+
+          changes = {
+            "model" => default_model,
+            "managed_models" => managed_models,
+            "allow_personal_byok" => data.fetch("allow_personal_byok", true) == true
+          }
+          changes["base_url"] = gateway_url unless gateway_url.empty?
+          changed = changes.any? { |key, value| entry[key] != value }
+          if changes["allow_personal_byok"] == false && entry["type"] != "default"
+            @agent_config.models.each { |model| model.delete("type") if model["type"] == "default" }
+            entry["type"] = "default"
+            @agent_config.current_model_id = entry["id"]
+            @agent_config.current_model_index = @agent_config.models.index(entry)
+            changed = true
+          end
+          if changed
+            entry.merge!(changes)
+            @agent_config.save
+            refresh_live_enterprise_sessions!(entry, managed_models)
+          end
+
+          json_response(res, 200, {
+            ok: true,
+            bound: true,
+            changed: changed,
+            default_model: default_model,
+            models: managed_models,
+            model_count: managed_models.length,
+            allow_personal_byok: changes["allow_personal_byok"]
+          })
+        end
+      rescue ArgumentError
+        json_response(res, 502, {
+          ok: false,
+          bound: true,
+          error: "invalid_enterprise_model_policy"
+        })
+      end
+
+      private def refresh_live_enterprise_sessions!(entry, managed_models)
+        @registry.each_live_agent do |session_id, agent, _thread|
+          info = agent.current_model_info
+          next unless info && info[:id] == entry["id"]
+
+          sub_model = agent.config.session_model_overlay_name
+          sub_model = nil unless managed_models.include?(sub_model)
+          agent.set_session_sub_model(sub_model)
+          @session_manager.save(agent.to_session_data(updated_at: Time.now))
+          broadcast_session_update(session_id)
+        rescue StandardError => e
+          Clacky::Logger.warn(
+            "[EnterpriseModels] Failed to refresh session #{session_id}: #{e.class}: #{e.message}"
+          )
+        end
       end
 
       private def enterprise_license_status
@@ -6402,7 +6531,8 @@ module Clacky
             provider_id:      m["provider_id"],
             capabilities:     m["capabilities"],
             remark:           m["remark"],
-            type:             m["type"]
+            type:             m["type"],
+            enterprise_managed: m["enterprise_managed"] == true
           }
         end
         # Filter out auto-injected models (lite, derived media) AND media
@@ -6412,7 +6542,8 @@ module Clacky
           raw = @agent_config.models[m[:index]]
           raw["auto_injected"] ||
             Clacky::Providers::MEDIA_KINDS.include?(raw["type"].to_s) ||
-            raw["type"].to_s == "ocr"
+            raw["type"].to_s == "ocr" ||
+            (!personal_byok_allowed? && raw["enterprise_managed"] != true)
         end
         # Capabilities follow the model the *session* is actually running on
         # (it may differ from the global default after a per-session switch).
@@ -6422,7 +6553,30 @@ module Clacky
           models: models,
           current_index: @agent_config.current_model_index,
           current_id: @agent_config.current_model&.dig("id"),
-          media_capabilities: media_capabilities_payload(cfg)
+          media_capabilities: media_capabilities_payload(cfg),
+          personal_byok_allowed: personal_byok_allowed?
+        })
+      end
+
+      private def personal_byok_allowed?
+        @agent_config.personal_byok_allowed?
+      end
+
+      private def model_allowed_by_enterprise_policy?(model)
+        personal_byok_allowed? || model&.dig("enterprise_managed") == true
+      end
+
+      private def reject_personal_byok(res)
+        json_response(res, 403, {
+          error: "personal_byok_disabled",
+          message: "Personal API keys are disabled by your enterprise administrator"
+        })
+      end
+
+      private def reject_enterprise_managed_model(res)
+        json_response(res, 403, {
+          error: "enterprise_model_managed",
+          message: "Enterprise-managed models are read-only on this device"
         })
       end
 
@@ -6669,6 +6823,8 @@ module Clacky
       # Creates a new model entry, returns { ok:true, id, index } so the
       # frontend can record the new id without reloading the whole list.
       def api_add_model(req, res)
+        return reject_personal_byok(res) unless personal_byok_allowed?
+
         body = parse_json_body(req)
         return json_response(res, 400, { error: "Invalid JSON" }) unless body
 
@@ -6757,6 +6913,8 @@ module Clacky
 
         target = @agent_config.models.find { |m| m["id"] == id }
         return json_response(res, 404, { error: "model not found" }) unless target
+        return reject_personal_byok(res) unless model_allowed_by_enterprise_policy?(target)
+        return reject_enterprise_managed_model(res) if target["enterprise_managed"] == true
 
         # Validate before any mutation: target is a live reference inside
         # @agent_config.models, so an early 422 return after partial writes
@@ -6845,7 +7003,10 @@ module Clacky
       # DELETE /api/config/models/:id
       def api_delete_model(id, res)
         models = @agent_config.models
-        return json_response(res, 404, { error: "model not found" }) unless models.any? { |m| m["id"] == id }
+        target = models.find { |model| model["id"] == id }
+        return json_response(res, 404, { error: "model not found" }) unless target
+        return reject_personal_byok(res) unless model_allowed_by_enterprise_policy?(target)
+        return reject_enterprise_managed_model(res) if target["enterprise_managed"] == true
         return json_response(res, 422, { error: "cannot delete the last model" }) if models.length <= 1
 
         index = models.find_index { |m| m["id"] == id }
@@ -6875,6 +7036,10 @@ module Clacky
       # Makes the identified model the new "default" (global initial model
       # for new sessions AND current model for this server instance).
       def api_set_default_model(id, res)
+        target = @agent_config.models.find { |model| model["id"] == id }
+        return json_response(res, 404, { error: "model not found" }) unless target
+        return reject_personal_byok(res) unless model_allowed_by_enterprise_policy?(target)
+
         ok = @agent_config.set_default_model_by_id(id)
         return json_response(res, 404, { error: "model not found" }) unless ok
 
@@ -6892,9 +7057,14 @@ module Clacky
         body = parse_json_body(req)
         return json_response(res, 400, { error: "Invalid JSON" }) unless body
 
+        model_id = body["id"].to_s
+        target = model_id.empty? ? nil : @agent_config.models.find { |model| model["id"] == model_id }
+        if !personal_byok_allowed? && (target.nil? || target["enterprise_managed"] != true)
+          return reject_personal_byok(res)
+        end
+
         api_key = body["api_key"].to_s
         if api_key.include?("****")
-          model_id = body["id"].to_s
           entry = nil
           if !model_id.empty?
             entry = @agent_config.models.find { |m| m["id"] == model_id }
@@ -7219,6 +7389,7 @@ module Clacky
         if target_model.nil?
           return json_response(res, 400, { error: "Model not found in configuration" })
         end
+        return reject_personal_byok(res) unless model_allowed_by_enterprise_policy?(target_model)
 
         # Switch to the model by id (unified interface with CLI)
         # Handles: config.switch_model_by_id + client rebuild + message_compressor rebuild
@@ -7333,7 +7504,9 @@ module Clacky
         # Snapshot the models list — @agent_config.models is a shared reference
         # that the user might mutate from the settings panel during the test;
         # a shallow dup is enough since we only read string fields below.
-        models = Array(@agent_config.models).dup
+        models = Array(@agent_config.models).select do |model|
+          model_allowed_by_enterprise_policy?(model)
+        end
         return json_response(res, 200, { ok: true, results: [] }) if models.empty?
 
         # Kick off one thread per model. We deliberately cap per-request wall

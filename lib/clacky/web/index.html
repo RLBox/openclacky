@@ -984,6 +984,10 @@
                 <button id="btn-add-model" class="btn-settings-add" data-i18n="settings.models.add">+ Add Model</button>
               </div>
             </div>
+            <div id="personal-byok-policy-notice" class="settings-section-desc" style="display:none"
+                 data-i18n="settings.models.enterpriseOnly">
+              Your administrator allows enterprise-managed models only. Personal API keys are disabled.
+            </div>
             <div id="model-cards"></div>
           </section>
 
@@ -1232,6 +1236,11 @@
                 <div class="brand-status-row"><span class="brand-status-label" data-i18n="settings.brand.label.expires">Expires</span><span id="enterprise-license-expires" class="brand-status-value"></span></div>
                 <div class="brand-status-row"><span class="brand-status-label" data-i18n="settings.enterprise.devices">Devices</span><span id="enterprise-license-devices" class="brand-status-value"></span></div>
                 <p data-i18n="settings.enterprise.description">Managed through enterprise device login. No serial number is required.</p>
+                <div class="enterprise-model-refresh">
+                  <button type="button" id="btn-refresh-enterprise-models" class="btn-settings-action"
+                          data-i18n="settings.enterprise.models.refresh">Refresh enterprise models</button>
+                  <span id="enterprise-model-refresh-status" class="enterprise-model-refresh-status" aria-live="polite"></span>
+                </div>
               </div>
             </div>
             <div id="brand-status-card" class="brand-status-card" style="display:none">
@@ -1777,6 +1786,7 @@
 <script src="/auth.js"></script>
 <script src="/theme.js"></script>
 <script src="/components/notify.js"></script>
+<script src="/enterprise-models.js"></script>
 <script src="/ws.js"></script>
 <script src="/ws-dispatcher.js"></script>
 <script src="/components/custom-select.js"></script>

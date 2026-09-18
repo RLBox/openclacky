@@ -82,6 +82,7 @@ module Clacky
       @tool_registry = ToolRegistry.new
       @hooks = HookManager.new(agent: self)
       @session_id = session_id
+      configure_enterprise_request_context!
       @name = ""
       @pinned = false
       @history = MessageHistory.new
@@ -232,13 +233,37 @@ module Clacky
         anthropic_format: @config.anthropic_format?,
         api_format: @config.api_format,
         provider_id: @config.provider_id_for(entry),
-        capabilities: entry && entry["capabilities"]
+        capabilities: entry && entry["capabilities"],
+        enterprise_application_id: current_enterprise_application_id,
+        enterprise_session_id: current_enterprise_session_id
       )
       # Update message compressor with new client and model
       @message_compressor = MessageCompressor.new(@client, model: current_model)
 
       # Inject a new session context to notify the AI of the model switch
       inject_session_context
+    end
+
+    private def configure_enterprise_request_context!
+      return unless @client.respond_to?(:enterprise_application_id=)
+
+      @client.enterprise_application_id = current_enterprise_application_id
+      @client.enterprise_session_id = current_enterprise_session_id if
+        @client.respond_to?(:enterprise_session_id=)
+    end
+
+    private def current_enterprise_application_id(config = @config)
+      entry = config.current_model
+      return unless entry && entry["enterprise_managed"] == true
+
+      @agent_profile.enterprise_application_id
+    end
+
+    private def current_enterprise_session_id(config = @config)
+      entry = config.current_model
+      return unless entry && entry["enterprise_managed"] == true
+
+      @session_id
     end
 
     # Change the working directory for this session
@@ -488,6 +513,13 @@ module Clacky
       goal_intercept = handle_goal_command(user_input)
       return goal_intercept[:result] if goal_intercept[:handled]
       user_input = goal_intercept[:user_input] if goal_intercept[:user_input]
+
+      # An enterprise policy can change while this session is still open. A
+      # stale session may therefore still point at a personal model even after
+      # personal API keys have been disabled. Enforce the policy at the actual
+      # execution boundary so web, channel, scheduler, and CLI turns all use an
+      # enterprise-managed model.
+      enforce_enterprise_model_policy!
 
       # Auto-clear a finished/paused goal when the user starts a new non-goal
       # task. /goal <text> already replaced the goal above; control commands
@@ -1004,6 +1036,18 @@ module Clacky
       # Guarded by run_turn_started so goal control commands (which return
       # before the task turn) are not counted as agent runs.
       Clacky::Telemetry.task!(result: result) if run_turn_started
+    end
+
+    private def enforce_enterprise_model_policy!
+      return if @config.personal_byok_allowed?
+
+      current = @config.models.find { |model| model["id"] == @config.current_model_id }
+      return if current&.dig("enterprise_managed") == true
+
+      managed = @config.models.find { |model| model["enterprise_managed"] == true }
+      raise "No enterprise-managed model is available" unless managed
+
+      switch_model_by_id(managed["id"])
     end
 
     private def think
@@ -1966,7 +2010,8 @@ module Clacky
         anthropic_format: subagent_config.anthropic_format?,
         api_format: subagent_config.api_format,
         provider_id: subagent_config.provider_id_for(subagent_entry),
-        capabilities: subagent_entry && subagent_entry["capabilities"]
+        capabilities: subagent_entry && subagent_entry["capabilities"],
+        enterprise_application_id: current_enterprise_application_id(subagent_config)
       )
 
       # Create subagent (reuses all tools from parent, inherits agent profile from parent)

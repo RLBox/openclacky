@@ -1,6 +1,24 @@
 # frozen_string_literal: true
 
 RSpec.describe Clacky::AgentConfig do
+  it "drops a stale enterprise sub-model overlay after access is removed" do
+    config = described_class.new(
+      models: [{
+        "id" => "enterprise-model",
+        "model" => "allowed-default",
+        "base_url" => "https://gateway.example.com",
+        "api_key" => "device-token",
+        "enterprise_managed" => true,
+        "managed_models" => ["allowed-default"]
+      }],
+      current_model_id: "enterprise-model",
+      session_model_overlay: { "model" => "removed-model" }
+    )
+
+    expect(config.model_name).to eq("allowed-default")
+    expect(config.session_model_overlay_name).to be_nil
+  end
+
   # Helper to create a temporary config file
   def with_temp_config(data = nil)
     temp_dir = Dir.mktmpdir
@@ -1337,6 +1355,34 @@ RSpec.describe Clacky::AgentConfig do
       result = config.effective_media_entry("image")
       expect(result["model"]).to eq("gpt-image-1")
       expect(result["base_url"]).to eq("https://api.openai.com/v1")
+    end
+
+    it "ignores a personal custom sidecar when enterprise BYOK is disabled" do
+      managed_anchor = default_anchor.merge(
+        "enterprise_managed" => true,
+        "enterprise_source" => "https://enterprise.example.com",
+        "allow_personal_byok" => false
+      )
+      config = described_class.new(
+        models: [managed_anchor, custom_media_entry],
+        clacky_license_server: "https://enterprise.example.com"
+      )
+      allow(Clacky::Providers).to receive(:resolve_provider)
+        .with(base_url: managed_anchor["base_url"], api_key: managed_anchor["api_key"])
+        .and_return("anthropic")
+      allow(Clacky::Providers).to receive(:media_models)
+        .with("anthropic", "image").and_return(["managed-image"])
+      allow(Clacky::Providers).to receive(:default_media_model)
+        .with("anthropic", "image").and_return("managed-image")
+
+      result = config.effective_media_entry("image")
+
+      expect(result).to include(
+        "model" => "managed-image",
+        "base_url" => managed_anchor["base_url"],
+        "api_key" => managed_anchor["api_key"]
+      )
+      expect(result["base_url"]).not_to eq(custom_media_entry["base_url"])
     end
 
     it "returns the raw entry for a legacy entry without mode but with credentials" do
